@@ -6,7 +6,7 @@ This project involves a standalone Python 3 desktop application designed to solv
 
 ## Author
 
-Luba Ira - [lubani@ac.sce.ac.il](mailto:lubani@ac.sce.ac.il)
+Luba Ira - [lubacareer@gmail.com](mailto:lubacareer@gmail.com)
 
 ## Project Description
 
