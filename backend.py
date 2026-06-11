@@ -588,25 +588,57 @@ class PCM(ABC):
 
         return H, T
 
-    def calcEnergySufficiency(self, H_vals):
-        E_vals = H_vals  # Enthalpy is the energy in kJ
+    def calcEnergySufficiency(
+        self,
+        H_vals,
+        area_m2: float = 1.0,
+        settlement_power_kw: float = 50.0,
+        settlement_hours: Optional[float] = None,
+        electric_conversion_efficiency: float = 1.0,
+    ):
+        """
+        Estimate if the thermal energy in the current enthalpy profile can meet a settlement load.
 
-        P_settlement = 50  # Power requirement for the settlement in kW
-        time_hours = (
-            14.75 * 24
-        )  # Half of a lunar day-night cycle (only day or night) in hours
+        Assumptions:
+        - H_vals is an enthalpy density field in J/m^3 (as produced by calcEnthalpy2 / implicitSol).
+        - 1D slab of width dx and cross-section area_m2.
+        - Only the latest time slice is used (stored energy at the end of the simulation window).
+        - Optional electric conversion efficiency can be applied.
+        """
+        H_array = np.asarray(H_vals, dtype=np.float64)
 
-        # Energy needed for the settlement over the adjusted lunar day-night cycle directly in kJ
-        E_settlement = P_settlement * time_hours * 3.6e3  # Convert kWh to kJ
+        # Use the last time slice if a time dimension exists
+        if H_array.ndim == 2:
+            H_profile = H_array[:, -1]
+        elif H_array.ndim == 1:
+            H_profile = H_array
+        else:
+            raise ValueError("H_vals must be 1D or 2D enthalpy density array.")
 
-        # Total energy stored in the regolith over the adjusted cycle, assuming E_vals is already in kJ
-        E_regolith_total = np.sum(
-            E_vals
-        )  # Directly use the values without further conversion
+        dx = float(getattr(self, "dx", 1.0))
+        area = max(float(area_m2), 1e-12)
+        efficiency = max(float(electric_conversion_efficiency), 1e-6)
 
-        # Formulate the result string
-        result_string = f"Energy needed: {E_settlement:.0f} kJ, Energy calculated: {E_regolith_total:.0f} kJ. "
-        if E_regolith_total >= E_settlement:
+        # Convert enthalpy density (J/m^3) to total thermal energy (J) for the 1D slab, then to kJ
+        volume_per_cell = dx * area  # m^3 per cell (assuming unit depth in 1D model)
+        E_regolith_kJ = float(np.sum(H_profile * volume_per_cell) / 1e3)
+
+        # Load side: electrical energy demand over the target window
+        hours = float(settlement_hours) if settlement_hours is not None else 14.75 * 24
+        E_electric_need_kJ = float(settlement_power_kw * hours * 3.6e3)
+
+        # Usable electric energy from the thermal store (apply conversion efficiency)
+        usable_electric_kJ = E_regolith_kJ * efficiency
+
+        ratio = usable_electric_kJ / E_electric_need_kJ if E_electric_need_kJ > 0 else float("nan")
+        sufficient = usable_electric_kJ >= E_electric_need_kJ
+
+        result_string = (
+            f"Energy needed (electric): {E_electric_need_kJ:.0f} kJ, "
+            f"Thermal stored: {E_regolith_kJ:.0f} kJ, "
+            f"Usable electric (@{efficiency:.2f} η): {usable_electric_kJ:.0f} kJ. "
+        )
+        if sufficient:
             result_string += "The thermal energy in the regolith is sufficient to power the settlement."
         else:
             result_string += "The thermal energy in the regolith is not sufficient to power the settlement."
@@ -615,7 +647,7 @@ class PCM(ABC):
 
     def analyticalSol(self, x_val, t_arr, cls):
         T_initial = cls.T_a
-        T_final = cls.T_m
+        T_final = cls.T_m + 10.0
         T = np.full((len(x_val), len(t_arr)), T_initial, dtype=np.float64)
         T[0, :] = T_final
 
@@ -999,12 +1031,20 @@ class Regolith(PCM):
             diffusive_term[0] = 0
             diffusive_term[-1] = 0
 
-            T_new = T_old + (alpha * cls.dt / cls.dx**2) * diffusive_term
+            heat_source = self.heat_source_function(x_arr, float(t_arr[timestep]))
+            heat_source = np.asarray(heat_source, dtype=np.float64)
+            if heat_source.shape == ():
+                heat_source = np.full_like(T_old, float(heat_source))
+            c_vals = np.array(
+                [cls.calcSpecificHeat(T_old[i]) for i in range(nx)], dtype=np.float64
+            )
+            rho_cp = np.maximum(cls.rho * c_vals, 1e-9)
+            source_increment = (cls.dt * heat_source) / rho_cp
 
-            # Keep boundary at fixed temperature; no additional heat source during comparison
-            # This ensures consistency with the analytical solution (pure diffusion)
-            # heat_source disabled for parity
+            T_new = T_old + (alpha * cls.dt / cls.dx**2) * diffusive_term + source_increment
 
+            # Reapply the fixed-temperature boundary after volumetric heating.
+            T_new[0] = cls.T_m + 10.0
             T_new[-1] = T_old[-1]  # Keep the last cell's temperature constant
 
             # Clip temperatures to prevent numerical issues
@@ -1061,9 +1101,20 @@ class Regolith(PCM):
         for time_step in range(1, num_timesteps):
             T_old = T_arr[:, time_step - 1]
 
-            # No external heat source to keep consistency with the analytical solution
-            # Use pure diffusion implicit step (T_explicit equals previous temperature)
-            T_explicit = T_old
+            heat_source = self.heat_source_function(x_arr, float(t_arr[time_step]))
+            heat_source = np.asarray(heat_source, dtype=np.float64)
+            if heat_source.shape == ():
+                heat_source = np.full_like(T_old, float(heat_source))
+
+            # Incorporate volumetric heating before the implicit diffusion solve
+            c_vals = np.array(
+                [cls.calcSpecificHeat(T_old[i]) for i in range(num_segments)],
+                dtype=np.float64,
+            )
+            rho_cp = np.maximum(cls.rho * c_vals, 1e-9)
+            source_increment = (cls.dt * heat_source) / rho_cp
+            T_explicit = T_old + source_increment
+            T_explicit[0] = cls.T_m + 10.0
 
             # Use constant thermal properties to maintain parity with analytical/explicit solutions
             alpha_const = cls.alpha(cls.k, cls.c, cls.rho)
@@ -1106,6 +1157,8 @@ class Regolith(PCM):
                     A[-1, -1] = 1 + lmbda_vals[-1]
 
                     T_new = np.linalg.solve(A, T_explicit)
+
+                T_new[0] = cls.T_m + 10.0
 
                 # Calculate new enthalpy from updated temperature
                 H_new = cls.calcEnthalpy2(T_new, cls)

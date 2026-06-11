@@ -12,6 +12,7 @@ from np_compat import check_numpy_health, friendly_numpy_error
 
 
 import tkinter as tk
+from tkinter import font as tkfont
 
 # import google
 # import logging
@@ -20,8 +21,9 @@ from matplotlib import pyplot as plt
 from matplotlib.backends._backend_tk import NavigationToolbar2Tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 from mpl_toolkits.mplot3d import Axes3D  # type: ignore
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 import backend
 
 # Map selectable material names to their backend implementations.
@@ -34,6 +36,19 @@ PINN_TRAINING_EPOCHS = 50
 PINN_TARGET_BATCHES_PER_EPOCH = 32
 PINN_MAX_TRAIN_SAMPLES = 20000
 BOUNDARY_HEAD_VIOLATION_THRESHOLD = 0.05
+PLOT_ENTHALPY_SCALE = 1e-6  # Convert J/m^3 to MJ/m^3 for more readable T(E)
+
+THEME = {
+    "bg": "#f3f6fa",
+    "surface": "#ffffff",
+    "surface_alt": "#eef3f8",
+    "border": "#d8e0ea",
+    "text": "#172033",
+    "muted": "#5b677a",
+    "primary": "#2563eb",
+    "primary_hover": "#1d4ed8",
+    "danger": "#dc2626",
+}
 
 # Work around protobuf >=3.19 descriptor change by forcing Python implementation before importing TensorFlow/Keras
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
@@ -192,79 +207,112 @@ class InputWindow1(tk.Tk):
         return x, t, self.material_input
 
 
+class RoundedFrame(tk.Frame):
+    """Canvas-backed rounded panel used for the dashboard's main cards."""
+
+    def __init__(
+        self,
+        master,
+        *,
+        radius: int = 18,
+        padding: int = 22,
+        fill: str = THEME["surface"],
+        outline: str = THEME["border"],
+        bg: str = THEME["bg"],
+        **kwargs,
+    ):
+        super().__init__(master, bg=bg, highlightthickness=0, bd=0, **kwargs)
+        self.radius = radius
+        self.padding = padding
+        self.fill = fill
+        self.outline = outline
+
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.content = tk.Frame(self.canvas, bg=fill, highlightthickness=0, bd=0)
+        self.content_window = self.canvas.create_window(
+            (padding, padding), window=self.content, anchor="nw"
+        )
+        self.shape_id = None
+        self.canvas.bind("<Configure>", self._draw)
+
+    def _draw(self, event=None) -> None:
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        radius = min(self.radius, width // 2, height // 2)
+        self.canvas.delete("rounded_panel")
+        self._create_rounded_rect(
+            1,
+            1,
+            width - 1,
+            height - 1,
+            radius,
+            fill=self.fill,
+            outline=self.outline,
+            width=1,
+            tags="rounded_panel",
+        )
+        inner_width = max(1, width - (2 * self.padding))
+        inner_height = max(1, height - (2 * self.padding))
+        self.canvas.coords(self.content_window, self.padding, self.padding)
+        self.canvas.itemconfigure(
+            self.content_window, width=inner_width, height=inner_height
+        )
+        self.canvas.tag_lower("rounded_panel")
+
+    def _create_rounded_rect(self, x1, y1, x2, y2, radius, **kwargs):
+        points = [
+            x1 + radius,
+            y1,
+            x2 - radius,
+            y1,
+            x2,
+            y1,
+            x2,
+            y1 + radius,
+            x2,
+            y2 - radius,
+            x2,
+            y2,
+            x2 - radius,
+            y2,
+            x1 + radius,
+            y2,
+            x1,
+            y2,
+            x1,
+            y2 - radius,
+            x1,
+            y1 + radius,
+            x1,
+            y1,
+        ]
+        return self.canvas.create_polygon(points, smooth=True, splinesteps=16, **kwargs)
+
+
 class App:
     def __init__(self):
-        self.choiceWindow = chooseInput()
-        self.choiceWindow.wait_window()
-        choice = self.choiceWindow.v.get()
-        self.pcm: backend.PCM
-
-        if choice == 0:
-            self.input_window = InputWindow0()
-            self.input_window.mainloop()
-            self.L, self.t_max, self.k, self.c, self.rho, self.T_m, self.LH = (
-                self.input_window.submit()
-            )
-            self.input_window.destroy()
-            self.material = "Custom"
-            self.pcm = backend.customPCM(self.k, self.c, self.rho, self.T_m, self.LH)
-        else:
-            self.input_window = InputWindow1()
-            self.input_window.mainloop()
-            self.L, self.t_max, self.material = self.input_window.submit()
-            self.input_window.destroy()
-            material_cls = MATERIAL_CLASSES.get(self.material)
-            if material_cls is None:
-                raise ValueError(f"Unsupported material: {self.material}")
-            self.pcm = material_cls()
-
-        print(f"Debug: Selected material = {self.material if choice else 'Custom'}")
-
-        # Create the main window
         self.root = tk.Tk()
-        self.root.wm_title("Embedding in Tk")
-        self.root.configure(bg="white")
-        self.root.title("Heat Conduction")
+        self.root.wm_title("Heat Conduction Dashboard")
+        self.root.configure(bg=THEME["bg"])
+        self.root.title("Heat Conduction Dashboard")
+        self.root.geometry("1360x900")
+        self.root.minsize(1180, 760)
         self.root.grid_anchor("center")
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.configure_theme()
 
-        # Create a frame to hold the scale and the line plot
-        self.frame = tk.Frame(self.root)
-        self.frame.grid(
-            row=0, column=0, columnspan=3, sticky="n"
-        )  # Span the frame across columns
+        self.pcm: Optional[backend.PCM] = None
+        self.L = 0.0
+        self.t_max = 0.0
+        self.material = "Regolith"
+        self.simulation_ready = False
 
-        # Create the scale widget
-        self.time_scale = tk.Scale(
-            self.root,
-            from_=0,
-            to=self.t_max,
-            resolution=self.pcm.dt,
-            orient=tk.HORIZONTAL,
-            command=self.update_time,
-        )
-        self.time_scale.grid(row=0, column=0, sticky="nsew")
-
-        # Create a variable for the dropdown selection
         self.solution_type = tk.StringVar(self.root)
-        self.solution_type.set("Analytical")  # default value
-
-        # Create the dropdown menu for the main solution type selection
-        solution_menu = tk.OptionMenu(
-            self.frame,
-            self.solution_type,
-            "Analytical",
-            "Implicit",
-            "Numerical",
-            "PINN",
-        )
-        solution_menu.grid(row=0, column=1, sticky="nsew")
-        self.solution_type.trace("w", self.handle_solution_type_change)
-        # Initialize gold standard variables
+        self.solution_type.set("Analytical")
         self.gold_standard = None
         self.gold_standard_temp_array: Optional[np.ndarray] = None
-        self.root.focus_force()
+
         self.moving_boundary_indices: Dict[str, Optional[np.ndarray]] = {}
         self.temp_mask_arrays: Dict[str, Optional[np.ndarray]] = {
             "Numerical": None,
@@ -281,11 +329,6 @@ class App:
             "Analytical": None,
             "Implicit": None,
         }
-        self.moving_boundary_positions: Dict[str, Optional[np.ndarray]] = {
-            "Numerical": None,
-            "Analytical": None,
-            "Implicit": None,
-        }
         self.temperature_solutions: Dict[str, Optional[np.ndarray]] = {
             "Numerical": None,
             "Analytical": None,
@@ -293,6 +336,14 @@ class App:
         }
         self.temp_mask_array: Optional[np.ndarray] = None
         self.bound_mask_array: Optional[np.ndarray] = None
+        self.x: Optional[np.ndarray] = None
+        self.y_T: Optional[np.ndarray] = None
+        self.y_B: Optional[np.ndarray] = None
+        self.x_boundary: Optional[np.ndarray] = None
+        self.x_grid: Optional[np.ndarray] = None
+        self.t_grid: Optional[np.ndarray] = None
+        self.T_arr: Optional[np.ndarray] = None
+        self.H_arr: Optional[np.ndarray] = None
         self.x_input_full: Optional[np.ndarray] = None
         self.x_boundary_input_full: Optional[np.ndarray] = None
         self.T_arr_to_display: Optional[np.ndarray] = None
@@ -306,21 +357,504 @@ class App:
         self.indices: List[int] = []
         self.raw_loss_values: List[float] = []
         self.gold_standard_boundary_per_time: Optional[np.ndarray] = None
+        self.true_boundary_times: Optional[np.ndarray] = None
+        self.Temperature_pred: Optional[np.ndarray] = None
+        self.Boundary_pred: Optional[np.ndarray] = None
+        self.loss_values: List[float] = []
+        self.scaled_accuracy_values = {"scaled_accuracy_T": [], "scaled_accuracy_B": []}
+        self.raw_accuracy_values = {"raw_accuracy_T": [], "raw_accuracy_B": []}
+        self.model = None
+        self.batch_size = 1
+        self.t_idx = 0
 
-        # Create the 2D line plot
+        self.animation_running = False
+        self.animation_after_id: Optional[str] = None
+        self.animation_interval_ms = 250
+        self.surface_time_slice_artist = None
+        self.surface_visible_t_count = 0
+        self.last_commands = ""
+
+        self.build_dashboard()
+
+    def configure_theme(self) -> None:
+        self.font_family = "Segoe UI"
+        self.body_font = tkfont.Font(family=self.font_family, size=12)
+        self.small_font = tkfont.Font(family=self.font_family, size=10)
+        self.label_font = tkfont.Font(family=self.font_family, size=12)
+        self.heading_font = tkfont.Font(family=self.font_family, size=18, weight="bold")
+        self.section_font = tkfont.Font(family=self.font_family, size=13, weight="bold")
+        self.button_font = tkfont.Font(family=self.font_family, size=12, weight="bold")
+
+        self.root.option_add("*Font", self.body_font)
+        self.root.option_add("*TCombobox*Listbox.font", self.body_font)
+
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(".", font=self.body_font)
+        style.configure("App.TFrame", background=THEME["bg"])
+        style.configure("Card.TFrame", background=THEME["surface"])
+        style.configure(
+            "TLabel",
+            background=THEME["bg"],
+            foreground=THEME["text"],
+            font=self.body_font,
+        )
+        style.configure(
+            "Card.TLabel",
+            background=THEME["surface"],
+            foreground=THEME["text"],
+            font=self.body_font,
+        )
+        style.configure(
+            "Muted.Card.TLabel",
+            background=THEME["surface"],
+            foreground=THEME["muted"],
+            font=self.small_font,
+        )
+        style.configure(
+            "Header.TLabel",
+            background=THEME["bg"],
+            foreground=THEME["text"],
+            font=self.heading_font,
+        )
+        style.configure(
+            "Section.Card.TLabel",
+            background=THEME["surface"],
+            foreground=THEME["text"],
+            font=self.section_font,
+        )
+        style.configure(
+            "Status.TLabel",
+            background=THEME["surface"],
+            foreground=THEME["muted"],
+            padding=(14, 8),
+            font=self.small_font,
+        )
+        style.configure(
+            "TNotebook",
+            background=THEME["bg"],
+            borderwidth=0,
+            tabmargins=(20, 8, 20, 0),
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=THEME["surface_alt"],
+            foreground=THEME["muted"],
+            padding=(22, 11),
+            font=self.button_font,
+            borderwidth=0,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", THEME["surface"]), ("active", "#e7edf6")],
+            foreground=[("selected", THEME["primary"]), ("active", THEME["text"])],
+        )
+        style.configure(
+            "TButton",
+            background=THEME["surface_alt"],
+            foreground=THEME["text"],
+            borderwidth=0,
+            focusthickness=0,
+            focuscolor=THEME["surface_alt"],
+            padding=(16, 9),
+            font=self.button_font,
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("disabled", "#e5e7eb"),
+                ("pressed", "#d6e2f2"),
+                ("active", "#dde8f7"),
+            ],
+            foreground=[("disabled", "#9ca3af")],
+        )
+        style.configure(
+            "Primary.TButton",
+            background=THEME["primary"],
+            foreground="#ffffff",
+            borderwidth=0,
+            focusthickness=0,
+            focuscolor=THEME["primary"],
+            padding=(18, 11),
+            font=self.button_font,
+        )
+        style.map(
+            "Primary.TButton",
+            background=[
+                ("disabled", "#93c5fd"),
+                ("pressed", "#1e40af"),
+                ("active", THEME["primary_hover"]),
+            ],
+            foreground=[("disabled", "#eff6ff"), ("active", "#ffffff")],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground="#f8fafc",
+            background="#f8fafc",
+            foreground=THEME["text"],
+            bordercolor=THEME["border"],
+            lightcolor=THEME["border"],
+            darkcolor=THEME["border"],
+            padding=(10, 8),
+            insertcolor=THEME["text"],
+            font=self.body_font,
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground="#f8fafc",
+            background="#f8fafc",
+            foreground=THEME["text"],
+            bordercolor=THEME["border"],
+            arrowcolor=THEME["primary"],
+            padding=(10, 8),
+            font=self.body_font,
+        )
+        style.configure(
+            "TRadiobutton",
+            background=THEME["surface"],
+            foreground=THEME["text"],
+            font=self.body_font,
+            padding=(4, 4),
+        )
+        style.map(
+            "TRadiobutton",
+            background=[("active", THEME["surface"])],
+            foreground=[("disabled", "#9ca3af")],
+        )
+
+        plt.rcParams.update(
+            {
+                "font.size": 11,
+                "axes.titlesize": 13,
+                "axes.labelsize": 11,
+                "xtick.labelsize": 10,
+                "ytick.labelsize": 10,
+                "legend.fontsize": 10,
+            }
+        )
+
+    def build_dashboard(self) -> None:
+        self.root.grid_rowconfigure(0, weight=0)
+        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_rowconfigure(2, weight=0)
+        self.root.grid_columnconfigure(0, weight=1)
+
+        header = ttk.Frame(self.root, style="App.TFrame", padding=(24, 18, 24, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(0, weight=1)
+        ttk.Label(
+            header, text="Heat Conduction Dashboard", style="Header.TLabel"
+        ).grid(row=0, column=0, sticky="w")
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 10))
+
+        self.setup_tab = ttk.Frame(self.notebook, style="App.TFrame")
+        self.simulation_tab = ttk.Frame(self.notebook, style="App.TFrame")
+        self.pinn_tab = ttk.Frame(self.notebook, style="App.TFrame")
+        self.messages_tab = ttk.Frame(self.notebook, style="App.TFrame")
+
+        self.notebook.add(self.setup_tab, text="Setup")
+        self.notebook.add(self.simulation_tab, text="Simulation")
+        self.notebook.add(self.pinn_tab, text="PINN")
+        self.notebook.add(self.messages_tab, text="Messages")
+
+        self.status_var = tk.StringVar(value="Ready")
+        status_bar = ttk.Label(
+            self.root,
+            textvariable=self.status_var,
+            anchor="w",
+            style="Status.TLabel",
+        )
+        status_bar.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 14))
+
+        self.build_setup_tab()
+        self.build_simulation_tab()
+        self.build_pinn_tab()
+        self.build_messages_tab()
+        self._set_simulation_controls_enabled(False)
+        self._set_pinn_controls_enabled(False)
+        self.notebook.select(self.setup_tab)
+
+    def build_setup_tab(self) -> None:
+        self.setup_tab.grid_rowconfigure(0, weight=1)
+        self.setup_tab.grid_columnconfigure(0, weight=1)
+
+        content = ttk.Frame(self.setup_tab, style="App.TFrame", padding=(26, 22, 26, 26))
+        content.grid(row=0, column=0, sticky="nsew")
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(0, weight=3)
+        content.grid_columnconfigure(1, weight=2)
+
+        setup_card = RoundedFrame(content, radius=22, padding=28)
+        setup_card.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        panel = setup_card.content
+        panel.grid_columnconfigure(1, weight=1)
+
+        custom_card = RoundedFrame(content, radius=22, padding=28)
+        custom_card.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
+        custom_panel = custom_card.content
+        custom_panel.grid_columnconfigure(1, weight=1)
+
+        self.setup_mode_var = tk.IntVar(value=1)
+        ttk.Label(
+            panel, text="Simulation Setup", style="Section.Card.TLabel"
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 18))
+
+        ttk.Label(panel, text="Mode", style="Card.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(0, 8)
+        )
+        ttk.Radiobutton(
+            panel,
+            text="Choose material",
+            variable=self.setup_mode_var,
+            value=1,
+            command=self.update_setup_mode,
+        ).grid(row=1, column=1, sticky="w", padx=(16, 0), pady=(0, 8))
+        ttk.Radiobutton(
+            panel,
+            text="Custom properties",
+            variable=self.setup_mode_var,
+            value=0,
+            command=self.update_setup_mode,
+        ).grid(row=1, column=2, sticky="w", padx=(16, 0), pady=(0, 8))
+
+        self.setup_x_var = tk.StringVar(value="0.2")
+        self.setup_t_var = tk.StringVar(value="2")
+        self.setup_material_var = tk.StringVar(value="Regolith")
+        self.setup_k_var = tk.StringVar(value="1.0")
+        self.setup_c_var = tk.StringVar(value="800.0")
+        self.setup_rho_var = tk.StringVar(value="1800.0")
+        self.setup_tm_var = tk.StringVar(value="1373.0")
+        self.setup_lh_var = tk.StringVar(value="1429.0")
+
+        fields = (
+            ("Length of the bar", self.setup_x_var),
+            ("Final time", self.setup_t_var),
+        )
+        ttk.Label(panel, text="Domain", style="Section.Card.TLabel").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(24, 10)
+        )
+        for row, (label, var) in enumerate(fields, start=3):
+            ttk.Label(panel, text=label, style="Card.TLabel").grid(
+                row=row, column=0, sticky="w", pady=8
+            )
+            ttk.Entry(panel, textvariable=var, width=22).grid(
+                row=row, column=1, columnspan=2, sticky="ew", padx=(16, 0), pady=8
+            )
+
+        ttk.Label(panel, text="Material", style="Section.Card.TLabel").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(28, 10)
+        )
+        self.material_frame = ttk.Frame(panel, style="Card.TFrame")
+        self.material_frame.grid(row=6, column=0, columnspan=3, sticky="ew")
+        self.material_frame.grid_columnconfigure(0, weight=1)
+        self.material_selector = ttk.Combobox(
+            self.material_frame,
+            textvariable=self.setup_material_var,
+            values=list(MATERIAL_CLASSES.keys()),
+            state="readonly",
+            width=24,
+        )
+        self.material_selector.grid(row=0, column=0, sticky="ew")
+
+        ttk.Button(
+            panel,
+            text="Run Simulation",
+            command=self.submit_setup_form,
+            style="Primary.TButton",
+        ).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(36, 0))
+
+        ttk.Label(
+            custom_panel, text="Custom Properties", style="Section.Card.TLabel"
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 18))
+        self.custom_frame = ttk.Frame(custom_panel, style="Card.TFrame")
+        self.custom_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.custom_frame.grid_columnconfigure(1, weight=1)
+        custom_fields = (
+            ("Conductivity", self.setup_k_var),
+            ("Specific Heat", self.setup_c_var),
+            ("Density", self.setup_rho_var),
+            ("Melting Temperature", self.setup_tm_var),
+            ("Latent Heat", self.setup_lh_var),
+        )
+        for row, (label, var) in enumerate(custom_fields):
+            ttk.Label(self.custom_frame, text=label, style="Card.TLabel").grid(
+                row=row, column=0, sticky="w", pady=8
+            )
+            ttk.Entry(self.custom_frame, textvariable=var, width=20).grid(
+                row=row, column=1, sticky="ew", padx=(16, 0), pady=8
+            )
+
+        self.update_setup_mode()
+
+    def update_setup_mode(self) -> None:
+        custom_state = "normal" if self.setup_mode_var.get() == 0 else "disabled"
+        material_state = "readonly" if self.setup_mode_var.get() == 1 else "disabled"
+        for child in self.custom_frame.winfo_children():
+            try:
+                child.configure(state=custom_state)
+            except tk.TclError:
+                pass
+        for child in self.material_frame.winfo_children():
+            try:
+                child.configure(state=material_state)
+            except tk.TclError:
+                pass
+
+    def submit_setup_form(self) -> None:
+        try:
+            self.L = float(self.setup_x_var.get())
+            self.t_max = float(self.setup_t_var.get())
+            if self.L <= 0 or self.t_max <= 0:
+                raise ValueError("Length and final time must be positive.")
+
+            if self.setup_mode_var.get() == 0:
+                self.k = float(self.setup_k_var.get())
+                self.c = float(self.setup_c_var.get())
+                self.rho = float(self.setup_rho_var.get())
+                self.T_m = float(self.setup_tm_var.get())
+                self.LH = float(self.setup_lh_var.get())
+                self.material = "Custom"
+                self.pcm = backend.customPCM(self.k, self.c, self.rho, self.T_m, self.LH)
+            else:
+                self.material = self.setup_material_var.get()
+                material_cls = MATERIAL_CLASSES.get(self.material)
+                if material_cls is None:
+                    raise ValueError(f"Unsupported material: {self.material}")
+                self.pcm = material_cls()
+        except Exception as e:
+            self.set_status(f"Setup error: {e}", error=True)
+            self.notebook.select(self.messages_tab)
+            return
+
+        print(f"Debug: Selected material = {self.material}")
+        self.stop_animation()
+        self.simulation_ready = True
+        self._set_simulation_controls_enabled(True)
+        self._set_pinn_controls_enabled(True)
+        self.calcAll()
+        try:
+            if hasattr(self, "t_grid") and len(self.t_grid) > 0 and self.pcm is not None:
+                self.time_scale.config(
+                    to=float(self.t_grid[-1]), resolution=float(self.pcm.dt)
+                )
+                self.time_scale.set(float(self.t_grid[0]))
+        except Exception as e:
+            self.set_status(f"Warning: failed to sync time slider: {e}", error=True)
+
+        self.solution_type.set("Analytical")
+        self.update_solution_type()
+        self.update_plots()
+        self.notebook.select(self.simulation_tab)
+        self.set_status(f"Simulation ready: {self.material}")
+
+    def build_simulation_tab(self) -> None:
+        self.simulation_tab.grid_rowconfigure(1, weight=1)
+        self.simulation_tab.grid_columnconfigure(0, weight=1)
+
+        controls_card = RoundedFrame(self.simulation_tab, radius=20, padding=18)
+        controls_card.configure(height=108)
+        controls_card.grid_propagate(False)
+        controls_card.grid(row=0, column=0, sticky="ew", padx=26, pady=(22, 12))
+        controls = controls_card.content
+        controls.columnconfigure(3, weight=1)
+
+        ttk.Label(controls, text="Solution", style="Card.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.solution_menu = ttk.Combobox(
+            controls,
+            textvariable=self.solution_type,
+            values=("Analytical", "Implicit", "Numerical", "PINN"),
+            state="readonly",
+            width=16,
+        )
+        self.solution_menu.grid(row=0, column=1, sticky="w", padx=(10, 18))
+        self.solution_type.trace_add("write", self.handle_solution_type_change)
+
+        ttk.Label(controls, text="Time", style="Card.TLabel").grid(
+            row=0, column=2, sticky="e"
+        )
+        self.time_scale = tk.Scale(
+            controls,
+            from_=0,
+            to=1,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            command=self.update_time,
+            length=420,
+            bg=THEME["surface"],
+            fg=THEME["text"],
+            troughcolor=THEME["surface_alt"],
+            activebackground=THEME["primary"],
+            highlightthickness=0,
+            bd=0,
+            font=self.small_font,
+        )
+        self.time_scale.grid(row=0, column=3, sticky="ew", padx=(10, 14))
+
+        self.step_back_button = ttk.Button(
+            controls, text="Step Back", command=lambda: self.step_animation(-1)
+        )
+        self.step_back_button.grid(row=0, column=4, sticky="ew", padx=2)
+        self.play_button = ttk.Button(
+            controls, text="Play", command=self.toggle_animation
+        )
+        self.play_button.grid(row=0, column=5, sticky="ew", padx=2)
+        self.step_forward_button = ttk.Button(
+            controls, text="Step Forward", command=lambda: self.step_animation(1)
+        )
+        self.step_forward_button.grid(row=0, column=6, sticky="ew", padx=2)
+
+        self.animation_speed_var = tk.IntVar(value=self.animation_interval_ms)
+        ttk.Label(controls, text="Speed", style="Card.TLabel").grid(
+            row=0, column=7, sticky="e", padx=(14, 0)
+        )
+        self.animation_speed_scale = tk.Scale(
+            controls,
+            from_=50,
+            to=1000,
+            resolution=50,
+            orient=tk.HORIZONTAL,
+            variable=self.animation_speed_var,
+            length=150,
+            bg=THEME["surface"],
+            fg=THEME["text"],
+            troughcolor=THEME["surface_alt"],
+            activebackground=THEME["primary"],
+            highlightthickness=0,
+            bd=0,
+            font=self.small_font,
+        )
+        self.animation_speed_scale.grid(row=0, column=8, sticky="ew", padx=(10, 0))
+
+        plots_frame = ttk.Frame(
+            self.simulation_tab, style="App.TFrame", padding=(26, 0, 26, 10)
+        )
+        plots_frame.grid(row=1, column=0, sticky="nsew")
+        for col in range(3):
+            plots_frame.grid_columnconfigure(col, weight=1)
+        plots_frame.grid_rowconfigure(0, weight=1)
+
+        plot_cards = []
+        for col in range(3):
+            card = RoundedFrame(plots_frame, radius=20, padding=12)
+            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 8, 0 if col == 2 else 8))
+            card.content.grid_rowconfigure(0, weight=1)
+            card.content.grid_columnconfigure(0, weight=1)
+            plot_cards.append(card)
+
         self.fig1, self.ax1 = plt.subplots(figsize=(4, 3), dpi=100)
         self.ax1.set_title("T(E) Line Plot")
-        self.ax1.set_xlabel("E")
+        self.ax1.set_xlabel("E (MJ/m³)")
         self.ax1.set_ylabel("T")
-        self.canvas1 = FigureCanvasTkAgg(self.fig1, self.root)
+        self.canvas1 = FigureCanvasTkAgg(self.fig1, plot_cards[0].content)
         self.canvas1.draw()
-        self.fig2 = Figure(figsize=(4, 3), dpi=100)
-        self.ax2 = cast(Axes3D, self.fig2.add_subplot(111, projection="3d"))
-        self.ax2.set_title("3D Surface Plot")
-        self.ax2.set_xlabel("x")
-        self.ax2.set_ylabel("t")
-        self.ax2.set_zlabel("T")
-        self.canvas2 = FigureCanvasTkAgg(self.fig2, self.root)
 
         self.fig3 = Figure(figsize=(5, 5), dpi=100)
         self.ax3 = self.fig3.add_subplot(111)
@@ -328,69 +862,223 @@ class App:
         self.ax3.set_xlabel("x [m]")
         self.ax3.set_ylabel("T [C]")
         self.ax3.set_title("T(x)")
-        self.canvas3 = FigureCanvasTkAgg(
-            self.fig3, master=self.root
-        )  # A tk.DrawingArea.
+        self.canvas3 = FigureCanvasTkAgg(self.fig3, master=plot_cards[1].content)
         self.canvas3.draw()
-        self.canvas3.get_tk_widget().grid(row=1, column=1, sticky="nsew")
-        (self.line1,) = self.ax1.plot(
-            [], [], "r-", label="Line Plot 1"
-        )  # Notice the comma
-        (self.line3,) = self.ax3.plot(
-            [], [], "g-", label="Line Plot 3"
-        )  # Notice the comma
 
+        self.fig2 = Figure(figsize=(4, 3), dpi=100)
+        self.ax2 = cast(Axes3D, self.fig2.add_subplot(111, projection="3d"))
+        self.ax2.set_title("3D Surface Plot")
+        self.ax2.set_xlabel("x")
+        self.ax2.set_ylabel("t")
+        self.ax2.set_zlabel("T")
+        self.canvas2 = FigureCanvasTkAgg(self.fig2, plot_cards[2].content)
+        self.canvas2.draw()
+
+        for canvas in (self.canvas1, self.canvas3, self.canvas2):
+            canvas.get_tk_widget().configure(
+                bg=THEME["surface"], highlightthickness=0, bd=0
+            )
+        self.canvas1.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.canvas3.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.canvas2.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        (self.line1,) = self.ax1.plot([], [], "r-", label="Line Plot 1")
+        (self.line3,) = self.ax3.plot([], [], "g-", label="Line Plot 3")
         self.ax3.legend()
 
-        # Configure the frame to give all extra space to the line plot
-        self.frame.grid_rowconfigure(0, weight=1)
-        self.frame.grid_columnconfigure(0, weight=1)
-
-        self.canvas1.get_tk_widget().grid(row=1, column=0, sticky="nsew")
-        self.canvas2.get_tk_widget().grid(row=1, column=2, sticky="nsew")
-
-        # Add this to the App's __init__ method to create the label
-        self.energy_label = tk.Label(
-            self.root, text="", bg="white", wraplength=500, justify="center"
+        self.energy_label = ttk.Label(
+            self.simulation_tab,
+            text="",
+            anchor="center",
+            wraplength=1100,
+            style="Status.TLabel",
         )
-        self.energy_label.grid(row=2, column=0, columnspan=3, pady=10)
+        self.energy_label.grid(row=2, column=0, sticky="ew", padx=26, pady=(0, 18))
 
-        # Configure the frame to give all extra space to the line plot
-        self.frame.grid_rowconfigure(0, weight=1)
-        self.frame.grid_columnconfigure(0, weight=1)
-        self.frame.grid_columnconfigure(1, weight=1)
-        self.frame.grid_columnconfigure(2, weight=1)
+    def build_pinn_tab(self) -> None:
+        self.pinn_tab.grid_rowconfigure(1, weight=1)
+        self.pinn_tab.grid_columnconfigure(0, weight=1)
 
-        # Configure the main window to distribute extra space among the widgets
-        self.root.grid_rowconfigure(0, weight=1)  # Row for the time scale
-        self.root.grid_rowconfigure(1, weight=3)  # Row for the plots
-        self.root.grid_rowconfigure(2, weight=1)  # Row for the energy sufficiency label
+        controls_card = RoundedFrame(self.pinn_tab, radius=20, padding=18)
+        controls_card.configure(height=108)
+        controls_card.grid_propagate(False)
+        controls_card.grid(row=0, column=0, sticky="ew", padx=26, pady=(22, 12))
+        controls = controls_card.content
+        controls.columnconfigure(3, weight=1)
 
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_columnconfigure(1, weight=1)
-        self.root.grid_columnconfigure(2, weight=1)
+        ttk.Label(controls, text="Gold Standard", style="Card.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.gold_standard_var = tk.StringVar(value="Analytical")
+        self.gold_standard_menu = ttk.Combobox(
+            controls,
+            textvariable=self.gold_standard_var,
+            values=("Analytical", "Implicit", "Numerical"),
+            state="readonly",
+            width=16,
+        )
+        self.gold_standard_menu.grid(row=0, column=1, sticky="w", padx=(10, 12))
+        self.train_pinn_button = ttk.Button(
+            controls,
+            text="Train PINN",
+            command=lambda: self.handle_gold_standard_selection(
+                self.gold_standard_var.get()
+            ),
+            style="Primary.TButton",
+        )
+        self.train_pinn_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         self.fig_PINN = Figure(figsize=(15, 5), dpi=100)
-        self.moving_boundary_locations = None
-        self.indices = []
+        self.pinn_canvas_card = RoundedFrame(self.pinn_tab, radius=20, padding=12)
+        self.pinn_canvas_card.grid(
+            row=1, column=0, sticky="nsew", padx=26, pady=(0, 10)
+        )
+        self.pinn_canvas_frame = self.pinn_canvas_card.content
+        self.pinn_canvas_frame.grid_rowconfigure(0, weight=1)
+        self.pinn_canvas_frame.grid_columnconfigure(0, weight=1)
+        self.pinn_canvas = FigureCanvasTkAgg(self.fig_PINN, master=self.pinn_canvas_frame)
+        self.pinn_canvas.get_tk_widget().configure(
+            bg=THEME["surface"], highlightthickness=0, bd=0
+        )
+        self.pinn_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
-        self.calcAll()
-        # Sync the time slider with the actual simulated time span (may differ from user input if adjusted internally)
+        self.pinn_toolbar_frame = ttk.Frame(
+            self.pinn_tab, style="App.TFrame", padding=(26, 0, 26, 14)
+        )
+        self.pinn_toolbar_frame.grid(row=2, column=0, sticky="ew")
+        self.pinn_toolbar = NavigationToolbar2Tk(self.pinn_canvas, self.pinn_toolbar_frame)
+        self.pinn_toolbar.update()
+
+    def build_messages_tab(self) -> None:
+        self.messages_tab.grid_rowconfigure(1, weight=1)
+        self.messages_tab.grid_columnconfigure(0, weight=1)
+
+        button_card = RoundedFrame(self.messages_tab, radius=20, padding=18)
+        button_card.configure(height=108)
+        button_card.grid_propagate(False)
+        button_card.grid(row=0, column=0, sticky="ew", padx=26, pady=(22, 12))
+        button_bar = button_card.content
+        button_bar.grid_columnconfigure(1, weight=1)
+        ttk.Label(button_bar, text="Messages", style="Section.Card.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.copy_commands_button = ttk.Button(
+            button_bar,
+            text="Copy Commands",
+            command=self.copy_last_commands,
+        )
+        self.copy_commands_button.grid(row=0, column=1, sticky="e")
+
+        text_card = RoundedFrame(self.messages_tab, radius=20, padding=14)
+        text_card.grid(row=1, column=0, sticky="nsew", padx=26, pady=(0, 18))
+        text_frame = text_card.content
+        text_frame.grid_rowconfigure(0, weight=1)
+        text_frame.grid_columnconfigure(0, weight=1)
+
+        self.messages_text = tk.Text(
+            text_frame,
+            wrap="word",
+            height=12,
+            bg="#f8fafc",
+            fg=THEME["text"],
+            insertbackground=THEME["text"],
+            relief="flat",
+            bd=0,
+            padx=16,
+            pady=14,
+            font=self.body_font,
+        )
+        self.messages_text.grid(row=0, column=0, sticky="nsew")
+        yscroll = ttk.Scrollbar(text_frame, command=self.messages_text.yview)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self.messages_text["yscrollcommand"] = yscroll.set
+        self.messages_text.configure(state="disabled")
+
+    def _set_simulation_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            getattr(self, "solution_menu", None),
+            getattr(self, "time_scale", None),
+            getattr(self, "step_back_button", None),
+            getattr(self, "play_button", None),
+            getattr(self, "step_forward_button", None),
+            getattr(self, "animation_speed_scale", None),
+        ):
+            if widget is not None:
+                try:
+                    state = (
+                        "readonly"
+                        if enabled and isinstance(widget, ttk.Combobox)
+                        else "normal"
+                        if enabled
+                        else "disabled"
+                    )
+                    widget.configure(state=state)
+                except tk.TclError:
+                    pass
+
+    def _set_pinn_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            getattr(self, "gold_standard_menu", None),
+            getattr(self, "train_pinn_button", None),
+        ):
+            if widget is not None:
+                try:
+                    state = (
+                        "readonly"
+                        if enabled and isinstance(widget, ttk.Combobox)
+                        else "normal"
+                        if enabled
+                        else "disabled"
+                    )
+                    widget.configure(state=state)
+                except tk.TclError:
+                    pass
+
+    def set_status(self, message: str, error: bool = False) -> None:
+        prefix = "Error: " if error and not message.startswith("Error") else ""
+        text = prefix + message
+        self.status_var.set(text)
         try:
-            if hasattr(self, "t_grid") and len(self.t_grid) > 0:
-                self.time_scale.config(
-                    to=float(self.t_grid[-1]), resolution=float(self.pcm.dt)
-                )
-        except Exception as e:
-            print(f"Warning: Failed to sync time slider with simulation time grid: {e}")
-        self.update_solution_type()
-        self.update_plots()
+            self.messages_text.configure(state="normal")
+            self.messages_text.insert("end", text + "\n")
+            self.messages_text.see("end")
+            self.messages_text.configure(state="disabled")
+        except Exception:
+            print(text)
+
+    def show_commands_panel(self, title, instructions, commands):
+        self.last_commands = commands
+        content = f"{title}\n\n{instructions}\n\n{commands}\n"
+        self.messages_text.configure(state="normal")
+        self.messages_text.delete("1.0", "end")
+        self.messages_text.insert("1.0", content)
+        self.messages_text.configure(state="disabled")
+        self.notebook.select(self.messages_tab)
+        self.set_status(title)
+
+    def copy_last_commands(self) -> None:
+        if not self.last_commands:
+            self.set_status("No commands available to copy.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.last_commands)
+        self.root.update()
+        self.set_status("Commands copied to clipboard.")
 
     # Call the energy calculation method and update the label with the result string
     def update_energy_label(self):
         # Example: Assuming self.H_arr_final contains the enthalpy values needed for the energy calculation
         if self.H_arr_final is not None:
-            result_string = self.pcm.calcEnergySufficiency(self.H_arr_final)
+            # Use the simulated time span (seconds) to set the load duration in hours
+            try:
+                sim_hours = float(self.t_grid[-1]) / 3600.0 if self.t_grid is not None else None
+            except Exception:
+                sim_hours = None
+
+            result_string = self.pcm.calcEnergySufficiency(
+                self.H_arr_final,
+                settlement_hours=sim_hours,
+            )
             self.energy_label.config(text=result_string)
         else:
             self.energy_label.config(
@@ -426,20 +1114,25 @@ class App:
         )
 
     def prompt_for_gold_standard(self):
-        self.gold_standard_window = GoldStandardSelectionWindow(
-            self.root, self.handle_gold_standard_selection
-        )
-        self.gold_standard_window.mainloop()
+        self.show_gold_standard_controls()
 
     def handle_solution_type_change(self, *args):
+        if not self.simulation_ready:
+            return
         selected_solution = self.solution_type.get()
         if selected_solution == "PINN":
-            # Prompt the user to select the gold standard solution type
-            self.prompt_for_gold_standard()
+            self.show_gold_standard_controls()
         else:
-            # Handle other solution types normally
+            self.hide_gold_standard_controls()
             self.update_solution_type()
             self.update_plots()
+
+    def show_gold_standard_controls(self):
+        self.notebook.select(self.pinn_tab)
+        self.set_status("Select a gold standard and train the PINN.")
+
+    def hide_gold_standard_controls(self):
+        return
 
     def calcAll(self):
         print("Debug: Starting calcAll")
@@ -452,6 +1145,11 @@ class App:
             "Implicit": None,
         }
         self.bound_mask_arrays: Dict[str, Optional[np.ndarray]] = {
+            "Numerical": None,
+            "Analytical": None,
+            "Implicit": None,
+        }
+        self.moving_boundary_positions: Dict[str, Optional[np.ndarray]] = {
             "Numerical": None,
             "Analytical": None,
             "Implicit": None,
@@ -513,6 +1211,14 @@ class App:
             )
 
         self.temperature_solutions["Numerical"] = self.T_arr_numerical
+
+        if self.T_arr_numerical is not None:
+            numerical_boundary_positions = self.compute_boundary_positions_from_temperature(
+                self.T_arr_numerical,
+                mask_series=_numerical_boundary_mask_series,
+                fallback_indices=moving_boundary_indices_numerical,
+            )
+            self.moving_boundary_positions["Numerical"] = numerical_boundary_positions
 
         # Analytical solution
         print("Debug: Calculating analytical solution")
@@ -768,6 +1474,8 @@ class App:
         return best_curve, best_label
 
     def update_solution_type(self, *args):
+        if not self.simulation_ready:
+            return
         selected_solution = self.solution_type.get()
         print(f"Debug: Selected solution type = {selected_solution}")
 
@@ -802,7 +1510,8 @@ class App:
             else:
                 print("Warning: Implicit solution data is not available.")
         elif selected_solution == "PINN":
-            self.prompt_for_gold_standard()
+            self.show_gold_standard_controls()
+            return
 
         if self.T_arr_to_display is not None:
             self.update_plots()
@@ -844,7 +1553,10 @@ class App:
 
         self.boundary_indices = boundary_indices
         self.moving_boundary_locations = boundary_positions
-        self.gold_standard_boundary_per_time = boundary_positions.copy()
+        sanitized_gold = self._sanitize_boundary_curve(boundary_positions)
+        self.gold_standard_boundary_per_time = (
+            sanitized_gold if sanitized_gold is not None else boundary_positions.copy()
+        )
 
         self.indices = list(range(len(self.t_grid)))
         self.true_boundary_times = self.t_grid.copy()
@@ -1055,12 +1767,9 @@ class App:
                     )
                 cmds_to_show = fix_prefix + install_cmds
 
-                messagebox.showerror(
-                    "TensorFlow/Keras not available",
-                    "PINN training requires TensorFlow/Keras and a compatible NumPy stack.\n\n"
-                    f"Detected Python {py_ver}. Recommended installation for {'conda' if is_conda else 'pip'} environment:\n{cmds_to_show}\n\n"
-                    "Alternatively, you can run: pip install -r requirements.txt (now version-aware).\n\n"
-                    f"Import error: {err}",
+                self.set_status(
+                    "TensorFlow/Keras not available. See Messages tab for setup commands.",
+                    error=True,
                 )
                 # Also print and show a copyable commands dialog
                 try:
@@ -1226,12 +1935,9 @@ class App:
                     "pip install --no-cache-dir --upgrade --force-reinstall --ignore-installed google-pasta==0.2.0 scikit-learn\n\n"
                 )
             cmds_to_show = fix_prefix + install_cmds
-            messagebox.showerror(
-                "TensorFlow/Keras not available",
-                "PINN training requires TensorFlow/Keras and a compatible NumPy stack.\n\n"
-                f"Detected Python {py_ver}. Recommended installation for {'conda' if is_conda else 'pip'} environment:\n{cmds_to_show}\n\n"
-                "Alternatively, you can run: pip install -r requirements.txt (now version-aware).\n\n"
-                f"Import error: {e}",
+            self.set_status(
+                "TensorFlow/Keras not available. See Messages tab for setup commands.",
+                error=True,
             )
             # Also print and show a copyable commands dialog
             try:
@@ -1310,11 +2016,18 @@ class App:
                     ),
                 }
                 prediction_batch_size = min(2048, max(32, self.batch_size))
+                sample_count = prediction_inputs["temperature_input"].shape[0]
+                print(
+                    f"Generating PINN predictions for visualization "
+                    f"({sample_count} samples, batch size {prediction_batch_size})...",
+                    flush=True,
+                )
                 model_output_full = self.model.predict(
                     prediction_inputs,
                     batch_size=prediction_batch_size,
-                    verbose=0,
+                    verbose=1,
                 )
+                print("Full-resolution predictions complete.", flush=True)
                 self.Temperature_pred = model_output_full["temperature_output"]
                 self.Boundary_pred = model_output_full["boundary_output"]
             else:
@@ -1357,26 +2070,23 @@ class App:
             return
         T_arr_to_display = self.T_arr_to_display
 
-        # Map the time slider (seconds) to a discrete time index
-        try:
-            t_val = float(self.time_scale.get())
-            dt = float(getattr(self.pcm, "dt", 1.0))
-            t_idx = int(round(t_val / max(dt, 1e-12)))
-        except Exception:
-            t_idx = 0
-        t_idx = max(0, min(t_idx, T_arr_to_display.shape[1] - 1))
+        enthalpy_curve, temperature_curve = self.build_enthalpy_temperature_curve(
+            T_arr_to_display
+        )
+
+        self.t_idx = max(
+            0,
+            min(self.time_value_to_index(), T_arr_to_display.shape[1] - 1),
+        )
 
         # Update T(x) plot
-        self.update_line_plot3(self.x_grid, T_arr_to_display[:, t_idx])
+        self.update_line_plot3(self.x_grid, T_arr_to_display[:, self.t_idx])
 
         # Update 3D surface plot
         self.update_surface_plot(self.x_grid, self.t_grid, T_arr_to_display)
 
-        # Safely access H_arr_final
-        if self.H_arr_final is not None:
-            self.update_line_plot(self.H_arr_final, T_arr_to_display)
-        else:
-            print("Warning: H_arr_final is not available, skipping update.")
+        # Update T(E) plot using a monotonic enthalpy-temperature relation with a latent-heat plateau
+        self.update_line_plot(enthalpy_curve, temperature_curve)
 
         self.canvas1.draw()
         self.canvas2.draw()
@@ -1385,43 +2095,105 @@ class App:
         # Update the energy sufficiency message
         self.update_energy_label()
 
+    def time_value_to_index(self, value=None) -> int:
+        try:
+            t_val = float(self.time_scale.get() if value is None else value)
+        except Exception:
+            t_val = 0.0
+
+        if self.t_grid is not None and len(self.t_grid) > 0:
+            t_values = np.asarray(self.t_grid, dtype=float)
+            finite_mask = np.isfinite(t_values)
+            if finite_mask.any():
+                valid_indices = np.flatnonzero(finite_mask)
+                nearest_valid = int(np.argmin(np.abs(t_values[finite_mask] - t_val)))
+                return int(valid_indices[nearest_valid])
+
+        try:
+            dt = float(getattr(self.pcm, "dt", 1.0))
+            max_idx = self.T_arr_to_display.shape[1] - 1 if self.T_arr_to_display is not None else 0
+            return max(0, min(int(round(t_val / max(dt, 1e-12))), max_idx))
+        except Exception:
+            return 0
+
+    def build_enthalpy_temperature_curve(
+        self, temperature_surface: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Construct a monotonic T(E) curve with a flat segment across the latent-heat interval."""
+        tm = float(getattr(self.pcm, "T_m", 0.0))
+        rho = max(float(getattr(self.pcm, "rho", 1.0)), 1e-12)
+        c_solid = max(float(getattr(self.pcm, "c_solid", getattr(self.pcm, "c", 1.0))), 1e-12)
+        c_liquid = max(float(getattr(self.pcm, "c_liquid", getattr(self.pcm, "c", 1.0))), 1e-12)
+        latent_heat = max(float(getattr(self.pcm, "LH", 0.0)), 0.0)
+
+        if temperature_surface.size:
+            t_min = float(np.nanmin(temperature_surface))
+            t_max = float(np.nanmax(temperature_surface))
+        else:
+            t_min = tm
+            t_max = tm
+
+        if not math.isfinite(t_min):
+            t_min = tm
+        if not math.isfinite(t_max):
+            t_max = tm
+
+        # Ensure the curve spans below and above the melting point so the branches and plateau are visible.
+        t_min = min(t_min, tm - 1e-3)
+        t_max = max(t_max, tm + 1e-3)
+
+        latent_enthalpy = latent_heat * rho
+
+        solid_enthalpy = np.linspace(
+            rho * c_solid * (t_min - tm),
+            0.0,
+            120,
+            endpoint=True,
+        )
+        solid_temps = tm + solid_enthalpy / (rho * c_solid)
+
+        plateau_points = 60 if latent_enthalpy > 0 else 2
+        plateau_enthalpy = np.linspace(0.0, latent_enthalpy, plateau_points)
+        plateau_temps = np.full_like(plateau_enthalpy, tm)
+
+        liquid_enthalpy = np.linspace(
+            latent_enthalpy,
+            latent_enthalpy + rho * c_liquid * (t_max - tm),
+            180,
+            endpoint=True,
+        )
+        liquid_temps = tm + (liquid_enthalpy - latent_enthalpy) / (rho * c_liquid)
+
+        enthalpy_curve = np.concatenate(
+            [solid_enthalpy, plateau_enthalpy[1:], liquid_enthalpy]
+        )
+        temperature_curve = np.concatenate(
+            [solid_temps, plateau_temps[1:], liquid_temps]
+        )
+        enthalpy_scaled = enthalpy_curve * PLOT_ENTHALPY_SCALE
+        min_e = float(np.nanmin(enthalpy_scaled)) if enthalpy_scaled.size else 0.0
+        offset = -min_e if min_e < 0 else 0.0
+        enthalpy_shifted = enthalpy_scaled + offset
+        return enthalpy_shifted, temperature_curve
+
     def show_PINN_plots(self, show_gold_standard=True, custom_cmap="coolwarm"):
+        self.render_pinn_results(show_gold_standard, custom_cmap)
+
+    def render_pinn_results(self, show_gold_standard=True, custom_cmap="coolwarm"):
         # Ensure the necessary data is available
         if self.Temperature_pred is None or self.Boundary_pred is None:
             print("Prediction data is not available.")
+            self.set_status("Prediction data is not available.", error=True)
             return
 
         if show_gold_standard and self.gold_standard_boundary_per_time is None:
             print("Gold standard data is not set.")
+            self.set_status("Gold standard data is not set.", error=True)
             return
-
-        # Create a new Tkinter window for the plots
-        new_window = tk.Toplevel(self.root)
-        new_window.title("PINN Plots")
-
-        # Create a main frame for all widgets
-        main_frame = tk.Frame(new_window)
-        main_frame.grid(row=0, column=0)
-
-        # Create a frame for the canvas where plots will be shown
-        canvas_frame = tk.Frame(main_frame)
-        canvas_frame.grid(row=0, column=0)
-
-        # Create a frame for the toolbar (for navigation and tools)
-        toolbar_frame = tk.Frame(main_frame)
-        toolbar_frame.grid(row=1, column=0)
 
         # Reset the figure before drawing new subplots
         self.fig_PINN.clf()
-
-        # Create a canvas on which the plots will be drawn
-        canvas = FigureCanvasTkAgg(self.fig_PINN, master=canvas_frame)
-        canvas.get_tk_widget().grid(row=0, column=0)
-
-        # Add a toolbar to the canvas frame
-        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
-        toolbar.update()
-        toolbar.pack()
+        self.notebook.select(self.pinn_tab)
 
         # Create subplots on the figure for different types of plots
         ax1 = self.fig_PINN.add_subplot(151)
@@ -1582,27 +2354,17 @@ class App:
                 color="gray",
             )
 
-            if show_gold_standard and self.gold_standard_boundary_per_time is not None:
-                ax4.plot(
-                    self.t_grid,
-                    self.gold_standard_boundary_per_time,
-                    label="Gold Standard Boundary",
-                    linestyle="--",
-                )
-            ax4.set_title("Boundary Location vs Time (PINN)")
-            ax4.set_xlabel("t")
-            ax4.set_ylabel("Boundary Location (m)")
-            ax4.legend()
-        else:
-            ax4.text(
-                0.5,
-                0.5,
-                "Boundary plot unavailable",
-                transform=ax4.transAxes,
-                ha="center",
-                va="center",
+        if show_gold_standard and self.gold_standard_boundary_per_time is not None:
+            ax4.plot(
+                self.t_grid,
+                self.gold_standard_boundary_per_time,
+                label="Gold Standard Boundary",
+                linestyle="--",
             )
-            ax4.set_axis_off()
+        ax4.set_title("Boundary Location vs Time (PINN)")
+        ax4.set_xlabel("t")
+        ax4.set_ylabel("Boundary Location (m)")
+        ax4.legend()
 
         # Save the composite PINN figure for reference
         try:
@@ -1611,12 +2373,48 @@ class App:
             print(f"Warning: Failed to save PINN figure ({e})")
 
         # Draw the canvas with all the plots
-        canvas.draw()
+        self.pinn_canvas.draw()
+        self.set_status("PINN plots updated.")
 
-    def update_line_plot(self, H_arr: np.ndarray, T_arr: np.ndarray) -> None:
-        self.line1.set_data(H_arr, T_arr)
+    def update_line_plot(
+        self, enthalpy_values: np.ndarray, temperature_values: np.ndarray
+    ) -> None:
+        enthalpy_values = np.asarray(enthalpy_values, dtype=float).ravel()
+        temperature_values = np.asarray(temperature_values, dtype=float).ravel()
+
+        if enthalpy_values.size != temperature_values.size:
+            min_len = min(enthalpy_values.size, temperature_values.size)
+            enthalpy_values = enthalpy_values[:min_len]
+            temperature_values = temperature_values[:min_len]
+
+        sort_idx = np.argsort(enthalpy_values)
+        enthalpy_sorted = enthalpy_values[sort_idx]
+        temperature_sorted = temperature_values[sort_idx]
+
+        self.line1.set_data(enthalpy_sorted, temperature_sorted)
         self.ax1.relim()
         self.ax1.autoscale_view()
+
+        if enthalpy_sorted.size:
+            x_min = float(np.nanmin(enthalpy_sorted))
+            x_max = float(np.nanmax(enthalpy_sorted))
+            x_span = x_max - x_min
+            x_pad = 0.1 * (x_span if x_span > 0 else max(abs(x_min), abs(x_max), 1.0))
+            self.ax1.set_xlim(x_min - x_pad, x_max + x_pad)
+
+        if temperature_sorted.size:
+            y_min = float(np.nanmin(temperature_sorted))
+            y_max = float(np.nanmax(temperature_sorted))
+            y_span = y_max - y_min
+            y_pad = 0.1 * (y_span if y_span > 0 else max(abs(y_min), abs(y_max), 1.0))
+
+            tm = float(getattr(self.pcm, "T_m", 0.0))
+            above_tm_margin = max(0.05 * max(tm, 1.0), 25.0)
+            y_upper = max(y_max + y_pad, tm + above_tm_margin)
+            self.ax1.set_ylim(y_min - y_pad, y_upper)
+
+        self.ax1.xaxis.set_major_locator(MaxNLocator(nbins=6))
+        self.ax1.yaxis.set_major_locator(MaxNLocator(nbins=6))
         self.canvas1.draw()
 
     def update_line_plot3(self, x: np.ndarray, y: np.ndarray) -> None:
@@ -1631,20 +2429,100 @@ class App:
             return
         T_arr_to_display = self.T_arr_to_display
 
-        # Map the time slider (seconds) to a discrete time index
-        try:
-            t_val = float(self.time_scale.get())
-            dt = float(getattr(self.pcm, "dt", 1.0))
-            t_idx = int(round(t_val / max(dt, 1e-12)))
-        except Exception:
-            t_idx = 0
-        self.t_idx = max(0, min(t_idx, T_arr_to_display.shape[1] - 1))
+        self.t_idx = max(
+            0,
+            min(self.time_value_to_index(event), T_arr_to_display.shape[1] - 1),
+        )
 
         # Update the T(x) plot
+        self.line3.set_xdata(self.x_grid)
         self.line3.set_ydata(T_arr_to_display[:, self.t_idx])
         self.ax3.relim()
         self.ax3.autoscale_view()
         self.canvas3.draw()
+        if self.x_grid is not None and self.t_grid is not None:
+            self.update_surface_plot(self.x_grid, self.t_grid, T_arr_to_display)
+
+    def update_surface_time_slice(self) -> None:
+        if (
+            self.T_arr_to_display is None
+            or self.x_grid is None
+            or self.t_grid is None
+            or len(self.t_grid) == 0
+        ):
+            return
+
+        try:
+            if self.surface_time_slice_artist is not None:
+                self.surface_time_slice_artist.remove()
+        except Exception:
+            pass
+        self.surface_time_slice_artist = None
+
+        t_idx = max(0, min(int(getattr(self, "t_idx", 0)), self.T_arr_to_display.shape[1] - 1))
+        x_values = np.asarray(self.x_grid, dtype=float)
+        t_values = np.full_like(x_values, float(self.t_grid[t_idx]), dtype=float)
+        z_values = np.asarray(self.T_arr_to_display[:, t_idx], dtype=float)
+        (self.surface_time_slice_artist,) = self.ax2.plot(
+            x_values,
+            t_values,
+            z_values,
+            color="black",
+            linewidth=3,
+            label="Current time",
+        )
+        try:
+            self.ax2.legend(loc="upper right")
+        except Exception:
+            pass
+        self.canvas2.draw_idle()
+
+    def toggle_animation(self) -> None:
+        if not self.simulation_ready or self.T_arr_to_display is None:
+            return
+        if self.animation_running:
+            self.stop_animation()
+            return
+        self.animation_running = True
+        self.play_button.configure(text="Pause")
+        self.advance_animation_frame()
+
+    def advance_animation_frame(self) -> None:
+        if not self.animation_running or self.T_arr_to_display is None:
+            return
+        next_idx = int(getattr(self, "t_idx", 0)) + 1
+        if next_idx >= self.T_arr_to_display.shape[1]:
+            next_idx = 0
+        self.t_idx = next_idx
+        if self.t_grid is not None and len(self.t_grid) > next_idx:
+            self.time_scale.set(float(self.t_grid[next_idx]))
+        interval = max(50, int(self.animation_speed_var.get()))
+        self.animation_after_id = self.root.after(interval, self.advance_animation_frame)
+
+    def step_animation(self, delta: int) -> None:
+        if not self.simulation_ready or self.T_arr_to_display is None:
+            return
+        self.stop_animation()
+        next_idx = int(getattr(self, "t_idx", 0)) + int(delta)
+        next_idx = max(0, min(next_idx, self.T_arr_to_display.shape[1] - 1))
+        self.t_idx = next_idx
+        if self.t_grid is not None and len(self.t_grid) > next_idx:
+            self.time_scale.set(float(self.t_grid[next_idx]))
+        else:
+            self.update_time(None)
+
+    def stop_animation(self) -> None:
+        if self.animation_after_id is not None:
+            try:
+                self.root.after_cancel(self.animation_after_id)
+            except Exception:
+                pass
+        self.animation_after_id = None
+        self.animation_running = False
+        try:
+            self.play_button.configure(text="Play")
+        except Exception:
+            pass
 
     def update_surface_plot(
         self,
@@ -1653,6 +2531,7 @@ class App:
         T_arr_to_display: np.ndarray,
     ) -> None:
         self.ax2.cla()
+        self.surface_time_slice_artist = None
         x_dim, t_dim = len(x_grid), len(t_arr_final)
         # print( f"Debug: update_surface_plot - x_dim: {x_dim}, t_dim: {t_dim}, T_arr_to_display shape: {
         # T_arr_to_display.shape}")
@@ -1665,22 +2544,46 @@ class App:
                 T_arr_to_display = T_arr_to_display[:, :t_dim]
 
             T_reshaped = T_arr_to_display.reshape((x_dim, t_dim))
-            X, T = np.meshgrid(x_grid, t_arr_final, indexing="ij")
-            rcount = min(200, x_dim)
-            ccount = min(200, t_dim)
-            self.ax2.plot_surface(
-                X,
-                T,
-                T_reshaped,
-                cmap="coolwarm",
-                rcount=rcount,
-                ccount=ccount,
-                antialiased=True,
+            current_t_idx = max(
+                0,
+                min(int(getattr(self, "t_idx", 0)), T_reshaped.shape[1] - 1),
             )
+            visible_t_count = min(t_dim, max(2, current_t_idx + 1))
+            self.surface_visible_t_count = visible_t_count
+            if visible_t_count >= 2 and x_dim >= 2:
+                t_visible = t_arr_final[:visible_t_count]
+                T_visible = T_reshaped[:, :visible_t_count]
+                X, T = np.meshgrid(x_grid, t_visible, indexing="ij")
+                rcount = min(200, x_dim)
+                ccount = min(200, visible_t_count)
+                self.ax2.plot_surface(
+                    X,
+                    T,
+                    T_visible,
+                    cmap="coolwarm",
+                    rcount=rcount,
+                    ccount=ccount,
+                    antialiased=True,
+                    alpha=0.95,
+                )
             self.ax2.set_title("3D Surface Plot")
             self.ax2.set_xlabel("x")
             self.ax2.set_ylabel("t")
             self.ax2.set_zlabel("T")
+            if x_dim:
+                self.ax2.set_xlim(float(np.nanmin(x_grid)), float(np.nanmax(x_grid)))
+            if t_dim:
+                self.ax2.set_ylim(
+                    float(np.nanmin(t_arr_final)), float(np.nanmax(t_arr_final))
+                )
+            finite_t = T_reshaped[np.isfinite(T_reshaped)]
+            if finite_t.size:
+                z_min = float(np.nanmin(finite_t))
+                z_max = float(np.nanmax(finite_t))
+                z_span = z_max - z_min
+                z_pad = 0.05 * (z_span if z_span > 0 else max(abs(z_min), 1.0))
+                self.ax2.set_zlim(z_min - z_pad, z_max + z_pad)
+            self.update_surface_time_slice()
             self.canvas2.draw()
 
             # print(
@@ -1690,50 +2593,9 @@ class App:
 
     def show_commands_dialog(self, title, instructions, commands):
         try:
-            win = tk.Toplevel(self.root)
-            win.title(title)
-            win.configure(bg="white")
-            win.geometry("720x320")
-
-            lbl = tk.Label(
-                win, text=instructions, justify="left", anchor="w", bg="white"
-            )
-            lbl.pack(fill="x", padx=10, pady=(10, 5))
-
-            frm = tk.Frame(win)
-            frm.pack(fill="both", expand=True, padx=10)
-
-            txt = tk.Text(frm, wrap="none", height=10)
-            txt.pack(side="left", fill="both", expand=True)
-            txt.insert("1.0", commands)
-            txt.configure(state="disabled")
-
-            yscroll = tk.Scrollbar(frm, command=txt.yview)
-            yscroll.pack(side="right", fill="y")
-            txt["yscrollcommand"] = yscroll.set
-
-            btnfrm = tk.Frame(win, bg="white")
-            btnfrm.pack(fill="x", padx=10, pady=10)
-
-            def copy_cmds():
-                try:
-                    self.root.clipboard_clear()
-                    self.root.clipboard_append(commands)
-                    self.root.update()
-                    messagebox.showinfo("Copied", "Commands copied to clipboard.")
-                except Exception as e:
-                    messagebox.showwarning(
-                        "Clipboard", f"Failed to copy to clipboard: {e}"
-                    )
-
-            copy_btn = tk.Button(
-                btnfrm, text="Copy commands to clipboard", command=copy_cmds
-            )
-            copy_btn.pack(side="left")
-            close_btn = tk.Button(btnfrm, text="Close", command=win.destroy)
-            close_btn.pack(side="right")
+            self.show_commands_panel(title, instructions, commands)
         except Exception as e:
-            print(f"Warning: failed to show text commands dialog: {e}")
+            print(f"Warning: failed to show text commands panel: {e}")
             print("Commands to run:\n" + commands)
 
     def run(self):
@@ -1742,45 +2604,6 @@ class App:
     def on_closing(self):
         # print("Main window is closing")
         self.root.destroy()
-
-
-class GoldStandardSelectionWindow(tk.Toplevel):
-    def __init__(self, parent, on_submit=None):
-        super().__init__(parent)
-        self.title("Select Gold Standard Solution")
-        self.on_submit = on_submit  # Callback function from the parent
-
-        # Exclude the PINN option from the selection
-        self.solution_types = ["Analytical", "Implicit", "Numerical"]
-
-        # Create a label
-        label = tk.Label(
-            self, text="Select a solution type to serve as a gold standard:"
-        )
-        label.grid(row=0, column=0)
-
-        # Create a StringVar for the dropdown
-        self.selected_option = tk.StringVar(self)
-        self.selected_option.set(self.solution_types[0])  # default value
-
-        # Create the dropdown menu
-        self.dropdown = tk.OptionMenu(self, self.selected_option, *self.solution_types)
-        self.dropdown.grid(row=1, column=0)
-
-        # Create submit button
-        submit_button = tk.Button(self, text="Submit", command=self.submit)
-        submit_button.grid(row=2, column=0)
-
-    def submit(self):
-        # Get the selected gold standard solution
-        self.selected_solution = self.selected_option.get()
-
-        # If a callback function was provided, call it with the selected solution
-        if self.on_submit is not None:
-            self.on_submit(self.selected_solution)
-
-        # Close the window
-        self.destroy()
 
 
 if __name__ == "__main__":

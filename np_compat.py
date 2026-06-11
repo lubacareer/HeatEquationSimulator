@@ -3,7 +3,7 @@ Lightweight NumPy compatibility shims and diagnostics.
 
 Purpose
 -------
-Some third‑party packages (or older local code) reference symbols that were
+Some third-party packages (or older local code) reference symbols that were
 removed or renamed in NumPy 2.0 (e.g., `numpy.bool8`). Importing this module
 early in your program defines missing aliases to keep such code running
 without modifying external dependencies.
@@ -26,7 +26,7 @@ if _np is not None:
     # NumPy 2.0 removed the `bool8` alias. Many libs still expect it.
     # Map it to the canonical `bool_` type if missing.
     if not hasattr(_np, "bool8"):
-        try:  # tolerate read‑only module attributes in exotic environments
+        try:  # tolerate read-only module attributes in exotic environments
             setattr(_np, "bool8", _np.bool_)
         except Exception:
             pass
@@ -43,6 +43,7 @@ def check_numpy_health() -> tuple[bool, str]:
     """
     try:
         import importlib
+
         np = importlib.import_module("numpy")
         # Basic sanity ops that require working C extensions
         a = np.array([1.0, 2.0, 3.0], dtype=np.float64)

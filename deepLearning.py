@@ -15,6 +15,7 @@ if not _ok:
     raise SystemExit(1)
 
 import numpy as np
+import math
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
@@ -145,8 +146,90 @@ def custom_accuracy(y_true, y_pred, min_value, max_value):
     return scaled_accuracy
 
 
+class PINNConsoleLogger(tf.keras.callbacks.Callback):
+    """Lightweight console logger to surface PINN training progress in real time."""
 
+    def __init__(
+        self,
+        total_epochs,
+        batches_per_epoch,
+        total_samples,
+        batch_log_frequency=1,
+        log_batches=True,
+    ):
+        super().__init__()
+        self.total_epochs = max(1, int(total_epochs or 1))
+        self.batches_per_epoch = max(1, int(batches_per_epoch or 1))
+        self.total_samples = max(1, int(total_samples or 1))
+        self.batch_log_frequency = max(1, int(batch_log_frequency or 1))
+        self.log_batches = bool(log_batches)
 
+    def on_train_begin(self, logs=None):
+        batch_size = None
+        if hasattr(self, "params"):
+            batch_size = self.params.get("batch_size")
+        msg = (
+            f"PINN training started: {self.total_epochs} epochs, "
+            f"{self.total_samples} samples, batch size {batch_size or 'auto'} "
+            f"(~{self.batches_per_epoch} batches/epoch)"
+        )
+        print(msg, flush=True)
+
+    def on_epoch_begin(self, epoch, logs=None):
+        print(f"Epoch {epoch + 1}/{self.total_epochs}", flush=True)
+
+    def on_train_batch_end(self, batch, logs=None):
+        if not self.log_batches:
+            return
+        current_batch = batch + 1
+        if (
+            current_batch % self.batch_log_frequency != 0
+            and current_batch != self.batches_per_epoch
+        ):
+            return
+        metrics_str = self._format_metrics(logs)
+        print(
+            f"  batch {current_batch}/{self.batches_per_epoch} - {metrics_str}",
+            flush=True,
+        )
+
+    def on_epoch_end(self, epoch, logs=None):
+        metrics_str = self._format_metrics(logs)
+        print(f"Epoch {epoch + 1} summary - {metrics_str}", flush=True)
+
+    def on_train_end(self, logs=None):
+        print("PINN training finished.", flush=True)
+
+    @staticmethod
+    def _safe_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            try:
+                return float(np.asarray(value).astype(np.float32))
+            except Exception:
+                return None
+
+    def _format_metrics(self, logs):
+        if not logs:
+            return "no metrics reported"
+        ordered_keys = (
+            ("loss", "loss", "{:.5f}"),
+            ("scaled_loss", "scaled_loss", "{:.5f}"),
+            ("physics_loss", "phys", "{:.5f}"),
+            ("physics_loss_raw", "phys_raw", "{:.3e}"),
+            ("scaled_accuracy_T", "acc_T", "{:.5f}"),
+            ("scaled_accuracy_B", "acc_B", "{:.5f}"),
+        )
+        parts = []
+        for key, label, fmt in ordered_keys:
+            if key not in logs:
+                continue
+            value = self._safe_float(logs.get(key))
+            if value is None:
+                continue
+            parts.append(f"{label}: {fmt.format(value)}")
+        return " | ".join(parts) if parts else "no metrics reported"
 
 
 class CustomPINNModel(tf.keras.Model):
@@ -180,6 +263,17 @@ class CustomPINNModel(tf.keras.Model):
         self.T_arr = gold_standard
         self.x = x_input
         self.pcm = pcm
+        self.has_heat_source = callable(getattr(self.pcm, "heat_source_function", None))
+        pcm_rho = float(getattr(self.pcm, "rho", 1.0) or 1.0)
+        pcm_c_candidate = float(
+            getattr(self.pcm, "c", 0.0)
+            or getattr(self.pcm, "c_solid", 0.0)
+            or getattr(self.pcm, "c_liquid", 1.0)
+            or 1.0
+        )
+        if not np.isfinite(pcm_c_candidate) or pcm_c_candidate == 0.0:
+            pcm_c_candidate = 1.0
+        self.heat_capacity_scale = max(pcm_rho * pcm_c_candidate, 1e-6)
         self.batch_size = batch_size
         self.bound_mask_array = tf.convert_to_tensor(bound_mask_array, dtype=tf.float32)
         self.temp_mask_array = tf.convert_to_tensor(temp_mask_array, dtype=tf.float32)
@@ -377,37 +471,102 @@ class CustomPINNModel(tf.keras.Model):
         return mask_initial_condition1, mask_initial_condition2, mask_moving_boundary
 
     @tf.function
-    def calculate_physics_loss(self, temperature_inputs, y_pred_T):
-        # Ensure tensor type
-        temperature_inputs = tf.convert_to_tensor(temperature_inputs, dtype=tf.float32)
+    def calculate_physics_loss(self, raw_temperature_inputs):
+        raw_inputs = tf.convert_to_tensor(raw_temperature_inputs, dtype=tf.float32)
+        normalized_inputs = (raw_inputs - self.temp_feature_mean) / self.temp_feature_std
 
-        # Compute derivatives of network output w.r.t. inputs using nested GradientTapes
         with tf.GradientTape(persistent=True) as tape2:
-            tape2.watch(temperature_inputs)
+            tape2.watch(normalized_inputs)
             with tf.GradientTape(persistent=True) as tape1:
-                tape1.watch(temperature_inputs)
-                x = temperature_inputs
+                tape1.watch(normalized_inputs)
+                x = normalized_inputs
                 for layer in self.temperature_subnetwork:
-                    x = layer(x, training=True)
-                u_pred = self.output_layer_temperature(x)
-            du_dinputs = tape1.gradient(u_pred, temperature_inputs)
-            u_x = du_dinputs[:, 0]
-            u_t = du_dinputs[:, 1]
-        u_xx_full = tape2.gradient(u_x, temperature_inputs)
+                    x = layer(x, training=False)
+                temp_linear = self.output_layer_temperature(x)
+                u_pred = self.temp_output_center + self.temp_output_half_range * tf.tanh(temp_linear)
+            du_dinputs = tape1.gradient(u_pred, normalized_inputs)
+            u_x_norm = du_dinputs[:, 0]
+            u_t_norm = du_dinputs[:, 1]
+        u_xx_norm = tape2.gradient(u_x_norm, normalized_inputs)
         del tape1
         del tape2
-        u_xx = u_xx_full[:, 0]
 
-        # Pure diffusion residual (no external heat source) for consistency across solvers
-        heat_equation_res = u_t - self.alpha * u_xx
-        physics_loss = tf.reduce_mean(tf.square(heat_equation_res))
-        return physics_loss
+        std_x = tf.maximum(self.temp_feature_std[0], 1e-6)
+        std_t = tf.maximum(self.temp_feature_std[1], 1e-6)
+        u_t_phys = u_t_norm / std_t
+        u_xx_phys = u_xx_norm[:, 0] / (std_x * std_x)
+
+        x_phys = tf.reshape(raw_inputs[:, 0], [-1])
+        t_phys = tf.reshape(raw_inputs[:, 1], [-1])
+        if self.has_heat_source:
+            heat_flux = self._evaluate_heat_flux(x_phys, t_phys)
+        else:
+            heat_flux = tf.zeros_like(x_phys, dtype=tf.float32)
+        heat_capacity = self._evaluate_heat_capacity(tf.reshape(u_pred, [-1]))
+        source_term = heat_flux / heat_capacity
+
+        heat_equation_res = u_t_phys - self.alpha * u_xx_phys - source_term
+        raw_physics_loss = tf.reduce_mean(tf.square(heat_equation_res))
+
+        # Dynamically scale the residual so extremely small raw values still inform training.
+        # Use stop_gradient to prevent the scale from affecting the backward pass.
+        residual_scale = (
+            tf.reduce_mean(tf.abs(u_t_phys))
+            + tf.reduce_mean(tf.abs(self.alpha * u_xx_phys))
+            + tf.reduce_mean(tf.abs(source_term))
+        )
+        residual_scale = tf.stop_gradient(tf.maximum(residual_scale, 1e-6))
+        normalized_residual = heat_equation_res / residual_scale
+        physics_loss = tf.reduce_mean(tf.square(normalized_residual))
+        return physics_loss, raw_physics_loss
+
+    def _evaluate_heat_flux(self, x_phys, t_phys):
+        def _flux_np(x_np, t_np):
+            pcm = self.pcm
+            x_arr = np.asarray(x_np, dtype=np.float32).ravel()
+            t_arr = np.asarray(t_np, dtype=np.float32).ravel()
+            flux = np.zeros_like(x_arr, dtype=np.float32)
+            for idx in range(x_arr.shape[0]):
+                try:
+                    flux[idx] = float(
+                        pcm.heat_source_function(float(x_arr[idx]), float(t_arr[idx]))
+                    )
+                except Exception:
+                    flux[idx] = 0.0
+            return flux.reshape(x_np.shape)
+
+        heat_flux = tf.numpy_function(_flux_np, [x_phys, t_phys], tf.float32)
+        heat_flux.set_shape(x_phys.shape)
+        return heat_flux
+
+    def _evaluate_heat_capacity(self, temperature):
+        def _heat_capacity_np(temp_np):
+            pcm = self.pcm
+            temp_arr = np.asarray(temp_np, dtype=np.float32).ravel()
+            rho = float(getattr(pcm, "rho", 1.0) or 1.0)
+            try:
+                specific_heat = np.asarray(
+                    pcm.calcSpecificHeat(temp_arr), dtype=np.float32
+                ).reshape(temp_arr.shape)
+            except Exception:
+                specific_heat = np.full(
+                    temp_arr.shape,
+                    float(self.heat_capacity_scale) / max(rho, 1e-6),
+                    dtype=np.float32,
+                )
+            heat_capacity = rho * specific_heat
+            heat_capacity = np.maximum(heat_capacity, 1e-6).astype(np.float32)
+            return heat_capacity.reshape(temp_np.shape)
+
+        heat_capacity = tf.numpy_function(_heat_capacity_np, [temperature], tf.float32)
+        heat_capacity.set_shape(temperature.shape)
+        return tf.maximum(heat_capacity, tf.constant(1e-6, dtype=tf.float32))
 
     def stefan_loss_wrapper(self, x, y_T, y_B, T_arr, pcm, mask_T, mask_B):
         def loss(y_true, y_pred):
             mse_loss_T = tf.reduce_mean(tf.square(y_true['temperature_output'] - y_pred['temperature_output']))
             mse_loss_B = tf.reduce_mean(tf.square(y_true['boundary_output'] - y_pred['boundary_output']))
-            physics_loss = self.calculate_physics_loss(x, y_pred['temperature_output'])
+            physics_loss, _ = self.calculate_physics_loss(x)
 
             total_loss = self.scale_physics * physics_loss + self.scale_mse_T * mse_loss_T + self.scale_mse_B * mse_loss_B
 
@@ -526,7 +685,8 @@ class CustomPINNModel(tf.keras.Model):
         with tf.GradientTape() as tape:
             y_pred = self(inputs, training=True)
             mse_loss_T, mse_loss_B = self.compute_loss(targets, y_pred, inputs, sample_weights)
-            total_loss = mse_loss_T + mse_loss_B
+            physics_loss, physics_loss_raw = self.calculate_physics_loss(inputs['temperature_input'])
+            total_loss = mse_loss_T + mse_loss_B + self.scale_physics * physics_loss
 
         grads = tape.gradient(total_loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
@@ -573,7 +733,9 @@ class CustomPINNModel(tf.keras.Model):
             "loss": total_loss,
             "scaled_loss": scaled_loss,
             "scaled_accuracy_T": scaled_accuracy_T,
-            "scaled_accuracy_B": scaled_accuracy_B
+            "scaled_accuracy_B": scaled_accuracy_B,
+            "physics_loss": physics_loss,
+            "physics_loss_raw": physics_loss_raw,
         }
 
     def scale_value(self, value, min_value, max_value):
@@ -972,6 +1134,10 @@ def train_PINN(model, x, x_boundary, y_T, y_B, epochs, mask_T, mask_B, batch_siz
         print(f"Debug: Trimmed mask_T shape = {mask_T.shape}")
         print(f"Debug: Trimmed mask_B shape = {mask_B.shape}")
 
+    total_samples = int(min_length)
+    effective_batch_size = max(1, int(batch_size or 1))
+    batches_per_epoch = max(1, math.ceil(total_samples / effective_batch_size))
+
     # Create inputs and targets dictionaries for the model
     inputs = {
         'temperature_input': x,
@@ -994,14 +1160,23 @@ def train_PINN(model, x, x_boundary, y_T, y_B, epochs, mask_T, mask_B, batch_siz
     # Explicitly build the model before training
     model.build(input_shape={'temperature_input': x.shape, 'boundary_input': x_boundary.shape})
 
+    training_logger = PINNConsoleLogger(
+        total_epochs=epochs,
+        batches_per_epoch=batches_per_epoch,
+        total_samples=total_samples,
+        batch_log_frequency=1,
+        log_batches=True,
+    )
+
     # Training loop
     history = model.fit(
         x=inputs,
         y=targets,
         sample_weight=sample_weights,
         epochs=epochs,
-        batch_size=batch_size,
-        verbose=1 if debug_logging else 0,
+        batch_size=effective_batch_size,
+        verbose=0,
+        callbacks=[training_logger],
     )
     if debug_logging:
         print(f"Debug: History keys: {history.history.keys()}")
@@ -1050,12 +1225,51 @@ def train_PINN(model, x, x_boundary, y_T, y_B, epochs, mask_T, mask_B, batch_siz
             if scaled_accuracy_values_B_raw:
                 print("Debug: Scaled Accuracy B (raw):", scaled_accuracy_values_B_raw)
 
-    model_output = model.predict(inputs, verbose=1 if debug_logging else 0)
+    print(
+        f"Running PINN predictions on training samples "
+        f"({total_samples} rows, batch size {effective_batch_size})...",
+        flush=True,
+    )
+    model_output = model.predict(
+        inputs,
+        verbose=1,
+        batch_size=effective_batch_size,
+    )
+    print("Training-set predictions complete.", flush=True)
     if debug_logging:
         print(f"Debug: model_output keys: {model_output.keys()}")
 
     Temperature_pred = model_output['temperature_output']
     Boundary_pred = model_output['boundary_output']
+
+    if scaled_accuracy_values_T or scaled_accuracy_values_B:
+        final_acc_T = (
+            scaled_accuracy_values_T[-1]
+            if scaled_accuracy_values_T
+            else scaled_accuracy_values_T_raw[-1]
+            if scaled_accuracy_values_T_raw
+            else None
+        )
+        final_acc_B = (
+            scaled_accuracy_values_B[-1]
+            if scaled_accuracy_values_B
+            else scaled_accuracy_values_B_raw[-1]
+            if scaled_accuracy_values_B_raw
+            else None
+        )
+        parts = []
+        if final_acc_T is not None:
+            parts.append(f"Temperature accuracy: {float(final_acc_T):.5f}")
+        if final_acc_B is not None:
+            parts.append(f"Boundary accuracy: {float(final_acc_B):.5f}")
+        if parts:
+            print("Final scaled accuracies -> " + " | ".join(parts), flush=True)
+
+    if raw_loss_values:
+        try:
+            print(f"Final training loss: {float(raw_loss_values[-1]):.6f}", flush=True)
+        except (TypeError, ValueError):
+            pass
 
     if debug_logging:
         print(f"Debug (train_PINN): Scaled Accuracy T values: {scaled_accuracy_values_T}")
@@ -1066,7 +1280,9 @@ def train_PINN(model, x, x_boundary, y_T, y_B, epochs, mask_T, mask_B, batch_siz
         'scaled_accuracy_B': scaled_accuracy_values_B or scaled_accuracy_values_B_raw,
         'scaled_accuracy_T_raw': scaled_accuracy_values_T_raw,
         'scaled_accuracy_B_raw': scaled_accuracy_values_B_raw,
-        'raw_loss': raw_loss_values
+        'raw_loss': raw_loss_values,
+        'physics_loss': history.history.get('physics_loss', []),
+        'physics_loss_raw': history.history.get('physics_loss_raw', []),
     }, Temperature_pred, Boundary_pred
 
 
