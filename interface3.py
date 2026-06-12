@@ -369,9 +369,13 @@ class App:
 
         self.animation_running = False
         self.animation_after_id: Optional[str] = None
-        self.animation_interval_ms = 250
+        self.animation_interval_ms = 60
+        self.animation_frame_step = 10
         self.surface_time_slice_artist = None
-        self.surface_visible_t_count = 0
+        self.terrain_x_values: Optional[np.ndarray] = None
+        self.terrain_y_values: Optional[np.ndarray] = None
+        self.terrain_profile_values: Optional[np.ndarray] = None
+        self.terrain_surface_values: Optional[np.ndarray] = None
         self.last_commands = ""
 
         self.build_dashboard()
@@ -452,6 +456,7 @@ class App:
             "TNotebook.Tab",
             background=[("selected", THEME["surface"]), ("active", "#e7edf6")],
             foreground=[("selected", THEME["primary"]), ("active", THEME["text"])],
+            padding=[("selected", (22, 11)), ("active", (22, 11))],
         )
         style.configure(
             "TButton",
@@ -867,10 +872,10 @@ class App:
 
         self.fig2 = Figure(figsize=(4, 3), dpi=100)
         self.ax2 = cast(Axes3D, self.fig2.add_subplot(111, projection="3d"))
-        self.ax2.set_title("3D Surface Plot")
-        self.ax2.set_xlabel("x")
-        self.ax2.set_ylabel("t")
-        self.ax2.set_zlabel("T")
+        self.ax2.set_title("Thermal Terrain Snapshot")
+        self.ax2.set_xlabel("x [m]")
+        self.ax2.set_ylabel("y [m]")
+        self.ax2.set_zlabel("Temperature [C]")
         self.canvas2 = FigureCanvasTkAgg(self.fig2, plot_cards[2].content)
         self.canvas2.draw()
 
@@ -2447,8 +2452,6 @@ class App:
         if (
             self.T_arr_to_display is None
             or self.x_grid is None
-            or self.t_grid is None
-            or len(self.t_grid) == 0
         ):
             return
 
@@ -2460,16 +2463,31 @@ class App:
         self.surface_time_slice_artist = None
 
         t_idx = max(0, min(int(getattr(self, "t_idx", 0)), self.T_arr_to_display.shape[1] - 1))
-        x_values = np.asarray(self.x_grid, dtype=float)
-        t_values = np.full_like(x_values, float(self.t_grid[t_idx]), dtype=float)
-        z_values = np.asarray(self.T_arr_to_display[:, t_idx], dtype=float)
+        terrain_x_values = getattr(self, "terrain_x_values", None)
+        terrain_y_values = getattr(self, "terrain_y_values", None)
+        terrain_profile_values = getattr(self, "terrain_profile_values", None)
+        x_values = (
+            np.asarray(terrain_x_values, dtype=float)
+            if terrain_x_values is not None
+            else np.asarray(self.x_grid, dtype=float)
+        )
+        terrain_center = (
+            np.asarray(terrain_y_values, dtype=float)
+            if terrain_y_values is not None
+            else np.zeros_like(x_values, dtype=float)
+        )
+        z_values = (
+            np.asarray(terrain_profile_values, dtype=float)
+            if terrain_profile_values is not None
+            else np.asarray(self.T_arr_to_display[:, t_idx], dtype=float)
+        )
         (self.surface_time_slice_artist,) = self.ax2.plot(
             x_values,
-            t_values,
+            terrain_center,
             z_values,
             color="black",
             linewidth=3,
-            label="Current time",
+            label="Current terrain ridge",
         )
         try:
             self.ax2.legend(loc="upper right")
@@ -2490,7 +2508,7 @@ class App:
     def advance_animation_frame(self) -> None:
         if not self.animation_running or self.T_arr_to_display is None:
             return
-        next_idx = int(getattr(self, "t_idx", 0)) + 1
+        next_idx = int(getattr(self, "t_idx", 0)) + int(self.animation_frame_step)
         if next_idx >= self.T_arr_to_display.shape[1]:
             next_idx = 0
         self.t_idx = next_idx
@@ -2537,6 +2555,9 @@ class App:
         # T_arr_to_display.shape}")
 
         try:
+            if x_dim < 2 or t_dim < 1:
+                return
+
             if T_arr_to_display.shape[1] != t_dim:
                 print(
                     f"Warning: T_arr_to_display shape mismatch, reshaping to ({x_dim}, {t_dim})"
@@ -2544,45 +2565,145 @@ class App:
                 T_arr_to_display = T_arr_to_display[:, :t_dim]
 
             T_reshaped = T_arr_to_display.reshape((x_dim, t_dim))
+            finite_t = T_reshaped[np.isfinite(T_reshaped)]
+            if not finite_t.size:
+                return
+
+            temp_min = float(np.nanmin(finite_t))
+            temp_max = float(np.nanmax(finite_t))
+            temp_span = temp_max - temp_min
+            if temp_span <= 0:
+                temp_span = max(abs(temp_min), 1.0)
+
             current_t_idx = max(
                 0,
                 min(int(getattr(self, "t_idx", 0)), T_reshaped.shape[1] - 1),
             )
-            visible_t_count = min(t_dim, max(2, current_t_idx + 1))
-            self.surface_visible_t_count = visible_t_count
-            if visible_t_count >= 2 and x_dim >= 2:
-                t_visible = t_arr_final[:visible_t_count]
-                T_visible = T_reshaped[:, :visible_t_count]
-                X, T = np.meshgrid(x_grid, t_visible, indexing="ij")
-                rcount = min(200, x_dim)
-                ccount = min(200, visible_t_count)
-                self.ax2.plot_surface(
-                    X,
-                    T,
-                    T_visible,
-                    cmap="coolwarm",
-                    rcount=rcount,
-                    ccount=ccount,
-                    antialiased=True,
-                    alpha=0.95,
+            profile = np.asarray(T_reshaped[:, current_t_idx], dtype=float)
+            profile = np.nan_to_num(profile, nan=temp_min, posinf=temp_max, neginf=temp_min)
+
+            x_values = np.asarray(x_grid, dtype=float)
+            profile_min = float(np.nanmin(profile))
+            activity_threshold = max(1.0, 0.01 * temp_span)
+            active_indices = np.flatnonzero(np.abs(profile - profile_min) > activity_threshold)
+            window_start = 0
+            window_end = x_dim - 1
+            if active_indices.size:
+                active_start = int(active_indices[0])
+                active_end = int(active_indices[-1])
+                active_count = active_end - active_start + 1
+                pad = max(8, int(0.35 * active_count))
+                window_start = max(0, active_start - 2)
+                window_end = min(x_dim - 1, active_end + pad)
+
+                min_points = min(x_dim, max(18, min(70, active_count * 3)))
+                if (window_end - window_start + 1) < min_points:
+                    missing = min_points - (window_end - window_start + 1)
+                    window_start = max(0, window_start - missing // 3)
+                    window_end = min(x_dim - 1, window_end + missing - missing // 3)
+
+                if (window_end - window_start + 1) >= int(0.9 * x_dim):
+                    window_start = 0
+                    window_end = x_dim - 1
+
+            x_plot = x_values[window_start : window_end + 1]
+            profile_plot = profile[window_start : window_end + 1]
+            self.terrain_x_values = x_plot
+            terrain_is_focused = len(x_plot) < len(x_values)
+
+            x_span = float(np.nanmax(x_plot) - np.nanmin(x_plot))
+            dx = abs(float(getattr(self.pcm, "dx", 0.01))) if self.pcm is not None else 0.01
+            y_extent = max(x_span, dx * 8.0)
+            y_values = np.linspace(0.0, y_extent, 41)
+            X, Y = np.meshgrid(x_plot, y_values, indexing="ij")
+
+            heat_profile = np.clip(profile_plot - profile_min, 0.0, None)
+            heat_max = float(np.nanmax(heat_profile)) if heat_profile.size else 0.0
+            domain_depth = max(abs(float(x_values[-1] - x_values[0])), dx)
+            front_index = int(active_indices[-1]) if active_indices.size else window_start
+            front_x = float(x_values[min(front_index, len(x_values) - 1)])
+            front_x = float(np.clip(front_x, np.nanmin(x_plot), np.nanmax(x_plot)))
+            front_depth = abs(front_x - float(x_values[0]))
+            progress = current_t_idx / max(T_reshaped.shape[1] - 1, 1)
+            thermal_progress = float(
+                np.clip(
+                    max(
+                        2.0 * np.sqrt(max(front_depth, 0.0) / domain_depth),
+                        0.75 * np.sqrt(progress),
+                    ),
+                    0.0,
+                    1.0,
                 )
-            self.ax2.set_title("3D Surface Plot")
-            self.ax2.set_xlabel("x")
-            self.ax2.set_ylabel("t")
-            self.ax2.set_zlabel("T")
-            if x_dim:
-                self.ax2.set_xlim(float(np.nanmin(x_grid)), float(np.nanmax(x_grid)))
-            if t_dim:
-                self.ax2.set_ylim(
-                    float(np.nanmin(t_arr_final)), float(np.nanmax(t_arr_final))
-                )
-            finite_t = T_reshaped[np.isfinite(T_reshaped)]
-            if finite_t.size:
-                z_min = float(np.nanmin(finite_t))
-                z_max = float(np.nanmax(finite_t))
-                z_span = z_max - z_min
-                z_pad = 0.05 * (z_span if z_span > 0 else max(abs(z_min), 1.0))
-                self.ax2.set_zlim(z_min - z_pad, z_max + z_pad)
+            )
+
+            if heat_max > 1e-9:
+                heat_norm = np.clip(heat_profile / heat_max, 0.0, 1.0)
+                heat_shape = np.power(heat_norm, 0.55)
+                heat_weight_sum = float(np.sum(heat_profile))
+                if heat_weight_sum > 0:
+                    centroid_x = float(np.sum(x_plot * heat_profile) / heat_weight_sum)
+                else:
+                    centroid_x = float(x_plot[0])
+
+                peak_x = 0.55 * centroid_x + 0.45 * front_x
+                peak_x = float(np.clip(peak_x, np.nanmin(x_plot), np.nanmax(x_plot)))
+                peak_y = y_extent * (0.10 + 0.62 * thermal_progress)
+                peak_y = float(np.clip(peak_y, 0.08 * y_extent, 0.82 * y_extent))
+
+                sigma_x = max(dx * 3.0, x_span * (0.12 + 0.28 * thermal_progress))
+                sigma_y = max(dx * 3.0, y_extent * (0.10 + 0.32 * thermal_progress))
+                x_mound = np.exp(-0.5 * ((X - peak_x) / sigma_x) ** 2)
+                y_mound = np.exp(-0.5 * ((Y - peak_y) / sigma_y) ** 2)
+                terrain_weight = x_mound * y_mound * (0.45 + 0.55 * heat_shape[:, None])
+                weight_max = float(np.nanmax(terrain_weight))
+                if weight_max > 0:
+                    terrain_weight = terrain_weight / weight_max
+
+                mountain_strength = 0.35 + 0.65 * min(1.0, 1.35 * thermal_progress)
+                Z = profile_min + heat_max * mountain_strength * terrain_weight
+                Z = np.clip(Z, temp_min, temp_max)
+
+                ridge_col = int(np.argmin(np.abs(y_values - peak_y)))
+                self.terrain_y_values = np.full_like(x_plot, y_values[ridge_col], dtype=float)
+                self.terrain_profile_values = Z[:, ridge_col]
+            else:
+                Z = np.full_like(X, profile_min, dtype=float)
+                self.terrain_y_values = np.zeros_like(x_plot, dtype=float)
+                self.terrain_profile_values = np.full_like(x_plot, profile_min, dtype=float)
+
+            self.terrain_surface_values = Z
+
+            rcount = min(200, len(x_plot))
+            ccount = min(80, len(y_values))
+            self.ax2.plot_surface(
+                X,
+                Y,
+                Z,
+                cmap="coolwarm",
+                vmin=temp_min,
+                vmax=temp_max,
+                rcount=rcount,
+                ccount=ccount,
+                antialiased=True,
+                alpha=0.96,
+            )
+
+            time_label = ""
+            if self.t_grid is not None and len(self.t_grid) > current_t_idx:
+                time_label = f" (t={float(self.t_grid[current_t_idx]):.3g}s)"
+            self.ax2.set_title(f"Thermal Terrain Snapshot{time_label}")
+            self.ax2.set_xlabel("x [m] (thermal region)" if terrain_is_focused else "x [m]")
+            self.ax2.set_ylabel("y [m]")
+            self.ax2.set_zlabel("Temperature [C]")
+            self.ax2.set_xlim(float(np.nanmin(x_plot)), float(np.nanmax(x_plot)))
+            self.ax2.set_ylim(0.0, y_extent)
+            z_pad = 0.05 * temp_span
+            self.ax2.set_zlim(temp_min - z_pad, temp_max + z_pad)
+            try:
+                self.ax2.set_box_aspect((1.4, 0.8, 0.9))
+                self.ax2.view_init(elev=28, azim=-125)
+            except Exception:
+                pass
             self.update_surface_time_slice()
             self.canvas2.draw()
 
