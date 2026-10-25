@@ -72,6 +72,14 @@ def training_epochs(model: PINNResult) -> int | None:
     )
 
 
+def _failed_comparison(check: ValidationFailure) -> str:
+    value, limit = f"{check.value:.3g}", f"{check.limit:g}"
+    if float(value) <= float(limit):
+        # Keep ordinary summaries compact, but never round a failure to equality.
+        value, limit = repr(float(check.value)), repr(float(check.limit))
+    return f"{check.label} {value} > {limit}"
+
+
 def validation_message(model: PINNResult) -> str:
     status = str(model.metadata.get("validation_status", "unvalidated"))
     epochs = training_epochs(model)
@@ -81,7 +89,7 @@ def validation_message(model: PINNResult) -> str:
     checks = failed_checks(model)
     details = [
         (
-            f"{check.label} {check.value:.3g} > {check.limit:g}"
+            _failed_comparison(check)
             if math.isfinite(check.value)
             else f"{check.label} is non-finite (limit {check.limit:g})"
         )

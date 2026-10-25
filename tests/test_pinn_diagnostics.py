@@ -1,5 +1,6 @@
 """Validation failures remain explicit, including old saved result metadata."""
 
+import math
 import unittest
 
 from magnetic_torus.learning.diagnostics import (
@@ -23,6 +24,14 @@ def model(metrics, **metadata):
 
 
 class PINNDiagnosticsTests(unittest.TestCase):
+    def test_just_failed_loss_keeps_comparison_values_distinct(self):
+        for value in (0.010001, math.nextafter(0.01, math.inf)):
+            with self.subTest(value=value):
+                fit = model({"validation_loss": value})
+                message = validation_message(fit)
+                self.assertIn(f"held-out loss {value!r} > 0.01", message)
+                self.assertNotIn("0.01 > 0.01", message)
+
     def test_failed_coupled_fit_names_only_failed_checks_and_actual_epochs(self):
         fit = model(
             {
