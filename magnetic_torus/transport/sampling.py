@@ -96,7 +96,8 @@ def _above_ground_geometry(rng: np.random.Generator, count: int, radius: float,
             point, direction = _isotropic_geometry(rng, size, radius)
             exposed = (point[:, 2] >= ground_top) & (direction[:, 2] <= 0.)
         chosen = np.flatnonzero(exposed)[:remaining]
-        positions.append(point[chosen]); directions.append(direction[chosen])
+        positions.append(point[chosen])
+        directions.append(direction[chosen])
         remaining -= len(chosen)
     return np.concatenate(positions), np.concatenate(directions), float(area)
 

@@ -68,9 +68,9 @@ def evaluate_weak_residual_torch(config: ScenarioConfig, reference_result: RunRe
     Phi0, Phi = pair("electric_potential")
     T0, T = pair("temperature")
     ext = tensor(op["imposed_vector_potential"][indices])
-    Ai, Ai0 = A - ext[1], A0 - ext[0]
+    Ai, _ = A - ext[1], A0 - ext[0]
     uq, upq = interpolate(U), interpolate(U0)
-    pq, tq, tpq = interpolate(P), interpolate(T), interpolate(T0)
+    _, tq, tpq = interpolate(P), interpolate(T), interpolate(T0)
     gU, gp, gA, gAi, gPhi, gT = gradient(U), gradient(P), gradient(A), gradient(Ai), gradient(Phi), gradient(T)
     Bcell, Bprevious = curl(gA), curl(gradient(A0))
     B = Bcell[:, None, :].expand(-1, 4, -1)

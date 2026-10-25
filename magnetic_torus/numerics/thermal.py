@@ -76,11 +76,15 @@ def _thermal_graph(config: ScenarioConfig) -> tuple[np.ndarray, dict[str, np.nda
                 if radial + 1 < nr:
                     rf = (radial + 1) * dr
                     surface = rf * (major + rf * math.cos(a[radial, theta, phi])) * da * db
-                    edge_i.append(i); edge_j.append(ids[radial + 1, theta, phi]); conductance.append(k * surface / dr)
-                edge_i.append(i); edge_j.append(ids[radial, (theta + 1) % nt, phi])
+                    edge_i.append(i)
+                    edge_j.append(ids[radial + 1, theta, phi])
+                    conductance.append(k * surface / dr)
+                edge_i.append(i)
+                edge_j.append(ids[radial, (theta + 1) % nt, phi])
                 conductance.append(k * (major + r[radial, theta, phi] * math.cos((theta + 1) * da)) * dr * db
                                    / (r[radial, theta, phi] * da))
-                edge_i.append(i); edge_j.append(ids[radial, theta, (phi + 1) % np_])
+                edge_i.append(i)
+                edge_j.append(ids[radial, theta, (phi + 1) % np_])
                 conductance.append(k * r[radial, theta, phi] * dr * da / (jac[radial, theta, phi] * db))
     return points, {"edge_i": np.asarray(edge_i, dtype=int), "edge_j": np.asarray(edge_j, dtype=int),
                     "conductance_w_k": np.asarray(conductance), "node_volume": volume.ravel(),
@@ -103,7 +107,8 @@ def available_memory_bytes() -> int:
                             ("total_pagefile", ctypes.c_ulonglong), ("available_pagefile", ctypes.c_ulonglong),
                             ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
                             ("extended_virtual", ctypes.c_ulonglong)]
-            status = MemoryStatus(); status.length = ctypes.sizeof(status)
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
                 return int(status.available_physical)
         elif Path("/proc/meminfo").is_file():
@@ -206,7 +211,8 @@ def stefan_front_benchmark(cell_count: int = 64, time_steps: int = 500,
     diagonal[-1] -= conductance  # insulated remote boundary
     stiffness = diags((-conductance * np.ones(cell_count - 1), diagonal,
                        -conductance * np.ones(cell_count - 1)), (-1, 0, 1), format="csr")
-    source = np.zeros(cell_count); source[0] = 2 * conductance * (c.melting_temperature + excess)
+    source = np.zeros(cell_count)
+    source[0] = 2 * conductance * (c.melting_temperature + excess)
     mass = np.full(cell_count, c.density * dx)
     h, zero_area = np.zeros(cell_count), np.zeros(cell_count)
     for _ in range(time_steps):
@@ -241,8 +247,11 @@ def _run_thermal(config: ScenarioConfig, progress: Progress, cancel: threading.E
         h, T, radiation = _implicit_enthalpy_step(h, dt, mass, K, area, watts * graph["source_weights"], config)
         cumulative_input += dt * watts
         cumulative_loss += dt * float(radiation.sum())
-        temperatures.append(T.copy()); hs.append(h.copy()); energy.append(float(mass @ h))
-        radiated.append(cumulative_loss); power.append(watts - float(radiation.sum()))
+        temperatures.append(T.copy())
+        hs.append(h.copy())
+        energy.append(float(mass @ h))
+        radiated.append(cumulative_loss)
+        power.append(watts - float(radiation.sum()))
         residuals.append(energy[-1] - energy[0] - cumulative_input + cumulative_loss)
         progress(index / (len(times) - 1), f"Conservative thermal benchmark · {t:.3g} s")
     H, T = np.asarray(hs), np.asarray(temperatures)
