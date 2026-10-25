@@ -608,6 +608,8 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.editor.run_button.setEnabled(False)
 
     def activate_result(self, path):
+        if self.exports.busy:
+            self.exports.finish_movie(cancelled=True)
         self.playback.stop_all()
         old_time = self.session.load_result(self.store, Path(path))
         self.chart_panel.invalidate()

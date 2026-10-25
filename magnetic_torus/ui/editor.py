@@ -63,6 +63,17 @@ class ScenarioEditor(QtWidgets.QFrame):
         self.name_edit = QtWidgets.QLineEdit()
         self.name_edit.setPlaceholderText("Scenario name")
         layout.addWidget(self.name_edit)
+        self.editors: dict[str, QtWidgets.QWidget] = {}
+        self._section(
+            "Run setup",
+            [("duration", "Simulation duration", "s")],
+            True,
+            target_layout=layout,
+            description=(
+                "Geometry below defines the reservoir. After running, right-click "
+                "the 3D view to inspect a point."
+            ),
+        )
         self.run_button = QtWidgets.QPushButton("Run simulation")
         self.run_button.setObjectName("run")
         layout.addWidget(self.run_button)
@@ -72,7 +83,6 @@ class ScenarioEditor(QtWidgets.QFrame):
         self.sections_layout = QtWidgets.QVBoxLayout(scroll_content)
         self.sections_layout.setContentsMargins(0, 0, 0, 0)
         self.sections_layout.setSpacing(0)
-        self.editors: dict[str, QtWidgets.QWidget] = {}
         self._section(
             "Geometry",
             [
@@ -94,7 +104,6 @@ class ScenarioEditor(QtWidgets.QFrame):
                 ("discharge_power", "Discharge power", "W"),
                 ("discharge_temperature", "Discharge cutoff", "K"),
                 ("efficiency", "Electrical efficiency", "0–1"),
-                ("duration", "Simulated duration", "s"),
             ],
             True,
         )
@@ -182,7 +191,15 @@ class ScenarioEditor(QtWidgets.QFrame):
         self.compare_history = QtWidgets.QComboBox()
         layout.addWidget(self.compare_history)
 
-    def _section(self, title, specifications, opened=False):
+    def _section(
+        self,
+        title,
+        specifications,
+        opened=False,
+        *,
+        target_layout=None,
+        description=None,
+    ):
         section = QtWidgets.QFrame()
         section.setObjectName("section")
         layout = QtWidgets.QVBoxLayout(section)
@@ -243,6 +260,11 @@ class ScenarioEditor(QtWidgets.QFrame):
             caption.setWordWrap(True)
             caption.setMaximumWidth(140)
             form.addRow(caption, field_widget)
+        if description:
+            help_label = QtWidgets.QLabel(description)
+            help_label.setObjectName("subtitle")
+            help_label.setWordWrap(True)
+            form.addRow(help_label)
         content.setVisible(opened)
         button.toggled.connect(content.setVisible)
         button.toggled.connect(
@@ -253,7 +275,9 @@ class ScenarioEditor(QtWidgets.QFrame):
             )
         )
         layout.addWidget(content)
-        self.sections_layout.addWidget(section)
+        (
+            target_layout if target_layout is not None else self.sections_layout
+        ).addWidget(section)
 
     def read_config(self):
         base = getattr(self, "_base_config", preset("Thermal benchmark")).to_dict()

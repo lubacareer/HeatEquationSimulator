@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -114,6 +115,106 @@ class DesktopSourceTests(unittest.TestCase):
         self.activate(self.ring_result("small-profile", 4))
         self.assertLess(int(np.max(self.window.chart_panel.profile_samples[1])), 4)
         self.assertEqual(self.window.session.active.run_id, "small-profile")
+
+    def test_duration_is_visible_before_run_and_recalculation_uses_edited_duration(self):
+        from magnetic_torus.models import preset
+
+        editor = self.window.editor
+        duration = editor.editors["duration"]
+        self.assertIsNone(self.window.session.active)
+        self.assertTrue(duration.isVisible())
+        self.assertLess(duration.mapTo(editor, QtCore.QPoint()).y(), editor.run_button.mapTo(editor, QtCore.QPoint()).y())
+        config = replace(preset("Thermal benchmark"), resolution=3, time_steps=4)
+        editor.set_config(config)
+        duration.setText("invalid")
+        editor.validate()
+        self.assertFalse(editor.run_button.isEnabled())
+        editor.set_config(config)
+        self.assertTrue(editor.run_button.isEnabled())
+        errors = []
+        self.window.jobs.failed.connect(lambda message, detail: errors.append(message))
+
+        def wait_for_result():
+            deadline = time.monotonic() + 30
+            while self.window.jobs.busy and time.monotonic() < deadline:
+                self.application.processEvents()
+                time.sleep(.01)
+            self.application.processEvents()
+            self.assertFalse(self.window.jobs.busy, "Duration regression worker timed out")
+            self.assertEqual(errors, [])
+
+        duration.setText("7.5")
+        self.assertEqual(editor.read_config().duration, 7.5)
+        self.window.start_job("simulate")
+        wait_for_result()
+        first = self.window.session.active
+        self.assertEqual(first.config.duration, 7.5)
+        self.assertAlmostEqual(float(first.times[-1]), 7.5)
+        duration.setText("12.5")
+        self.window.start_job("simulate")
+        self.assertIs(self.window.session.active, first)
+        wait_for_result()
+        self.assertNotEqual(self.window.session.active.run_id, first.run_id)
+        self.assertEqual(self.window.session.active.config.duration, 12.5)
+        self.assertAlmostEqual(float(self.window.session.active.times[-1]), 12.5)
+
+    def test_switching_to_shorter_run_cancels_movie_before_restoring_frame(self):
+        self.activate(self.ring_result("long-export", 8))
+        short = self.ring_result("short-export", 4)
+        short = replace(short, times=short.times[:1], fields={key: values[:1] for key, values in short.fields.items()})
+        short_path = self.window.store.save_run(short)
+        writer = Mock()
+        self.window.exports.writer = writer
+        self.window.exports._movie_restore = 1
+        self.window.exports._movie_frames = [0, 1]
+        self.window.activate_result(short_path)
+        writer.close.assert_called_once()
+        self.assertFalse(self.window.exports.busy)
+        self.assertEqual(self.window.session.active.run_id, short.run_id)
+        self.assertEqual(self.window.session.current_index, 0)
+        self.window.exports.writer = Mock()
+        self.window.exports._movie_restore = 999
+        self.window.exports.finish_movie(cancelled=True)
+        self.assertEqual(self.window.session.current_index, 0)
+
+    def test_movie_startup_is_busy_before_first_capture_and_cleans_up_failures(self):
+        self.activate(self.ring_result("startup-export", 4))
+        export = self.window.exports
+        observed = []
+        export.busy_changed.connect(lambda busy: observed.append((busy, export.busy, self.window.job_widget.isVisible())))
+
+        def screenshot(**kwargs):
+            self.assertTrue(export.busy)
+            self.assertTrue(self.window.job_widget.isVisible())
+            self.assertFalse(self.window.editor.run_button.isEnabled())
+            return np.zeros((64, 64, 3), dtype=np.uint8)
+
+        writer = Mock()
+        with patch.object(self.window.scene.plotter, "screenshot", side_effect=screenshot), patch("imageio_ffmpeg.write_frames", return_value=writer):
+            export.begin_movie_export("fixture.mp4")
+        self.assertEqual(observed[0], (True, True, True))
+        self.assertTrue(export.busy)
+        export.finish_movie(cancelled=True)
+        writer.close.assert_called_once()
+        self.assertFalse(export.busy)
+        for failure in ("capture", "encoder"):
+            with self.subTest(failure=failure):
+                with patch.object(self.window.scene.plotter, "screenshot", side_effect=RuntimeError("capture failed") if failure == "capture" else screenshot), patch("imageio_ffmpeg.write_frames", side_effect=RuntimeError("encoder failed")):
+                    export.begin_movie_export("fixture-failed.mp4")
+                self.assertFalse(export.busy)
+                self.assertFalse(export.movie_timer.isActive())
+                self.assertTrue(self.window.editor.run_button.isEnabled())
+
+    def test_history_selection_during_movie_startup_cancels_superseded_request(self):
+        self.activate(self.ring_result("startup-old", 8))
+        replacement = self.ring_result("startup-new", 4)
+        path = self.window.store.save_run(replacement)
+        QtCore.QTimer.singleShot(0, lambda: self.window.activate_result(path))
+        with patch("imageio_ffmpeg.write_frames") as encoder:
+            self.window.exports.begin_movie_export("cancelled-startup.mp4")
+        encoder.assert_not_called()
+        self.assertFalse(self.window.exports.busy)
+        self.assertEqual(self.window.session.active.run_id, replacement.run_id)
 
     def test_display_controls_do_not_repeat_full_scene_updates(self):
         self.activate(self.tetra_result())

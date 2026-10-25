@@ -13,7 +13,7 @@ conda activate torch-gpu
 python interface3.py
 ```
 
-Select **Thermal benchmark**, then **Run simulation** for the quickest computed animation. Edit thermal properties and press **Recalculate scenario** without restarting. Accepted results remain visible while a job runs and survive failures and cancellation. **Iron** and **Lunar habitat** select the full FEniCS worker; their engineering/material values are illustrative.
+Select **Thermal benchmark**, set **Simulation duration [s]** in **Run setup** at the top of the sidebar, then select **Run simulation** for the quickest computed animation. Geometry and thermal properties remain editable in the same window; press **Recalculate scenario** without restarting. After running, right-click the 3D view to inspect a point. Accepted results remain visible while a job runs and survive failures and cancellation. **Iron** and **Lunar habitat** select the full FEniCS worker; their engineering/material values are illustrative.
 
 For a new desktop environment:
 

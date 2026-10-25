@@ -34,6 +34,8 @@ class ExportController(QtCore.QObject):
         self.render_frame = render_frame
         self.job_is_busy = job_is_busy
         self.writer = None
+        self._starting = False
+        self._movie_generation = 0
         self._movie_frames = []
         self._movie_position = 0
         self._movie_restore = 0
@@ -43,7 +45,7 @@ class ExportController(QtCore.QObject):
 
     @property
     def busy(self):
-        return self.writer is not None
+        return self._starting or self.writer is not None
 
     def _notify(self, message, error=False, sticky=False):
         self.notified.emit(message, error, sticky)
@@ -131,10 +133,8 @@ class ExportController(QtCore.QObject):
             self.begin_movie_export(path)
 
     def begin_movie_export(self, path):
-        if self.session.active is None or self.writer is not None:
+        if self.session.active is None or self.busy or self.job_is_busy():
             return
-        import imageio_ffmpeg
-
         self.playback.stop_all()
         self._movie_restore = self.session.current_index
         self._movie_frames = (
@@ -147,27 +147,41 @@ class ExportController(QtCore.QObject):
             .tolist()
         )
         self._movie_position = 0
+        self._starting = True
+        self._movie_generation += 1
+        generation = self._movie_generation
         self.busy_changed.emit(True)
-        QtWidgets.QApplication.processEvents()
-        self.scene.flush_render()
-        image = self.scene.plotter.screenshot(return_img=True)
-        height, width = image.shape[:2]
-        # Even dimensions are required by the H.264 YUV420 format.
-        self._movie_size = (width - width % 2, height - height % 2)
-        self.writer = imageio_ffmpeg.write_frames(
-            path,
-            self._movie_size,
-            fps=30,
-            codec="libx264",
-            macro_block_size=2,
-            pix_fmt_in="rgb24",
-            pix_fmt_out="yuv420p",
-            ffmpeg_log_level="error",
-        )
-        self.writer.send(None)
-        self._movie_path = path
-        self.movie_timer.start()
-        self.busy_changed.emit(self.busy)
+        try:
+            import imageio_ffmpeg
+
+            QtWidgets.QApplication.processEvents()
+            # Cancellation or history selection can run while Qt applies the
+            # export layout. Never resume startup for that superseded request.
+            if not self._starting or generation != self._movie_generation:
+                return
+            self.scene.flush_render()
+            image = self.scene.plotter.screenshot(return_img=True)
+            height, width = image.shape[:2]
+            # Even dimensions are required by the H.264 YUV420 format.
+            self._movie_size = (width - width % 2, height - height % 2)
+            self.writer = imageio_ffmpeg.write_frames(
+                path,
+                self._movie_size,
+                fps=30,
+                codec="libx264",
+                macro_block_size=2,
+                pix_fmt_in="rgb24",
+                pix_fmt_out="yuv420p",
+                ffmpeg_log_level="error",
+            )
+            self.writer.send(None)
+            self._starting = False
+            self._movie_path = path
+            self.movie_timer.start()
+        except Exception as error:
+            if generation == self._movie_generation:
+                self.finish_movie(cancelled=True)
+                self._notify(f"Animation export failed: {error}", error=True)
 
     def _movie_tick(self):
         if self.writer is None:
@@ -204,13 +218,24 @@ class ExportController(QtCore.QObject):
 
     def finish_movie(self, cancelled=False):
         self.movie_timer.stop()
-        if self.writer is not None:
-            self.writer.close()
+        self._starting = False
+        self._movie_generation += 1
+        writer = self.writer
         self.writer = None
-        self.session.current_index = self._movie_restore
+        close_error = None
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception as error:
+                close_error = error
+        count = len(self.session.active.times) if self.session.active is not None else 0
+        self.session.current_index = min(max(0, self._movie_restore), max(0, count - 1))
         self.render_frame()
         self.scene.flush_render()
         self.busy_changed.emit(False)
+        if close_error is not None:
+            self._notify(f"Animation export failed: {close_error}", error=True)
+            return
         self._notify(
             "Animation export cancelled; any encoded frames remain in the selected file."
             if cancelled
