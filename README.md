@@ -106,6 +106,7 @@ With ground enabled, beam primaries sample only the exposed part of the incident
 ```powershell
 python -B scripts/run_checks.py
 python -B scripts/desktop_smoke.py
+python -B scripts/benchmark_desktop.py --output .cache/playback.json
 python -B -m magnetic_torus.physics --benchmark-report .cache/physics_validation.json --include-fenics
 python -B -m magnetic_torus.pinn_validation --native --device cpu --epochs 1000
 ```
@@ -113,6 +114,8 @@ python -B -m magnetic_torus.pinn_validation --native --device cpu --epochs 1000
 Run these in the desktop Python environment with PyTorch installed. The FE benchmark additionally needs the WSL worker; desktop smoke needs a graphical session. The test runner isolates modules to avoid OpenMP conflicts. Desktop smoke exercises real Qt/VTK, repeated edits/runs, probes, comparisons, cancellation, failure/stale isolation, particle replay, saved PINN inspection when available, and decoding every exported MP4 frame. It records scene size and measured FPS. Scientific reports list completed checks and outstanding qualification gates separately. The PINN validation CLI returns exit code **3** for a completed fit that fails validation.
 
 See [docs/VALIDATION.md](docs/VALIDATION.md) for actual benchmark values, the measured 31.8 FPS reference scene, real water/anatomical transport runs, failed coupled PINN fits, and open release gates. The Ubuntu FE package lock and integrity-pinned Geant4 environment are in `env/`.
+
+For component ownership, worker data flow, and before/after playback measurements, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Generated run histories, worker artifacts, datasets, checkpoints, and `.cache/` benchmark reports are kept out of Git. The paths in the validation record describe local evidence; rerun the commands above to generate reports on your machine. The recorded dynamic coupled PINN fits fail their accuracy gates, the small dose samples miss the 5% precision target, and the remaining MHD qualification benchmarks are still open.
 

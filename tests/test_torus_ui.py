@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import PyQt6.QtCore as QtCore
@@ -92,7 +92,7 @@ class DesktopSourceTests(unittest.TestCase):
     def activate(self, result):
         path = self.window.store.save_run(result)
         self.window.activate_result(path)
-        self.window.set_config(result.config)
+        self.window.editor.set_config(result.config)
         return path
 
     def attach_ui_pinn(self, result, shift=100.):
@@ -103,17 +103,26 @@ class DesktopSourceTests(unittest.TestCase):
         fields["velocity"][1] *= 2
         model = PINNResult("ui-pinn", result.run_id, result.config.config_hash, fields, {}, {},
                            {"validation_status": "unvalidated UI fixture"})
-        self.window.pinn = model
+        self.window.session.set_pinn(model)
         self.window._update_actions()
         return model
 
     def test_temperature_profile_rebuilt_when_switching_to_smaller_run(self):
         self.activate(self.ring_result("large-profile", 32))
         self.window.thermal_plot.setCurrentText("Temperature profile")
-        self.assertGreater(int(np.max(self.window._profile_samples[1])), 3)
+        self.assertGreater(int(np.max(self.window.chart_panel.profile_samples[1])), 3)
         self.activate(self.ring_result("small-profile", 4))
-        self.assertLess(int(np.max(self.window._profile_samples[1])), 4)
-        self.assertEqual(self.window.active.run_id, "small-profile")
+        self.assertLess(int(np.max(self.window.chart_panel.profile_samples[1])), 4)
+        self.assertEqual(self.window.session.active.run_id, "small-profile")
+
+    def test_display_controls_do_not_repeat_full_scene_updates(self):
+        self.activate(self.tetra_result())
+        with patch.object(self.window.scene, "update_index", wraps=self.window.scene.update_index) as update:
+            self.window.slice.setChecked(True)
+            self.assertEqual(update.call_count, 1)
+        with patch.object(self.window.scene, "update_index", wraps=self.window.scene.update_index) as update:
+            self.window.quantity.setCurrentText("Specific enthalpy")
+            self.assertEqual(update.call_count, 1)
 
     def test_section_and_cutaway_keep_pinn_and_error_sources(self):
         result = self.tetra_result()
@@ -121,16 +130,16 @@ class DesktopSourceTests(unittest.TestCase):
         model = self.attach_ui_pinn(result)
         self.window.source.setCurrentText("PINN")
         self.window.slice.setChecked(True)
-        self.window._section_changed(740)
-        self.assertIs(self.window.scene._display_fields, model.fields)
-        self.assertFalse(self.window.scene._difference)
+        self.window.section_slider.setValue(740)
+        self.assertIs(self.window.scene.display_selection.fields, model.fields)
+        self.assertFalse(self.window.scene.display_selection.difference)
         self.window.cutaway.setChecked(False)
-        self.assertIs(self.window.scene._display_fields, model.fields)
+        self.assertIs(self.window.scene.display_selection.fields, model.fields)
         self.window.source.setCurrentText("PINN error")
-        self.window._section_changed(740)
+        self.window.section_slider.setValue(740)
         self.window.cutaway.setChecked(True)
-        self.assertTrue(self.window.scene._difference)
-        self.assertIs(self.window.scene._display_fields, self.window._pinn_difference)
+        self.assertTrue(self.window.scene.display_selection.difference)
+        self.assertIs(self.window.scene.display_selection.fields, self.window.session.pinn_difference)
         section = self.window.scene.plotter.actors["slice"]
         np.testing.assert_allclose(section.mapper.scalar_range, (-100., 100.))
 
@@ -143,7 +152,7 @@ class DesktopSourceTests(unittest.TestCase):
         np.testing.assert_allclose(self.window.scene.color_range(), expected)
         self.window.source.setCurrentText("PINN")
         np.testing.assert_allclose(self.window.scene._actor.mapper.scalar_range, expected)
-        self.window.seek_time(1.)
+        self.window.playback.seek_time(1.)
         np.testing.assert_allclose(self.window.scene._actor.mapper.scalar_range, expected)
         self.window.source.setCurrentText("Numerical")
         np.testing.assert_allclose(self.window.scene._actor.mapper.scalar_range, expected)
@@ -165,14 +174,14 @@ class DesktopSourceTests(unittest.TestCase):
         alternative = replace(result, run_id="comparison-ui", fields=fields)
         path = self.window.store.save_run(alternative)
         self.window.refresh_history()
-        self.window._compare_selected(self.window.compare_history.findData(str(path)))
+        self.window._compare_selected(self.window.editor.compare_history.findData(str(path)))
         self.window.source.setCurrentText("Run difference")
         self.window.slice.setChecked(True)
-        self.window._section_changed(740)
+        self.window.section_slider.setValue(740)
         self.window.cutaway.setChecked(False)
-        self.assertTrue(self.window.scene._difference)
-        self.assertIs(self.window.scene._display_fields, self.window._comparison_difference)
-        self.assertFalse(self.window.compare_scene._difference)
+        self.assertTrue(self.window.scene.display_selection.difference)
+        self.assertIs(self.window.scene.display_selection.fields, self.window.session.comparison_difference)
+        self.assertFalse(self.window.compare_scene.display_selection.difference)
         np.testing.assert_allclose(self.window.scene.plotter.actors["slice"].mapper.scalar_range, (-10., 10.))
         self.window.source.setCurrentText("Numerical")
         np.testing.assert_allclose(self.window.scene._actor.mapper.scalar_range,
@@ -182,14 +191,14 @@ class DesktopSourceTests(unittest.TestCase):
         from magnetic_torus.physics import regularized_enthalpy
         result = self.tetra_result(regularized=True)
         self.activate(result)
-        chart = self.window.charts[0]
+        chart = self.window.chart_panel.cards[0]
         sharp, computational = chart.ax.lines[:2]
         np.testing.assert_allclose(sharp.get_xdata()[1:3], [0., result.config.latent_heat / 1000])
         np.testing.assert_allclose(sharp.get_ydata()[1:3], result.config.melting_temperature)
         np.testing.assert_allclose(computational.get_xdata(), regularized_enthalpy(computational.get_ydata(), result.config) / 1000)
-        self.window.seek_time(1.)
-        np.testing.assert_allclose(chart.marker.get_xdata(), [result.fields["enthalpy"][1, self.window.probe_index] / 1000])
-        np.testing.assert_allclose(chart.marker.get_ydata(), [result.fields["temperature"][1, self.window.probe_index]])
+        self.window.playback.seek_time(1.)
+        np.testing.assert_allclose(chart.marker.get_xdata(), [result.fields["enthalpy"][1, self.window.session.probe_index] / 1000])
+        np.testing.assert_allclose(chart.marker.get_ydata(), [result.fields["temperature"][1, self.window.session.probe_index]])
 
     def test_radiation_completion_restores_numerical_source_and_busy_controls(self):
         result = self.tetra_result()
@@ -208,10 +217,10 @@ class DesktopSourceTests(unittest.TestCase):
                  baseline_paths=np.array([[[0., 0., 0.], [1., 0., 0.]]]), times=np.array([[0., 1.e-8]]),
                  species=np.array([[1, 1]]), energies_mev_nucleon=np.array([100.]),
                  _metadata_json=np.array(json.dumps(data)))
-        self.window._job_revision = self.window._selection_revision
+        self.window.session.job_revision = self.window.session.selection_revision
         self.window._job_completed({"action": "trace", "source_path": str(source_path), "path": str(artifact), "selected_source": "Numerical"})
         self.assertEqual(self.window.source.currentText(), "Numerical")
-        self.assertIsNone(self.window.scene._display_fields)
+        self.assertIsNone(self.window.scene.display_selection.fields)
         self.window.jobs.process = None
         self.window._busy_changed(False)
         self.assertTrue(self.window.source.isEnabled())
