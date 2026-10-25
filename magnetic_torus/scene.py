@@ -156,14 +156,16 @@ class SceneWidget(QtWidgets.QWidget):
         if previous.visual_detail != options.visual_detail:
             self._field_cache.clear()
             self._tracer_cache.clear()
-        if self._actor is not None:
-            self._actor.prop.opacity = self.opacity
+        if previous.opacity != options.opacity:
+            actor = self.plotter.actors.get("reservoir")
+            if actor is not None:
+                actor.prop.opacity = self.opacity
         if previous.cutaway != options.cutaway:
             self.rebuild_surface()
         elif self.result is not None:
             self.update_index(self.index)
         else:
-            self.preview(self.config)
+            self.request_render()
 
     def request_render(self) -> None:
         """Coalesce control and frame updates into one render per event cycle."""

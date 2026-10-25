@@ -4,12 +4,15 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 
-from magnetic_torus.models import PINNResult, RunResult, ScenarioConfig
+from magnetic_torus.models import PINNResult, RunResult, ScenarioConfig, SimulationCancelled
 from magnetic_torus.artifacts import FieldArtifact
 from magnetic_torus.radiation import (
     C, ELEMENTARY_CHARGE, MEV, PROTON_MASS, FrozenField, calculate_dose, load_spectrum,
@@ -168,6 +171,58 @@ class RadiationTests(unittest.TestCase):
         result = RunResult("accepted", ScenarioConfig(), np.array([0., 1.]), np.zeros((1, 3)), {}, {})
         with self.assertRaisesRegex(RuntimeError, "exterior magnetic field"):
             trace_particles(result, 0, lambda *_: None, None)
+
+    def test_cancelled_dose_keeps_original_error_when_wsl_kill_fails(self):
+        field = SimpleNamespace(radius=4., points=np.zeros((4, 3)),
+                                cells=np.array([[0, 1, 2, 3]]), cell_values=None,
+                                values=np.zeros((4, 3)), fingerprint="test-frozen-field")
+        result = RunResult("cancelled-dose", ScenarioConfig(radiation_histories=2),
+                           np.array([0.]), np.zeros((1, 3)), {}, {})
+        for failure in (subprocess.TimeoutExpired("wsl", 15), OSError("WSL unavailable")):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
+                process = Mock()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                original = SimulationCancelled("original dose cancellation")
+
+                def launch(_command, **kwargs):
+                    Path(kwargs["stdout"].name).with_name("worker.pid").write_text("12345", encoding="ascii")
+                    return process
+
+                with patch("magnetic_torus.transport.geant4.frozen_field", return_value=field), \
+                     patch("magnetic_torus.transport.geant4._geant4_command", return_value=["wsl", "worker"]), \
+                     patch("magnetic_torus.transport.geant4._check", side_effect=[None, original]), \
+                     patch("magnetic_torus.transport.geant4.subprocess.Popen", side_effect=launch), \
+                     patch("magnetic_torus.transport.geant4.subprocess.run", side_effect=failure) as kill:
+                    with self.assertRaises(SimulationCancelled) as raised:
+                        calculate_dose(result, 0, lambda *_: None, None, Path(directory))
+                self.assertIs(raised.exception, original)
+                self.assertEqual(kill.call_args.args[0][-3:], ["kill", "-TERM", "12345"])
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once_with(timeout=10)
+
+    def test_worker_cleanup_attempts_local_teardown_after_pid_read_failure(self):
+        from magnetic_torus.transport.geant4 import _stop_worker
+        for failure in (OSError("PID file unavailable"), UnicodeError("invalid PID encoding")):
+            with self.subTest(failure=type(failure).__name__):
+                process = Mock()
+                pid_path = Mock(spec=Path)
+                pid_path.read_text.side_effect = failure
+                with patch("magnetic_torus.transport.geant4.subprocess.run") as kill:
+                    _stop_worker(process, pid_path, via_wsl=True)
+                kill.assert_not_called()
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once_with(timeout=10)
+
+    def test_worker_cleanup_reaps_local_process_after_termination_timeout(self):
+        from magnetic_torus.transport.geant4 import _stop_worker
+        process = Mock()
+        process.terminate.side_effect = OSError("already exiting")
+        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 10), 0]
+        _stop_worker(process, Mock(spec=Path), via_wsl=False)
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
 
     def test_accepted_zero_field_produces_identical_paired_paths(self):
         from scipy.spatial import Delaunay

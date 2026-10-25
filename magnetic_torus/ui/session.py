@@ -16,6 +16,21 @@ if TYPE_CHECKING:
     from ..store import RunStore
 
 
+def _newest_artifacts(directory: Path, pattern: str) -> list[Path]:
+    """Order available sidecars without making their presence mandatory."""
+    candidates = []
+    for artifact in directory.rglob(pattern):
+        try:
+            modified = artifact.stat().st_mtime
+        except OSError:
+            # A concurrent cleanup or inaccessible sidecar must not prevent
+            # inspection of the independently loaded numerical result.
+            continue
+        candidates.append((modified, artifact))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [artifact for _, artifact in candidates]
+
+
 @dataclass
 class WorkspaceSession:
     """Own selection and analysis associations independently of editable inputs."""
@@ -93,23 +108,15 @@ class WorkspaceSession:
         """Load accepted fields and only analyses belonging to this source."""
         result = store.load_run(path)
         old_time = self.activate(result, path)
-        for artifact in sorted(
-            Path(path).parent.rglob("pinn-*.h5"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        ):
+        for artifact in _newest_artifacts(Path(path).parent, "pinn-*.h5"):
             try:
                 candidate = store.load_pinn(artifact)
                 if candidate.config_hash == result.config.config_hash:
                     self.set_pinn(candidate, artifact)
                     break
-            except (OSError, ValueError):
+            except (OSError, ValueError, KeyError, TypeError):
                 continue
-        for artifact in sorted(
-            Path(path).parent.rglob("dose-*.json"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        ):
+        for artifact in _newest_artifacts(Path(path).parent, "dose-*.json"):
             try:
                 candidate = store.load_dose(artifact)
                 if (

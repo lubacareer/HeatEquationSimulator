@@ -46,6 +46,24 @@ class SceneUpdateTests(unittest.TestCase):
             self.application.processEvents()
             render.assert_called_once()
 
+    def test_preview_options_reuse_geometry_and_opacity_updates_visible_actor(self):
+        self.scene.preview(self.result.config)
+        self.scene.flush_render()
+        actor = self.scene.plotter.actors["reservoir"]
+        camera = self.scene.plotter.camera_position
+        with patch.object(self.scene, "preview", wraps=self.scene.preview) as preview:
+            self.scene.set_options(replace(self.scene.options, show_field=True, visual_detail="High"))
+            preview.assert_not_called()
+            self.assertIs(self.scene.plotter.actors["reservoir"], actor)
+            self.scene.set_options(replace(self.scene.options, opacity=.4))
+            preview.assert_not_called()
+            self.assertIs(self.scene.plotter.actors["reservoir"], actor)
+            self.assertAlmostEqual(actor.prop.opacity, .4)
+            self.assertEqual(self.scene.plotter.camera_position, camera)
+            self.scene.set_options(replace(self.scene.options, cutaway=not self.scene.options.cutaway))
+            preview.assert_called_once()
+            self.assertIsNot(self.scene.plotter.actors["reservoir"], actor)
+
     def test_section_reuses_topology_and_preserves_linear_interpolation(self):
         self.scene.set_options(SceneOptions(slice_enabled=True, slice_position=1.))
         surface = self.scene._slice_surface

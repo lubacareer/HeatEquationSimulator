@@ -30,6 +30,36 @@ def _geant4_command(request_path: Path) -> list[str]:
     return [executable, str(request_path)]
 
 
+def _stop_worker(process: subprocess.Popen, pid_path: Path, *, via_wsl: bool) -> None:
+    """Best-effort teardown must not replace the error that stopped transport."""
+    if via_wsl:
+        try:
+            worker_pid = pid_path.read_text(encoding="ascii").strip()
+            if worker_pid.isdigit():
+                subprocess.run(["wsl", "-d", wsl_distribution(), "--", "kill", "-TERM", worker_pid],
+                               capture_output=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, UnicodeError, subprocess.SubprocessError):
+            pass
+    try:
+        process.terminate()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            process.wait(timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def parse_dose_output(data: Mapping[str, Any], result: RunResult, snapshot_index: int,
                       *, expected_field_sha256: str | None = None) -> DoseResult:
     """Validate the worker provenance before accepting scientific dose output."""
@@ -133,18 +163,7 @@ def calculate_dose(result: RunResult, snapshot_index: int, progress: Progress,
                         pass
                 time.sleep(.1)
         except BaseException:
-            pid_path = artifact_dir / "worker.pid"
-            if os.name == "nt" and pid_path.is_file():
-                worker_pid = pid_path.read_text().strip()
-                if worker_pid.isdigit():
-                    subprocess.run(["wsl", "-d", wsl_distribution(), "--",
-                                    "kill", "-TERM", worker_pid], capture_output=True, timeout=15,
-                                   creationflags=subprocess.CREATE_NO_WINDOW)
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            _stop_worker(process, artifact_dir / "worker.pid", via_wsl=command[0] == "wsl")
             raise
     if process.returncode != 0 or not output_path.is_file():
         detail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]

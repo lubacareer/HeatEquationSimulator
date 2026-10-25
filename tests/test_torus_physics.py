@@ -90,6 +90,47 @@ class ThermalPhysicsTests(unittest.TestCase):
         expected = c.duration * (.37 * c.heating_power - .63 * c.discharge_power)
         self.assertAlmostEqual(float(r.diagnostics["energy_j"][-1] - r.diagnostics["energy_j"][0]), expected, places=6)
 
+    def test_roundoff_near_charge_transition_does_not_create_tiny_step(self):
+        c = replace(self.config, duration=1., time_steps=10, charge_fraction=.3,
+                    heating_power=20000., discharge_power=5000.)
+        transition = c.duration * c.charge_fraction
+        self.assertNotEqual(np.linspace(0., c.duration, c.time_steps + 1)[3], transition)
+        result = run_simulation(c)
+        self.assertEqual(len(result.times), c.time_steps + 1)
+        self.assertEqual(np.count_nonzero(result.times == transition), 1)
+        self.assertEqual(result.times[0], 0.)
+        self.assertEqual(result.times[-1], c.duration)
+        self.assertGreater(float(np.diff(result.times).min()), .09)
+        expected = c.duration * (c.charge_fraction * c.heating_power
+                                 - (1 - c.charge_fraction) * c.discharge_power)
+        self.assertAlmostEqual(float(result.diagnostics["energy_j"][-1]
+                                     - result.diagnostics["energy_j"][0]), expected, places=6)
+
+    def test_charge_transition_preserves_off_grid_points_and_endpoint_schedules(self):
+        for fraction in (0., .37, 1.):
+            with self.subTest(charge_fraction=fraction):
+                c = replace(self.config, duration=1., time_steps=10,
+                            charge_fraction=fraction, heating_power=20000., discharge_power=5000.)
+                result = run_simulation(c)
+                expected_times = np.unique(np.r_[np.linspace(0., c.duration, c.time_steps + 1),
+                                                 c.duration * fraction])
+                np.testing.assert_array_equal(result.times, expected_times)
+                expected = c.duration * (fraction * c.heating_power - (1 - fraction) * c.discharge_power)
+                self.assertAlmostEqual(float(result.diagnostics["energy_j"][-1]
+                                             - result.diagnostics["energy_j"][0]), expected, places=6)
+
+    def test_charge_transition_roundoff_at_endpoints_preserves_complete_interval(self):
+        for fraction in (np.nextafter(0., 1.), np.nextafter(1., 0.)):
+            with self.subTest(charge_fraction=fraction):
+                c = replace(self.config, duration=1., time_steps=10,
+                            charge_fraction=float(fraction), heating_power=20000., discharge_power=5000.)
+                result = run_simulation(c)
+                np.testing.assert_array_equal(result.times, np.linspace(0., c.duration, c.time_steps + 1))
+                self.assertGreater(float(np.diff(result.times).min()), .09)
+                expected = c.duration * (fraction * c.heating_power - (1 - fraction) * c.discharge_power)
+                self.assertAlmostEqual(float(result.diagnostics["energy_j"][-1]
+                                             - result.diagnostics["energy_j"][0]), expected, places=6)
+
     def test_radiation_cools_surface_and_closes_energy_balance(self):
         c = replace(self.config, heating_power=0., emissivity=.1, duration=1.)
         r = run_simulation(c)

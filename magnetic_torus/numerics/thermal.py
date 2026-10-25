@@ -234,7 +234,17 @@ def _run_thermal(config: ScenarioConfig, progress: Progress, cancel: threading.E
     K = coo_matrix((np.r_[g, g, -g, -g], (np.r_[i, j, i, j], np.r_[i, j, j, i])), shape=(n, n)).tocsr()
     volume, area = graph["node_volume"], graph["boundary_area"]
     mass = config.density * volume
-    times = np.unique(np.r_[np.linspace(0, config.duration, config.time_steps + 1), config.duration * config.charge_fraction])
+    times = np.linspace(0, config.duration, config.time_steps + 1)
+    transition = config.duration * config.charge_fraction
+    nearest = int(np.argmin(np.abs(times - transition)))
+    # Linspace and multiplication can round the same event differently. Keep
+    # its exact schedule time without creating a roundoff-sized Newton step.
+    if abs(times[nearest] - transition) <= 8 * np.finfo(float).eps * config.duration:
+        if nearest in (0, len(times) - 1):
+            transition = times[nearest]  # Never move the run's exact endpoints.
+        else:
+            times[nearest] = transition
+    times = np.unique(np.r_[times, transition])
     h = np.full(n, float(enthalpy_from_temperature(config.initial_temperature, config)))
     hs, temperatures = [h.copy()], [temperature_from_enthalpy(h, config)]
     energy, radiated, power, residuals = [float(mass @ h)], [0.0], [0.0], [0.0]

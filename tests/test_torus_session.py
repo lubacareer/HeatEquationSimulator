@@ -2,12 +2,13 @@
 
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 import unittest
 
 import numpy as np
 
-from magnetic_torus.models import PINNResult, RunResult, ScenarioConfig
+from magnetic_torus.models import DoseResult, PINNResult, RunResult, ScenarioConfig
 from magnetic_torus.ui.session import WorkspaceSession
 
 
@@ -110,6 +111,109 @@ class WorkspaceSessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.session.load_result(store, Path("corrupt.h5"))
         self.assertIs(self.session.active, self.run)
+
+    def test_unavailable_pinn_and_dose_timestamps_do_not_block_valid_run_and_sidecars(
+        self,
+    ):
+        accepted = result("loadable-run")
+        root = Path("saved-run")
+        missing_pinn = root / "pinn-disappeared.h5"
+        valid_pinn = root / "pinn-valid.h5"
+        unreadable_dose = root / "dose-unreadable.json"
+        valid_dose = root / "dose-valid.json"
+        paths = {
+            "pinn-*.h5": [missing_pinn, valid_pinn],
+            "dose-*.json": [unreadable_dose, valid_dose],
+        }
+        model = PINNResult(
+            "valid-model",
+            accepted.run_id,
+            accepted.config.config_hash,
+            accepted.fields,
+            {},
+            {},
+            {},
+        )
+        dose = DoseResult(
+            "valid-dose",
+            accepted.run_id,
+            accepted.config.config_hash,
+            0,
+            "water",
+            ("water",),
+            np.array([0.0]),
+            np.array([0.0]),
+            1,
+        )
+        store = Mock()
+        store.load_run.return_value = accepted
+        store.load_pinn.return_value = model
+        store.load_dose.return_value = dose
+
+        def stat(path):
+            if path == missing_pinn:
+                raise FileNotFoundError("Sidecar removed during discovery")
+            if path == unreadable_dose:
+                raise PermissionError("Sidecar timestamp unavailable")
+            return SimpleNamespace(st_mtime=1.0)
+
+        with (
+            patch.object(
+                Path, "rglob", lambda directory, pattern: iter(paths[pattern])
+            ),
+            patch.object(Path, "stat", stat),
+        ):
+            self.session.load_result(store, root / "result.h5")
+        self.assertIs(self.session.active, accepted)
+        self.assertIs(self.session.pinn, model)
+        self.assertIs(self.session.dose, dose)
+        store.load_pinn.assert_called_once_with(valid_pinn)
+        store.load_dose.assert_called_once_with(valid_dose)
+
+    def test_malformed_or_unreadable_newer_pinn_continues_to_valid_older_model(self):
+        root = Path("saved-run")
+        newer = root / "pinn-newer-broken.h5"
+        older = root / "pinn-older-valid.h5"
+        model = PINNResult(
+            "valid-model",
+            self.run.run_id,
+            self.run.config.config_hash,
+            self.run.fields,
+            {},
+            {},
+            {},
+        )
+        for error in (KeyError, TypeError, OSError, ValueError):
+            with self.subTest(error=error.__name__):
+                store = Mock()
+                store.load_run.return_value = self.run
+                store.load_pinn.side_effect = [
+                    error("Invalid or unreadable model sidecar"),
+                    model,
+                ]
+                with (
+                    patch.object(
+                        Path,
+                        "rglob",
+                        lambda directory, pattern: iter(
+                            [older, newer] if pattern == "pinn-*.h5" else []
+                        ),
+                    ),
+                    patch.object(
+                        Path,
+                        "stat",
+                        lambda path: SimpleNamespace(
+                            st_mtime=2.0 if path == newer else 1.0
+                        ),
+                    ),
+                ):
+                    self.session.load_result(store, root / "result.h5")
+                self.assertIs(self.session.active, self.run)
+                self.assertIs(self.session.pinn, model)
+                self.assertEqual(self.session.pinn_path, older)
+                self.assertEqual(
+                    store.load_pinn.call_args_list, [call(newer), call(older)]
+                )
 
 
 if __name__ == "__main__":
