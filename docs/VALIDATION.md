@@ -4,6 +4,38 @@ Reference workstation: Windows, Python 3.12 `torch-gpu`, Radeon 780M rendering, 
 
 Reproduce with `python -B scripts/run_checks.py`, `python -B scripts/desktop_smoke.py`, and `python -B -m magnetic_torus.physics --benchmark-report .cache/physics_validation.json --include-fenics`.
 
+## Structure and playback refactor (2026-10-25)
+
+- Before/after comparisons preserve all 30 captured native thermal, diagnostic,
+  source-sampling, and trajectory arrays exactly. PINN comparisons preserve 27
+  native arrays/metrics and model/optimizer checkpoint tensors exactly; a saved
+  FE case also preserves all 52 coupled arrays/metrics (1961 points, five snapshots).
+- The isolated regression suite, real desktop tests, and actual desktop smoke
+  workflow pass. Additional checks cover dependency isolation, headless session
+  state, coalesced rendering, cached linear section interpolation, visible
+  pre-run duration editing, and movie startup/cancellation when switching runs.
+- Small actual stationary/driven FE and ground/water Geant4 integrations pass
+  after moving their Python execution boundaries. These checks do not close the
+  scientific qualification gates listed below.
+- A fresh comparison on the reference workstation measured **44.93 FPS before**
+  and **52.17 FPS after** (about **16.1% faster**), using the median of five
+  60-frame repetitions including Qt event processing. Both use the resolution-8
+  thermal reference (2048 points), a 1282×780 window, Medium detail, opacity 100%,
+  and optional overlays off. This is separate from the earlier 31.77 FPS record;
+  timings depend on the machine and workload.
+
+Reproduce paired timing using the same Python environment and graphical session:
+
+```powershell
+python -B scripts/benchmark_desktop.py --output .cache/playback-before.json
+python -B scripts/benchmark_desktop.py --output .cache/playback-after.json --baseline .cache/playback-before.json
+```
+
+Run the first command before changes and the second after them. To compare the
+historical pre-refactor checkout, copy the benchmark script onto that checkout;
+the harness supports both workspace interfaces. It rejects mismatched fixture
+sizes/counts and a slowdown greater than 10%.
+
 ## Checks exercised
 
 - Sharp T(E) branches and latent-heat plateau; SI heat-capacity units; regularized constitutive continuity.

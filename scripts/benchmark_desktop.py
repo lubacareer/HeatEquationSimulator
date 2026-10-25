@@ -45,12 +45,17 @@ def main(argv=None) -> int:
             config = replace(preset("Thermal benchmark"), resolution=args.resolution, time_steps=24)
             result = run_simulation(config)
             window.activate_result(window.store.save_run(result))
-            window.editor.set_config(config)
+            # The harness can also be copied onto the pre-refactor checkout to
+            # reproduce the baseline; compatibility stays outside product code.
+            editor = getattr(window, "editor", window)
+            session = getattr(window, "session", window)
+            options = getattr(window.scene, "options", window.scene)
+            editor.set_config(config)
             window.scene.camera_preset("Isometric")
             app.processEvents()
 
             def frame(index):
-                window.session.current_index = index % len(result.times)
+                session.current_index = index % len(result.times)
                 window._render()
                 app.processEvents()
 
@@ -70,8 +75,8 @@ def main(argv=None) -> int:
                 "window": [window.width(), window.height()],
                 "frames_per_repeat": args.frames, "repetitions": repetitions,
                 "median_fps": float(np.median([value["fps"] for value in repetitions])),
-                "detail": window.scene.options.visual_detail, "opacity": window.scene.options.opacity,
-                "overlays": {name: getattr(window.scene.options, name) for name in
+                "detail": options.visual_detail, "opacity": options.opacity,
+                "overlays": {name: getattr(options, name) for name in
                              ("show_phase", "show_flow", "show_tracers", "show_field", "slice_enabled")},
                 "includes_qt_events": True,
             }
