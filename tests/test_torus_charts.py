@@ -117,9 +117,37 @@ class ThermalChartTests(unittest.TestCase):
         self.assertLess(high - low, 0.1)
         self.assertFalse(ax.yaxis.get_major_formatter().get_useOffset())
         annotation = "\n".join(text.get_text() for text in ax.texts)
-        self.assertIn("Tm = 1810 K (above range)", annotation)
+        self.assertIn("Tm = 1810 K (above data range)", annotation)
         self.assertIn("Probe ΔT = +0.027721 K", annotation)
         self.assertNotIn("Melting point", [line.get_label() for line in ax.lines])
+
+    def test_melting_reference_uses_data_extrema_not_axis_padding(self):
+        temperatures = self.result.fields["temperature"][:, self.session.probe_index]
+        raw_low, raw_high = float(temperatures.min()), float(temperatures.max())
+        for melting, direction in (
+            (raw_low - 0.002, "below"),
+            (raw_high + 0.002, "above"),
+            (raw_low, None),
+            (raw_high, None),
+        ):
+            with self.subTest(melting=melting, direction=direction):
+                result = replace(
+                    self.result,
+                    config=replace(self.result.config, melting_temperature=melting),
+                )
+                self.session.activate(result, Path("melting-range-fixture.h5"))
+                self.panel.refresh()
+                ax = self.panel.cards[2].ax
+                axis_low, axis_high = ax.get_ylim()
+                self.assertLess(axis_low, melting)
+                self.assertGreater(axis_high, melting)
+                labels = [line.get_label() for line in ax.lines]
+                notes = "\n".join(text.get_text() for text in ax.texts)
+                if direction is None:
+                    self.assertIn("Melting point", labels)
+                else:
+                    self.assertNotIn("Melting point", labels)
+                    self.assertIn(f"({direction} data range)", notes)
 
     def test_probe_range_includes_pinn_and_draws_inrange_melting_reference(self):
         fields = dict(self.result.fields)
@@ -142,6 +170,23 @@ class ThermalChartTests(unittest.TestCase):
         self.assertGreater(high, 1820.027721)
         self.assertIn("PINN", [line.get_label() for line in ax.lines])
         self.assertIn("Melting point", [line.get_label() for line in ax.lines])
+
+        model = self.session.pinn
+        result = replace(
+            self.result, config=replace(self.result.config, melting_temperature=1820.1)
+        )
+        self.session.activate(result, Path("pinn-melting-range-fixture.h5"))
+        self.session.set_pinn(replace(model, config_hash=result.config.config_hash))
+        self.panel.refresh()
+        ax = self.panel.cards[2].ax
+        self.assertLess(
+            float(fields["temperature"].max()), result.config.melting_temperature
+        )
+        self.assertGreater(ax.get_ylim()[1], result.config.melting_temperature)
+        self.assertNotIn("Melting point", [line.get_label() for line in ax.lines])
+        self.assertIn(
+            "(above data range)", "\n".join(text.get_text() for text in ax.texts)
+        )
 
     def test_energy_selector_is_hidden_outside_thermal_and_playback_keeps_axes(self):
         for view in ("Dynamo", "Shielding", "PINN", "Compare"):

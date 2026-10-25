@@ -442,14 +442,13 @@ class ChartPanel(QtWidgets.QWidget):
                     linestyle="--",
                     label="PINN",
                 )
-            low = min(float(np.min(values)) for values in histories)
-            high = max(float(np.max(values)) for values in histories)
-            padding = max(0.1 * (high - low), 0.005)
-            low, high = low - padding, high + padding
-            ax.set_ylim(low, high)
+            data_low = min(float(np.min(values)) for values in histories)
+            data_high = max(float(np.max(values)) for values in histories)
+            padding = max(0.1 * (data_high - data_low), 0.005)
+            ax.set_ylim(data_low - padding, data_high + padding)
             ax.ticklabel_format(axis="y", style="plain", useOffset=False)
             notes = []
-            if low <= config.melting_temperature <= high:
+            if data_low <= config.melting_temperature <= data_high:
                 ax.axhline(
                     config.melting_temperature,
                     color="#a2b4bf",
@@ -458,9 +457,11 @@ class ChartPanel(QtWidgets.QWidget):
                     label="Melting point",
                 )
             else:
-                direction = "above" if config.melting_temperature > high else "below"
+                direction = (
+                    "above" if config.melting_temperature > data_high else "below"
+                )
                 notes.append(
-                    f"Tm = {config.melting_temperature:g} K ({direction} range)"
+                    f"Tm = {config.melting_temperature:g} K ({direction} data range)"
                 )
             notes.append(
                 f"Probe ΔT = {probe_temperature[-1] - probe_temperature[0]:+.6g} K"
