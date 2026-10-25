@@ -1,0 +1,11 @@
+# Install into the existing torch-gpu environment. PyTorch is managed separately.
+PyQt6>=6.9,<7
+pyvista==0.49.1
+vtk==9.7.1
+pyvistaqt==0.13.1
+QtPy==2.4.3
+h5py==3.16.0
+imageio-ffmpeg==0.6.0
+numpy>=2.1,<3
+scipy>=1.14,<2
+matplotlib>=3.10,<4
