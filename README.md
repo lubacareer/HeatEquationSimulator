@@ -1,91 +1,114 @@
-# 2-Phase Stefan Problem Solver using PINNs
+# Magnetic Torus Simulator
 
-## Overview
+A visualization-first Python desktop for phase-change thermal storage, resistive magnetohydrodynamics (MHD), physics-informed neural networks (PINNs), and charged-particle transport. Built on HeatEquationSimulator, it combines an interactive torus scene with linked scientific plots and animation. The original application remains available with `--legacy`.
 
-This project involves a standalone Python 3 desktop application designed to solve the 2-phase Stefan problem using Physics-Informed Neural Networks (PINNs) along with analytical and numerical methods. The application integrates TensorFlow, Keras, CUDA for GPU acceleration, and Tkinter for the user interface.
+**Status: experimental research implementation.** Every selected module has executable code. Integration checks are separate from scientific qualification: MHD Taylor–Green, full coupled manufactured-solution convergence, exterior-domain refinement, subgrid total-energy validation, and reference radiation transport qualification remain acceptance gates. A successful run or PINN fit does not establish habitat protection or a self-sustaining dynamo.
 
-## Author
+## Quick start: Windows desktop
 
-Luba Ira - [lubacareer@gmail.com](mailto:lubacareer@gmail.com) - [irakorla@post.bgu.ac.il](mailto:irakorla@post.bgu.ac.il)
+Use Python 3.12 and run commands from the repository root. If your `torch-gpu` environment is already configured, activate it and launch:
 
-## Project Description
+```powershell
+conda activate torch-gpu
+python interface3.py
+```
 
-The application simulates the latent heat thermal energy storage in lunar regolith, which is crucial for future lunar settlement. The PINN approach allows for efficient and accurate predictions of phase change materials (PCMs) behavior under varying thermal conditions.
+Select **Thermal benchmark**, then **Run simulation** for the quickest computed animation. Edit thermal properties and press **Recalculate scenario** without restarting. Accepted results remain visible while a job runs and survive failures and cancellation. **Iron** and **Lunar habitat** select the full FEniCS worker; their engineering/material values are illustrative.
 
-## Features
+For a new desktop environment:
 
-- **Physics-Informed Neural Networks (PINNs):** Dual-branch network architecture for temperature and boundary predictions.
-- **Numerical Methods:** Explicit and implicit numerical solutions for handling the Stefan problem.
-- **Analytical Solutions:** Provides baseline solutions for comparison.
-- **Graphical User Interface (GUI):** Built with Tkinter for easy interaction.
-- **GPU Acceleration:** Utilizes CUDA for computational efficiency.
+```powershell
+git clone https://github.com/lubacareer/HeatEquationSimulator.git
+cd HeatEquationSimulator
+conda create -n torch-gpu python=3.12
+conda activate torch-gpu
+python -m pip install -r requirements-desktop.txt
+python interface3.py
+```
 
-## Files
+The desktop and native thermal benchmark work without PyTorch or WSL. PINN training and the full test suite require PyTorch; install the CPU or CUDA build appropriate for your machine using the [official PyTorch installer](https://pytorch.org/get-started/locally/). Select the same environment as your Python interpreter in your IDE.
 
-- **`interface3.py`:** The main file containing the GUI and the application logic.
-- **`deepLearning.py`:** Contains the PINN model architecture and training functions.
-- **`backend.py`:** Includes utility functions and additional computational methods.
+| Capability | Additional environment |
+| --- | --- |
+| Desktop, plots, native thermal benchmark, imposed-coil trajectory diagnostics | Windows desktop dependencies |
+| Thermal/coupled PINN training | PyTorch in the Windows environment; CUDA optional |
+| Coupled numerical MHD and FE field snapshots | FEniCSx/Gmsh/PETSc in WSL Ubuntu |
+| Quantitative water or anatomical dose | Accepted FE field plus the Geant4 WSL worker and datasets |
 
-### How to Run the Program
+Check dependencies, reopen saved data, or launch the original interface:
 
-1. **Ensure Prerequisites Are Met:**
-   - **Docker Desktop**: Make sure Docker Desktop is installed and running on your system.
-   - **Xming (Windows users)**: Install and run Xming to display GUI applications. Configure it to allow external connections.
-   - **X Server for Linux/macOS**: Ensure X11 (Linux) or XQuartz (macOS) is installed and running for GUI display.
+```powershell
+python -m magnetic_torus.diagnostics
+python interface3.py --load C:\path\to\result.h5
+python interface3.py --legacy
+```
 
-2. **Pull the Docker image from Google Cloud Container Registry:**
-    
-    ```commandline
-   docker pull gcr.io/sonic-cumulus-357519/scientific-project
-    ```
-3. **Run the Docker container:**
+The tested Windows Python 3.12 package versions are recorded in [requirements-desktop.lock.txt](requirements-desktop.lock.txt), including the CUDA 12.8 PyTorch build. This is a reference package snapshot; [requirements-desktop.txt](requirements-desktop.txt) installs the desktop stack while leaving your PyTorch build under your control. Legacy dependencies and instructions are retained in [docs/LEGACY_README.md](docs/LEGACY_README.md).
 
-    ```commandline
-   docker run -it --rm -e DISPLAY=host.docker.internal:0.0 gcr.io/sonic-cumulus-357519/scientific-project
-    ```
-   
-4. **Display Configuration:**
-   - Ensure the DISPLAY environment variable is correctly set for your operating system to connect to the X server (e.g., DISPLAY=host.docker.internal:0.0 for Windows users).
+## Explore, animate, compare
 
-## Troubleshooting: NumPy DLL load failed
+- Rotate/zoom the PyVista scene or choose a camera preset. Toggle cutaway, phase contour, velocity arrows, integrated flow tracers, magnetic field lines, and a movable cross-section. Hide **Plots** for a larger scene. Opacity and visual detail do not alter the computed solution.
+- Right-click the reservoir to choose a probe. The T(E) marker and history update together: temperature rises for E<0, stays at the melting temperature for 0≤E≤LH, and rises again for E>LH. Zero enthalpy marks solid material at its melting point. The chart displays kJ/kg and K; internal quantities use SI.
+- Play, step, scrub, loop, or click history plots. The main clock displays accepted thermal/MHD snapshots. Particle replay has its own flight-time clock. Tracers interpolate accepted velocities for display; they are not additional solver states.
+- Thermal charts offer probe/cross-section temperature, liquid fraction, and thermal/pumping power. Dynamo charts show magnetic energy and toroidal/poloidal components. Shielding shows paired first-contact outcomes and field-on/off absorbed dose with standard errors. PINN shows training, held-out metrics, and overlays.
+- Select two saved runs for linked cameras, common color limits, and aligned timelines. **Run difference** is available for matching point geometries; time interpolation is labelled as a display operation. Radiation always references an accepted frozen field snapshot.
+- Expand individual plots with their arrow. Advanced parameters and diagnostics remain collapsible. Export PNG scenes, SVG charts, annotated MP4, JSON scenarios, and SI HDF5 results on request. HDF5 embeds accepted exterior-field and weak-operator artifacts for portability.
 
-If you see an error similar to the following when launching the app or importing matplotlib/NumPy:
+## Architecture and result history
 
-- ImportError: DLL load failed while importing _multiarray_umath: The specified module could not be found.
-- ImportError: numpy._core.multiarray failed to import
+Qt/PyVista/Matplotlib runs natively on Windows. Each solve, training job, and analysis runs in a separate process; one heavy job is allowed per desktop. The current conda environment can load conflicting Intel OpenMP runtimes when SciPy and PyTorch share a process, so workers and test modules deliberately remain isolated. Do not bypass this with `KMP_DUPLICATE_LIB_OK`.
 
-This is an environment issue: your Python environment has an incompatible or broken NumPy build (often caused by mixing conda and pip, or installing wheels that do not match your Python version/ABI).
+Immutable `ScenarioConfig`, `RunResult`, `PINNResult`, and `DoseResult` contracts record configuration hashes, source runs, accepted snapshots, seeds, versions, and validation status. Editable inputs are separate from accepted results. Geometry previews update before the first solve; later geometry edits appear as a labelled wireframe over accepted fields until recalculation. Run history defaults to `%LOCALAPPDATA%\MagneticTorus`; override with `MAGNETIC_TORUS_DATA` or `--data-dir`.
 
-The application now detects this early and shows a friendly message before heavy imports. To fix your environment, choose ONE of the options below and run the commands in a clean environment.
+### FEniCSx / Gmsh / PETSc in WSL Ubuntu
 
-Option A — Conda (recommended if you created a conda env):
+From the Windows clone directory, with WSL2 and an Ubuntu distribution installed:
 
-    # Create or repair environment (example name: tf_env)
-    conda create -n tf_env python==3.10 -y
-    conda activate tf_env
-    # Install compatible scientific stack from conda-forge
-    conda install -c conda-forge "numpy==1.23.5" "scipy==1.10.*" "matplotlib" "scikit-learn>=1.5,<2" -y
-    # Optional: TensorFlow CPU and DirectML plugin on Windows
-    pip install --upgrade pip
-    pip install --extra-index-url https://pkgs.dev.azure.com/azure-public/vside/_packaging/tensorflow-directml/pypi/simple/ \
-        "tensorflow-cpu==2.10.0" "tensorflow-directml-plugin==0.4.0.dev230202"
+```powershell
+wsl -d Ubuntu -- bash scripts/setup_wsl_physics.sh
+```
 
-Option B — Pure pip (no conda), in a clean venv:
+WSL inherits the current clone directory. Alternatively, open Ubuntu, change to the same clone under `/mnt/`, and run `bash scripts/setup_wsl_physics.sh`. Setup requires administrative access and installs the Ubuntu FE packages. The tested environment is **Ubuntu 26.04 with DOLFINx 0.10**; other package versions require verification. The script records installed versions, and [env/physics-ubuntu.lock.txt](env/physics-ubuntu.lock.txt) preserves the tested package snapshot; the apt installer does not replay that snapshot automatically. Set `TORUS_WSL_DISTRO` if your distribution is named differently from `Ubuntu`. See [DOLFINx installation guidance](https://github.com/FEniCS/dolfinx/blob/main/README.md).
 
-    py -3.10 -m venv .venv
-    .venv\Scripts\activate
-    python -m pip install --upgrade pip
-    pip uninstall -y numpy scipy
-    pip install --only-binary=:all: "numpy==1.26.4" "scipy==1.11.4" matplotlib "scikit-learn>=1.5,<2"
+The full worker uses conservative regularized enthalpy; buoyancy, pumping and Lorentz feedback; no-slip/enthalpy-porosity damping; Joule/viscous/Darcy heating; phase-dependent electrical transport; global vector potential A and conductor electric potential; truncated vacuum exterior; explicit gauges; and fully iterated implicit timesteps with rejection. Only accepted snapshots are published. Imposed currents and circulation are independent; dynamo mode removes its seed and reports actual growth/decay. Recoverable energy is volume weighted relative to the discharge temperature, with efficiency and pumping/imposed-field diagnostics accounted separately.
 
-Notes:
-- Do NOT mix conda and pip for NumPy/SciPy in the same environment.
-- Ensure your Python version matches the pinned versions in requirements.txt.
-- On Python 3.12+, NumPy 2.x will be installed and our code handles NumPy 2 changes.
+The mixed residual-VMS closure includes momentum and induction terms plus residual-based eddy transport using [Sondak et al.](https://arxiv.org/html/1412.1055). The A–phi/tetrahedral/exterior adaptation remains experimental; it does not reproduce the published B–psi Taylor–Green qualification. Thermal turbulent Prandtl number 0.85 is an assumption. The native finite-volume thermal benchmark charges at its boundary; the full FE source is volumetric, as recorded in metadata. Iron heat capacities use J/(kg K). Presets are illustrative constant-property models, not qualified temperature-dependent material datasets.
 
-Local run (without Docker):
+Imposed, induced, and mutual magnetic stored-energy contributions and integrated pumping work are separate diagnostics. The imposed coil is an ideal prescribed current; a coil circuit, resistive supply losses, and power electronics are not modeled. These stored-field diagnostics do not establish net electrical profitability. The lunar preset starts with molten iron; the thermal benchmark starts below melting to show the moving phase front.
 
-    python -m pip install -r requirements.txt
-    python interface3.py
+### PINNs
 
-If the GUI exits early with a "NumPy import error" dialog, follow the steps above to repair your environment.
+Per-scenario PyTorch models use nondimensional variables and sparse numerical samples. Full coupled models enforce the same exported differentiable FE weak operator, including closure, conductor/exterior interfaces, gauges, and boundary conditions. Native models enforce the corresponding discrete conservative enthalpy balance and supply only the thermal fields they train. Batches are bounded; checkpoints, cancellation, held-out field errors, conservation defects, and histories are recorded.
+
+Training can fail its validation gates. Failed models remain inspectable and labelled failed. **PINN-sourced** radiation requires a passed model with the originating scenario and full global A prediction. Numerical FE fields can supply radiation analyses without training a PINN. Agreement with a numerical source does not independently qualify that source's physics.
+
+### Geant4 and ICRP110 targets
+
+```powershell
+wsl -d Ubuntu -- bash scripts/setup_geant4.sh
+```
+
+Run this from the same Windows clone directory, or run `bash scripts/setup_geant4.sh` from the clone inside Ubuntu. Setup needs administrative access and downloads the toolkit and datasets. It installs Geant4 11.4.3, builds the C++ worker, downloads official physics/ICRP110 data, and replays the integrity-pinned Linux package URLs in [env/geant4-linux-64.explicit.txt](env/geant4-linux-64.explicit.txt). It uses prebuilt conda-forge toolkit binaries by default; `TORUS_GEANT4_PREBUILT=0` selects a source build. Runtime wrapper: `/opt/magnetic-torus/bin/torus-dose-run`; override with `TORUS_GEANT4_WORKER`.
+
+Relativistic Boris trajectories support protons, alpha particles, and heavier ions. Native thermal runs provide an explicitly labelled imposed-coil Biot–Savart diagnostic only. Dose requires the full accepted FE exterior map. Physical transport evaluates cellwise curl(A), including selected PINN A; smoothed nodal B is for display.
+
+Geant4 uses [Shielding](https://geant4.web.cern.ch/documentation/dev/plg_html/PhysicsListGuide/reference_PL/Shielding.html) with EM option 4 and supports a QGSP_BIC_HP cross-check. Geometry includes reservoir, vessel, coils, habitat wall, optional ground, water, and [ICRP110 male/female anatomical targets](https://geant4.web.cern.ch/docs/advanced_examples_doc/example_ICRP110Phantom). Anatomical targets require a large enough habitat; the lunar preset fits. Absorbed dose is Gy per specified incident fluence, with event-wise standard errors, secondary contributions, and explicit precision status. Zero-hit organs do not meet the ≤5% uncertainty target. Effective dose in Sv is outside this release; unnormalized dose rates are not reported.
+
+Spectrum JSON uses `schema_version: 1`, `energy_unit: "MeV/nucleon"`, `angular_distribution: "beam"` or `"isotropic"`, `provenance`, and `bins` with integer `z`, integer `a`, positive `energy_mev_nucleon`, and positive integrated-bin `weight`. Fluence is a separate scenario parameter. Field-on/off transport reuses identical incident primaries.
+
+## Reproduce checks
+
+```powershell
+python -B scripts/run_checks.py
+python -B scripts/desktop_smoke.py
+python -B -m magnetic_torus.physics --benchmark-report .cache/physics_validation.json --include-fenics
+python -B -m magnetic_torus.pinn_validation --native --device cpu --epochs 1000
+```
+
+Run these in the desktop Python environment with PyTorch installed. The FE benchmark additionally needs the WSL worker; desktop smoke needs a graphical session. The test runner isolates modules to avoid OpenMP conflicts. Desktop smoke exercises real Qt/VTK, repeated edits/runs, probes, comparisons, cancellation, failure/stale isolation, particle replay, saved PINN inspection when available, and decoding every exported MP4 frame. It records scene size and measured FPS. Scientific reports list completed checks and outstanding qualification gates separately. The PINN validation CLI returns exit code **3** for a completed fit that fails validation.
+
+See [docs/VALIDATION.md](docs/VALIDATION.md) for actual benchmark values, the measured 31.8 FPS reference scene, real water/anatomical transport runs, failed coupled PINN fits, and open release gates. The Ubuntu FE package lock and integrity-pinned Geant4 environment are in `env/`.
+
+Generated run histories, worker artifacts, datasets, checkpoints, and `.cache/` benchmark reports are kept out of Git. The paths in the validation record describe local evidence; rerun the commands above to generate reports on your machine. The recorded dynamic coupled PINN fits fail their accuracy gates, the small dose samples miss the 5% precision target, and the remaining MHD qualification benchmarks are still open.
+
+The original author and documentation are retained in [docs/LEGACY_README.md](docs/LEGACY_README.md).

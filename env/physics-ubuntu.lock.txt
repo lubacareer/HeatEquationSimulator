@@ -1,0 +1,22 @@
+# Installed Ubuntu 26.04 (resolute) finite-element environment
+# Exact apt binary package versions; recorded without apt mutation.
+libbasix0.10:amd64=0.10.0.post0-2build3
+libdolfinx-real0.10:amd64=1:0.10.0.post5-6ubuntu2
+libgmsh4.14:amd64=4.14.0+ds1-1build4
+libmumps-5.8:amd64=5.8.2-1ubuntu1
+libopenblas0-pthread:amd64=0.3.32+ds-5
+libpetsc-real3.24:amd64=3.24.4+dfsg1-1ubuntu1
+libpython3.14-stdlib:amd64=3.14.4-1ubuntu0.2
+python3=3.14.3-0ubuntu2
+python3-basix=0.10.0.post0-2build3
+python3-dolfinx:amd64=1:0.10.0.post5-6ubuntu2
+python3-dolfinx-real=1:0.10.0.post5-6ubuntu2
+python3-ffcx=1:0.10.1.post0-1
+python3-gmsh=4.14.0+ds1-1build4
+python3-mpi4py=4.1.1-1ubuntu2
+python3-numpy=1:2.3.5+ds-3ubuntu1
+python3-petsc4py-real=3.24.4-1ubuntu2
+python3-petsc4py-real3.24=3.24.4-1ubuntu2
+python3-scipy=1.16.3-4build1
+python3-ufl=2025.2.1-1
+python3.14=3.14.4-1ubuntu0.2

@@ -1,0 +1,3 @@
+* text=auto
+*.sh text eol=lf
+env/*.txt text eol=lf

@@ -1,3 +1,19 @@
+import sys
+
+# Keep legacy imports and App available to existing callers and regression tests.
+# Executing this file opens the modern workspace; --legacy retains the old GUI.
+if __name__ == "__main__" and "--legacy" not in sys.argv:
+    try:
+        from magnetic_torus.app import main as torus_main
+    except ImportError as error:
+        print(f"Magnetic Torus desktop dependency is unavailable: {error}\n"
+              "Activate conda environment torch-gpu, then run:\n"
+              "python -m pip install -r requirements-desktop.txt\n"
+              "python interface3.py\n"
+              "The original application remains available with --legacy.", file=sys.stderr)
+        raise SystemExit(1) from error
+    raise SystemExit(torus_main())
+
 import math
 import os
 
@@ -36,7 +52,7 @@ PINN_TRAINING_EPOCHS = 50
 PINN_TARGET_BATCHES_PER_EPOCH = 32
 PINN_MAX_TRAIN_SAMPLES = 20000
 BOUNDARY_HEAD_VIOLATION_THRESHOLD = 0.05
-PLOT_ENTHALPY_SCALE = 1e-6  # Convert J/m^3 to MJ/m^3 for more readable T(E)
+PLOT_ENTHALPY_SCALE = 1e-3  # Convert specific enthalpy from J/kg to kJ/kg for T(E).
 
 THEME = {
     "bg": "#f3f6fa",
@@ -701,15 +717,11 @@ class App:
         custom_state = "normal" if self.setup_mode_var.get() == 0 else "disabled"
         material_state = "readonly" if self.setup_mode_var.get() == 1 else "disabled"
         for child in self.custom_frame.winfo_children():
-            try:
+            if isinstance(child, ttk.Entry):
                 child.configure(state=custom_state)
-            except tk.TclError:
-                pass
         for child in self.material_frame.winfo_children():
-            try:
+            if isinstance(child, ttk.Combobox):
                 child.configure(state=material_state)
-            except tk.TclError:
-                pass
 
     def submit_setup_form(self) -> None:
         try:
@@ -744,7 +756,7 @@ class App:
         self._set_pinn_controls_enabled(True)
         self.calcAll()
         try:
-            if hasattr(self, "t_grid") and len(self.t_grid) > 0 and self.pcm is not None:
+            if self.t_grid is not None and len(self.t_grid) > 0 and self.pcm is not None:
                 self.time_scale.config(
                     to=float(self.t_grid[-1]), resolution=float(self.pcm.dt)
                 )
@@ -856,7 +868,7 @@ class App:
 
         self.fig1, self.ax1 = plt.subplots(figsize=(4, 3), dpi=100)
         self.ax1.set_title("T(E) Line Plot")
-        self.ax1.set_xlabel("E (MJ/m³)")
+        self.ax1.set_xlabel("E (kJ/kg)")
         self.ax1.set_ylabel("T")
         self.canvas1 = FigureCanvasTkAgg(self.fig1, plot_cards[0].content)
         self.canvas1.draw()
@@ -1073,7 +1085,7 @@ class App:
     # Call the energy calculation method and update the label with the result string
     def update_energy_label(self):
         # Example: Assuming self.H_arr_final contains the enthalpy values needed for the energy calculation
-        if self.H_arr_final is not None:
+        if self.H_arr_final is not None and self.pcm is not None:
             # Use the simulated time span (seconds) to set the load duration in hours
             try:
                 sim_hours = float(self.t_grid[-1]) / 3600.0 if self.t_grid is not None else None
@@ -1141,6 +1153,9 @@ class App:
 
     def calcAll(self):
         print("Debug: Starting calcAll")
+        pcm = self.pcm
+        if pcm is None:
+            raise RuntimeError("Select a material before calculating the simulation.")
 
         # Initialize attributes
         self.moving_boundary_indices: Dict[str, Optional[np.ndarray]] = {}
@@ -1184,7 +1199,7 @@ class App:
             self.t_grid,
             self.T_arr,
             self.H_arr,
-        ) = self.pcm.generate_data(self.L, self.t_max)
+        ) = pcm.generate_data(self.L, self.t_max)
         nx = len(self.x_grid)
         nt = len(self.t_grid)
 
@@ -1199,12 +1214,12 @@ class App:
             _numerical_phase_mask_series,
             _numerical_boundary_mask_series,
             moving_boundary_indices_numerical,
-        ) = self.pcm.explicitNumerical(
-            self.x_grid, self.t_grid, self.T_arr.copy(), self.pcm
+        ) = pcm.explicitNumerical(
+            self.x_grid, self.t_grid, self.T_arr.copy(), pcm
         )
 
-        phase_mask_final, boundary_mask_final = self.pcm.update_phase_mask(
-            self.T_arr_numerical[:, -1], self.pcm
+        phase_mask_final, boundary_mask_final = pcm.update_phase_mask(
+            self.T_arr_numerical[:, -1], pcm
         )
         self.temp_mask_arrays["Numerical"] = phase_mask_final
         self.bound_mask_arrays["Numerical"] = boundary_mask_final
@@ -1227,18 +1242,18 @@ class App:
 
         # Analytical solution
         print("Debug: Calculating analytical solution")
-        self.T_arr_analytical = self.pcm.analyticalSol(
-            self.x_grid, self.t_grid, self.pcm
+        self.T_arr_analytical = pcm.analyticalSol(
+            self.x_grid, self.t_grid, pcm
         )
-        analytical_phase_mask, analytical_boundary_mask = self.pcm.update_phase_mask(
-            self.T_arr_analytical[:, -1], self.pcm
+        analytical_phase_mask, analytical_boundary_mask = pcm.update_phase_mask(
+            self.T_arr_analytical[:, -1], pcm
         )
         self.temp_mask_arrays["Analytical"] = analytical_phase_mask
         self.bound_mask_arrays["Analytical"] = analytical_boundary_mask
         self.temperature_solutions["Analytical"] = self.T_arr_analytical
 
-        analytical_boundary_positions = self.pcm.stefan_boundary_location(
-            self.t_grid, surface_temp=self.pcm.T_m + 10.0
+        analytical_boundary_positions = pcm.stefan_boundary_location(
+            self.t_grid, surface_temp=pcm.T_m + 10.0
         )
         analytical_boundary_positions = np.clip(
             analytical_boundary_positions, 0.0, self.L
@@ -1266,13 +1281,13 @@ class App:
                 _implicit_phase_mask_series,
                 _implicit_boundary_mask_series,
                 moving_boundary_indices_implicit,
-            ) = self.pcm.implicitSol(
-                self.x_grid, self.t_grid, self.T_arr.copy(), self.H_arr.copy(), self.pcm
+            ) = pcm.implicitSol(
+                self.x_grid, self.t_grid, self.T_arr.copy(), self.H_arr.copy(), pcm
             )
 
             # Use update_phase_mask after obtaining T_arr_implicit
-            implicit_phase_mask, implicit_boundary_mask = self.pcm.update_phase_mask(
-                self.T_arr_implicit[:, -1], self.pcm
+            implicit_phase_mask, implicit_boundary_mask = pcm.update_phase_mask(
+                self.T_arr_implicit[:, -1], pcm
             )
             self.temp_mask_arrays["Implicit"] = implicit_phase_mask
             self.bound_mask_arrays["Implicit"] = implicit_boundary_mask
@@ -1313,7 +1328,7 @@ class App:
                 continue
             if self.moving_boundary_positions.get(key) is None:
                 self.moving_boundary_positions[key] = (
-                    np.clip(idx_array, 0, nx - 1).astype(float) * self.pcm.dx
+                    np.clip(idx_array, 0, nx - 1).astype(float) * pcm.dx
                 )
 
         print("Debug: calcAll finished successfully")
@@ -1529,6 +1544,16 @@ class App:
             print(
                 "Error: gold_standard_temp_array is None. Ensure that a valid solution is selected as the gold standard."
             )
+            return
+
+        if (
+            self.pcm is None
+            or self.x is None
+            or self.x_boundary is None
+            or self.x_grid is None
+            or self.t_grid is None
+        ):
+            print("Error: Run a simulation before preparing PINN training data.")
             return
 
         self.x_input = self.x
@@ -2070,7 +2095,11 @@ class App:
         self.show_PINN_plots()
 
     def update_plots(self) -> None:
-        if self.T_arr_to_display is None:
+        if (
+            self.T_arr_to_display is None
+            or self.x_grid is None
+            or self.t_grid is None
+        ):
             print("Warning: No solution data available for plotting.")
             return
         T_arr_to_display = self.T_arr_to_display
@@ -2124,62 +2153,64 @@ class App:
     def build_enthalpy_temperature_curve(
         self, temperature_surface: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Construct a monotonic T(E) curve with a flat segment across the latent-heat interval."""
+        """Return specific enthalpy (kJ/kg) and temperature with E=0 at solid melting.
+
+        In J/kg, E=c_solid*(T-Tm) below melting, E spans [0, LH]
+        at Tm, and E=LH+c_liquid*(T-Tm) above melting.
+        """
         tm = float(getattr(self.pcm, "T_m", 0.0))
-        rho = max(float(getattr(self.pcm, "rho", 1.0)), 1e-12)
         c_solid = max(float(getattr(self.pcm, "c_solid", getattr(self.pcm, "c", 1.0))), 1e-12)
         c_liquid = max(float(getattr(self.pcm, "c_liquid", getattr(self.pcm, "c", 1.0))), 1e-12)
         latent_heat = max(float(getattr(self.pcm, "LH", 0.0)), 0.0)
 
-        if temperature_surface.size:
-            t_min = float(np.nanmin(temperature_surface))
-            t_max = float(np.nanmax(temperature_surface))
+        # Iron stores heat capacities in J/(g K); the other materials use J/(kg K).
+        # Normalize the graph without changing the simulation's material properties.
+        if isinstance(self.pcm, backend.Iron):
+            c_solid *= 1000.0
+            c_liquid *= 1000.0
+
+        temperatures = np.asarray(temperature_surface, dtype=float)
+        finite_temperatures = temperatures[np.isfinite(temperatures)]
+        if finite_temperatures.size:
+            t_min = float(np.min(finite_temperatures))
+            t_max = float(np.max(finite_temperatures))
         else:
             t_min = tm
             t_max = tm
 
-        if not math.isfinite(t_min):
-            t_min = tm
-        if not math.isfinite(t_max):
-            t_max = tm
-
-        # Ensure the curve spans below and above the melting point so the branches and plateau are visible.
-        t_min = min(t_min, tm - 1e-3)
-        t_max = max(t_max, tm + 1e-3)
-
-        latent_enthalpy = latent_heat * rho
+        # This material curve must show both phases even if the simulation only
+        # reaches one of them. A tiny extension above Tm hides the liquid branch.
+        branch_temperature_span = max(0.25 * (t_max - t_min), 25.0)
+        t_min = min(t_min, tm - branch_temperature_span)
+        t_max = max(t_max, tm + branch_temperature_span)
 
         solid_enthalpy = np.linspace(
-            rho * c_solid * (t_min - tm),
+            c_solid * (t_min - tm),
             0.0,
             120,
             endpoint=True,
         )
-        solid_temps = tm + solid_enthalpy / (rho * c_solid)
+        solid_temps = tm + solid_enthalpy / c_solid
 
-        plateau_points = 60 if latent_enthalpy > 0 else 2
-        plateau_enthalpy = np.linspace(0.0, latent_enthalpy, plateau_points)
+        plateau_points = 60 if latent_heat > 0 else 1
+        plateau_enthalpy = np.linspace(0.0, latent_heat, plateau_points)
         plateau_temps = np.full_like(plateau_enthalpy, tm)
 
         liquid_enthalpy = np.linspace(
-            latent_enthalpy,
-            latent_enthalpy + rho * c_liquid * (t_max - tm),
+            latent_heat,
+            latent_heat + c_liquid * (t_max - tm),
             180,
             endpoint=True,
         )
-        liquid_temps = tm + (liquid_enthalpy - latent_enthalpy) / (rho * c_liquid)
+        liquid_temps = tm + (liquid_enthalpy - latent_heat) / c_liquid
 
         enthalpy_curve = np.concatenate(
-            [solid_enthalpy, plateau_enthalpy[1:], liquid_enthalpy]
+            [solid_enthalpy, plateau_enthalpy[1:], liquid_enthalpy[1:]]
         )
         temperature_curve = np.concatenate(
-            [solid_temps, plateau_temps[1:], liquid_temps]
+            [solid_temps, plateau_temps[1:], liquid_temps[1:]]
         )
-        enthalpy_scaled = enthalpy_curve * PLOT_ENTHALPY_SCALE
-        min_e = float(np.nanmin(enthalpy_scaled)) if enthalpy_scaled.size else 0.0
-        offset = -min_e if min_e < 0 else 0.0
-        enthalpy_shifted = enthalpy_scaled + offset
-        return enthalpy_shifted, temperature_curve
+        return enthalpy_curve * PLOT_ENTHALPY_SCALE, temperature_curve
 
     def show_PINN_plots(self, show_gold_standard=True, custom_cmap="coolwarm"):
         self.render_pinn_results(show_gold_standard, custom_cmap)
@@ -2189,6 +2220,10 @@ class App:
         if self.Temperature_pred is None or self.Boundary_pred is None:
             print("Prediction data is not available.")
             self.set_status("Prediction data is not available.", error=True)
+            return
+
+        if self.x_grid is None or self.t_grid is None:
+            self.set_status("Simulation grids are not available. Run a simulation first.", error=True)
             return
 
         if show_gold_standard and self.gold_standard_boundary_per_time is None:
@@ -2430,7 +2465,7 @@ class App:
         self.canvas3.draw()
 
     def update_time(self, event) -> None:
-        if self.T_arr_to_display is None:
+        if self.T_arr_to_display is None or self.x_grid is None:
             return
         T_arr_to_display = self.T_arr_to_display
 
