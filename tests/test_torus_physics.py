@@ -14,7 +14,8 @@ from unittest.mock import patch
 import numpy as np
 
 from magnetic_torus.models import ScenarioConfig, SimulationCancelled, RunResult, DoseResult
-from magnetic_torus.physics import (MU0, _thermal_graph, coil_magnetic_field,
+from magnetic_torus.numerics.thermal import _thermal_graph
+from magnetic_torus.physics import (MU0, coil_magnetic_field,
                                     enthalpy_from_temperature, liquid_fraction,
                                     regularized_enthalpy, run_simulation,
                                     temperature_from_enthalpy)
@@ -61,8 +62,8 @@ class ThermalPhysicsTests(unittest.TestCase):
         ordinary = replace(self.config, resolution=8, time_steps=80)
         enormous = replace(self.config, resolution=128, time_steps=100000)
         self.assertLess(native_memory_estimate(ordinary), 64 * 1024 ** 2)
-        with patch("magnetic_torus.physics.available_memory_bytes", return_value=512 * 1024 ** 2), \
-             patch("magnetic_torus.physics._thermal_graph") as allocation, \
+        with patch("magnetic_torus.numerics.thermal.available_memory_bytes", return_value=512 * 1024 ** 2), \
+             patch("magnetic_torus.numerics.thermal._thermal_graph") as allocation, \
              patch.dict(os.environ, {"MAGNETIC_TORUS_NATIVE_MEMORY_MB": "256"}):
             with self.assertRaisesRegex(ValueError, "Reduce mesh resolution or output snapshots"):
                 run_simulation(enormous)
@@ -121,7 +122,7 @@ class ThermalPhysicsTests(unittest.TestCase):
                                   wait=lambda **_kwargs: 1, terminate=lambda: None)
         with tempfile.TemporaryDirectory() as directory, \
              patch.dict(os.environ, {"MAGNETIC_TORUS_RUNS": directory}), \
-             patch("magnetic_torus.physics.subprocess.Popen", return_value=process):
+             patch("magnetic_torus.numerics.fenics.subprocess.Popen", return_value=process):
             with self.assertRaisesRegex(PhysicsBackendUnavailable, "delayed final numerical error"):
                 run_simulation(replace(self.config, solver="fenics"))
             logs = list(Path(directory).glob("*/worker.log"))
