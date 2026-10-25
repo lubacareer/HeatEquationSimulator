@@ -10,7 +10,7 @@ import numpy as np
 
 from .. import __version__
 from ..models import Progress
-from .fields import STEFAN_BOLTZMANN, _cancelled, _scalar_field
+from .fields import STEFAN_BOLTZMANN, UnsupportedPINNConfiguration, _cancelled, _scalar_field
 from .diagnostics import ENERGY_DEFECT_LIMIT, FIELD_RMSE_LIMIT, LOSS_LIMIT, RESIDUAL_RMS_LIMIT
 
 if TYPE_CHECKING:
@@ -36,7 +36,14 @@ def _field_metrics(run: TrainingRun, predicted: dict[str, np.ndarray], initial_v
     for name, field_width in zip(scaling.names, scaling.widths):
         normalization[name] = float(scaling.scales[scale_start])
         scale_start += field_width
-    normalization["temperature"] = max(float(np.ptp(np.asarray(result.fields["temperature"]))), 1.)
+    training_times, training_points = np.divmod(data.train_ids, data.point_count)
+    training_conductor = conductor_mask[training_points]
+    if not training_conductor.any():
+        raise UnsupportedPINNConfiguration(
+            "The reference split has no training labels for temperature; use a larger benchmark.")
+    training_temperature = _scalar_field(result.fields["temperature"], "temperature")[
+        training_times[training_conductor], training_points[training_conductor]]
+    normalization["temperature"] = max(float(np.ptp(training_temperature)), 1.)
     normalization["liquid_fraction"] = 1.
     run.metadata["validation_field_scales"] = normalization
     for name, predicted_field in predicted.items():
