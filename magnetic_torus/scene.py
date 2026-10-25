@@ -90,6 +90,8 @@ class SceneWidget(QtWidgets.QWidget):
         self._field_cache = {}
         self._flow_cache = {}
         self._display_fields = None
+        self._color_fields = None
+        self._source_label = None
         self._grid_operator = None
         self._surface_operator = None
         self._text_actors = {}
@@ -226,6 +228,10 @@ class SceneWidget(QtWidgets.QWidget):
             self.trajectory_data = None
             self.dose = None
         self.result = result
+        self._display_fields = None
+        self._color_fields = None
+        self._difference = False
+        self._source_label = None
         self.config = result.config
         self.quantity = quantity
         self.index = min(index, len(result.times) - 1)
@@ -357,7 +363,7 @@ class SceneWidget(QtWidgets.QWidget):
             self.plotter.remove_scalar_bar()
         except (ValueError, KeyError, IndexError, StopIteration):
             pass
-        values = scalar_values(self.result, self.quantity, self.index)
+        values = scalar_values(self.result, self.quantity, self.index, self._display_fields)
         if values is not None and surface.n_points:
             ids = np.asarray(surface.point_data.get("source_id", []), dtype=int)
             if len(ids) != surface.n_points:
@@ -377,33 +383,48 @@ class SceneWidget(QtWidgets.QWidget):
         else:
             self._actor = self.plotter.add_mesh(surface, color="#65b4c7", opacity=self.opacity,
                                                 name="reservoir", render=False)
-        self.update_index(self.index)
+        self.update_index(self.index, self._display_fields, self._difference, self._source_label)
+
+    def set_color_fields(self, fields) -> bool:
+        """Keep numerical and PINN playback on one stable, unclipped color scale."""
+        if fields is self._color_fields:
+            return False
+        self._color_fields = fields
+        self._quantity_clims.clear()
+        self._fixed_clim = None
+        return True
 
     def color_range(self):
         if self._fixed_clim is not None:
             return self._fixed_clim
-        if self.quantity in self._quantity_clims:
-            return self._quantity_clims[self.quantity]
+        display_fields = self._display_fields if not self._difference else None
+        cache_key = (self.quantity, id(self._color_fields), id(display_fields))
+        if cache_key in self._quantity_clims:
+            return self._quantity_clims[cache_key]
         if self.result is None or self._mask is None:
             return (0.0, 1.0)
         key = QUANTITIES[self.quantity][0]
-        values = self.result.fields.get(key)
-        if values is None:
+        ranges = []
+        for fields in (self.result.fields, self._color_fields, display_fields):
+            values = fields.get(key) if fields is not None else None
+            if values is None:
+                continue
+            values = np.asarray(values)[:, self._mask]
+            if values.ndim == 3:
+                values = np.linalg.norm(values, axis=-1)
+            if key == "enthalpy":
+                values = values / 1000
+            finite = values[np.isfinite(values)]
+            if finite.size:
+                ranges.append((float(finite.min()), float(finite.max())))
+        if not ranges:
             return (0.0, 1.0)
-        values = np.asarray(values)[:, self._mask]
-        if values.ndim == 3:
-            values = np.linalg.norm(values, axis=-1)
-        if key == "enthalpy":
-            values = values / 1000
-        finite = values[np.isfinite(values)]
-        if not finite.size:
-            return (0.0, 1.0)
-        low, high = float(finite.min()), float(finite.max())
+        low, high = min(value[0] for value in ranges), max(value[1] for value in ranges)
         if key == "liquid_fraction":
             return (0.0, 1.0)
         if high - low < 1e-12:
             high = low + max(abs(low) * .01, 1e-6)
-        self._quantity_clims[self.quantity] = (low, high)
+        self._quantity_clims[cache_key] = (low, high)
         return (low, high)
 
     def update_index(self, index, fields=None, difference=False, source_label=None):
@@ -413,8 +434,10 @@ class SceneWidget(QtWidgets.QWidget):
         if fields is not self._display_fields:
             self._field_cache.clear()
             self._tracer_cache.clear()
+            self._quantity_clims.clear()
         self._display_fields = fields
         self._difference = difference
+        self._source_label = source_label
         values = scalar_values(self.result, self.quantity, self.index, fields)
         if values is not None and self._surface is not None and "source_id" in self._surface.point_data:
             ids = np.asarray(self._surface.point_data["source_id"], dtype=int)

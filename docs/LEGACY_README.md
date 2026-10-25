@@ -76,7 +76,7 @@ Option B — Pure pip (no conda), in a clean venv:
     .venv\Scripts\activate
     python -m pip install --upgrade pip
     pip uninstall -y numpy scipy
-    pip install --only-binary=:all: "numpy==1.26.4" "scipy==1.11.4" matplotlib "scikit-learn>=1.5,<2"
+    pip install --only-binary=:all: "numpy==1.23.5" "scipy==1.11.4" matplotlib "scikit-learn>=1.5,<2"
 
 Notes:
 - Do NOT mix conda and pip for NumPy/SciPy in the same environment.
@@ -86,6 +86,6 @@ Notes:
 Local run (without Docker):
 
     python -m pip install -r requirements.txt
-    python interface3.py
+    python interface3.py --legacy
 
 If the GUI exits early with a "NumPy import error" dialog, follow the steps above to repair your environment.

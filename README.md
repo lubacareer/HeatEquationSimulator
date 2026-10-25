@@ -49,6 +49,7 @@ The tested Windows Python 3.12 package versions are recorded in [requirements-de
 
 - Rotate/zoom the PyVista scene or choose a camera preset. Toggle cutaway, phase contour, velocity arrows, integrated flow tracers, magnetic field lines, and a movable cross-section. Hide **Plots** for a larger scene. Opacity and visual detail do not alter the computed solution.
 - Right-click the reservoir to choose a probe. The T(E) marker and history update together: temperature rises for E<0, stays at the melting temperature for 0≤E≤LH, and rises again for E>LH. Zero enthalpy marks solid material at its melting point. The chart displays kJ/kg and K; internal quantities use SI.
+- FEniCS results also show their labelled regularized computational T(E) curve, and their probe markers follow that curve. The sharp reference plateau remains visible; conserved solver enthalpy is not converted for display.
 - Play, step, scrub, loop, or click history plots. The main clock displays accepted thermal/MHD snapshots. Particle replay has its own flight-time clock. Tracers interpolate accepted velocities for display; they are not additional solver states.
 - Thermal charts offer probe/cross-section temperature, liquid fraction, and thermal/pumping power. Dynamo charts show magnetic energy and toroidal/poloidal components. Shielding shows paired first-contact outcomes and field-on/off absorbed dose with standard errors. PINN shows training, held-out metrics, and overlays.
 - Select two saved runs for linked cameras, common color limits, and aligned timelines. **Run difference** is available for matching point geometries; time interpolation is labelled as a display operation. Radiation always references an accepted frozen field snapshot.
@@ -59,6 +60,8 @@ The tested Windows Python 3.12 package versions are recorded in [requirements-de
 Qt/PyVista/Matplotlib runs natively on Windows. Each solve, training job, and analysis runs in a separate process; one heavy job is allowed per desktop. The current conda environment can load conflicting Intel OpenMP runtimes when SciPy and PyTorch share a process, so workers and test modules deliberately remain isolated. Do not bypass this with `KMP_DUPLICATE_LIB_OK`.
 
 Immutable `ScenarioConfig`, `RunResult`, `PINNResult`, and `DoseResult` contracts record configuration hashes, source runs, accepted snapshots, seeds, versions, and validation status. Editable inputs are separate from accepted results. Geometry previews update before the first solve; later geometry edits appear as a labelled wireframe over accepted fields until recalculation. Run history defaults to `%LOCALAPPDATA%\MagneticTorus`; override with `MAGNETIC_TORUS_DATA` or `--data-dir`.
+
+New results and analyses are staged privately and published as complete bundles. Cancellation before publication also discards copied observation-only scenarios. Imported field artifacts must be embedded and checksum verified; metadata paths cannot authorize local file reads. Existing results without embedded field artifacts remain viewable, but their coupled analysis requires recalculation or a self-contained export.
 
 ### FEniCSx / Gmsh / PETSc in WSL Ubuntu
 
@@ -88,13 +91,15 @@ Training can fail its validation gates. Failed models remain inspectable and lab
 wsl -d Ubuntu -- bash scripts/setup_geant4.sh
 ```
 
-Run this from the same Windows clone directory, or run `bash scripts/setup_geant4.sh` from the clone inside Ubuntu. Setup needs administrative access and downloads the toolkit and datasets. It installs Geant4 11.4.3, builds the C++ worker, downloads official physics/ICRP110 data, and replays the integrity-pinned Linux package URLs in [env/geant4-linux-64.explicit.txt](env/geant4-linux-64.explicit.txt). It uses prebuilt conda-forge toolkit binaries by default; `TORUS_GEANT4_PREBUILT=0` selects a source build. Runtime wrapper: `/opt/magnetic-torus/bin/torus-dose-run`; override with `TORUS_GEANT4_WORKER`.
+Run this from the same Windows clone directory, or run `bash scripts/setup_geant4.sh` from the clone inside Ubuntu. Setup needs administrative access and downloads the toolkit and datasets. It installs Geant4 11.4.3, builds the C++ worker, downloads official physics/ICRP110 data, and replays the integrity-pinned Linux package URLs in [env/geant4-linux-64.explicit.txt](env/geant4-linux-64.explicit.txt). Bootstrap, source, and phantom downloads are checked against [pinned SHA-256 digests](env/geant4-downloads.sha256), including cached archives; extraction uses fresh unprivileged staging. It uses prebuilt conda-forge toolkit binaries by default; `TORUS_GEANT4_PREBUILT=0` selects a source build. Runtime wrapper: `/opt/magnetic-torus/bin/torus-dose-run`; override with `TORUS_GEANT4_WORKER`.
 
 Relativistic Boris trajectories support protons, alpha particles, and heavier ions. Native thermal runs provide an explicitly labelled imposed-coil Biot–Savart diagnostic only. Dose requires the full accepted FE exterior map. Physical transport evaluates cellwise curl(A), including selected PINN A; smoothed nodal B is for display.
 
 Geant4 uses [Shielding](https://geant4.web.cern.ch/documentation/dev/plg_html/PhysicsListGuide/reference_PL/Shielding.html) with EM option 4 and supports a QGSP_BIC_HP cross-check. Geometry includes reservoir, vessel, coils, habitat wall, optional ground, water, and [ICRP110 male/female anatomical targets](https://geant4.web.cern.ch/docs/advanced_examples_doc/example_ICRP110Phantom). Anatomical targets require a large enough habitat; the lunar preset fits. Absorbed dose is Gy per specified incident fluence, with event-wise standard errors, secondary contributions, and explicit precision status. Zero-hit organs do not meet the ≤5% uncertainty target. Effective dose in Sv is outside this release; unnormalized dose rates are not reported.
 
 Spectrum JSON uses `schema_version: 1`, `energy_unit: "MeV/nucleon"`, `angular_distribution: "beam"` or `"isotropic"`, `provenance`, and `bins` with integer `z`, integer `a`, positive `energy_mev_nucleon`, and positive integrated-bin `weight`. Fluence is a separate scenario parameter. Field-on/off transport reuses identical incident primaries.
+
+With ground enabled, beam primaries sample only the exposed part of the incident disk. Isotropic primaries start above the ground and travel downward; their normalization uses the joint sky-and-boundary acceptance relative to unobstructed 4π scalar fluence. Ground shadowing is included, and primary albedo is not imposed. Source metadata records the sampled area and fluence convention.
 
 ## Reproduce checks
 

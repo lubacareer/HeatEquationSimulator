@@ -11,6 +11,8 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from .artifacts import FIELD_ARTIFACT_KEYS, FieldArtifact
+
 Progress = Callable[[float, str], None]
 
 
@@ -82,7 +84,7 @@ class ScenarioConfig:
     schema_version: int = 2
 
     def validate(self) -> "ScenarioConfig":
-        if self.schema_version not in {1, 2}:
+        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version not in {1, 2}:
             raise ValueError("Unsupported scenario schema version.")
         for key, value in asdict(self).items():
             if isinstance(value, float) and not math.isfinite(value):
@@ -125,7 +127,7 @@ class ScenarioConfig:
                                      ("pinn_epochs", 1, 1000000), ("pinn_batch_size", 1, 65536),
                                      ("coil_turns", 1, 100000)):
             value = getattr(self, key)
-            if isinstance(value, bool) or int(value) != value or not minimum <= value <= maximum:
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
                 raise ValueError(f"{key.replace('_', ' ').capitalize()} must be an integer in [{minimum}, {maximum}].")
         if not 1 <= self.particle_z <= 28 or self.particle_a < self.particle_z:
             raise ValueError("Particle species requires 1 ≤ Z ≤ 28 and A ≥ Z.")
@@ -137,8 +139,10 @@ class ScenarioConfig:
             raise ValueError("Random seed must be between 0 and 2147483647.")
         if self.particle_energy_mev_nucleon <= 0 or self.exterior_radius_factor < 2:
             raise ValueError("Particle energy must be positive; exterior radius factor must be at least 2.")
-        if not self.composition or any(z < 1 or fraction <= 0 for z, fraction in self.composition):
-            raise ValueError("Elemental composition requires positive atomic numbers and mass fractions.")
+        if not self.composition or any(isinstance(z, bool) or not isinstance(z, int) or z < 1
+                                       or not math.isfinite(fraction) or fraction <= 0
+                                       for z, fraction in self.composition):
+            raise ValueError("Elemental composition requires positive integer atomic numbers and finite positive mass fractions.")
         if not math.isclose(sum(f for _, f in self.composition), 1.0, abs_tol=1e-6):
             raise ValueError("Elemental mass fractions must sum to one.")
         return self
@@ -177,7 +181,7 @@ class ScenarioConfig:
     def from_dict(cls, data: Mapping[str, Any]) -> "ScenarioConfig":
         values = dict(data)
         if "composition" in values:
-            values["composition"] = tuple((int(z), float(f)) for z, f in values["composition"])
+            values["composition"] = tuple((z, float(f)) for z, f in values["composition"])
         return cls(**values).validate()
 
 
@@ -211,6 +215,7 @@ class RunResult:
     fields: Mapping[str, np.ndarray]
     diagnostics: Mapping[str, np.ndarray]
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    artifacts: Mapping[str, FieldArtifact] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.config.validate()
@@ -220,6 +225,10 @@ class RunResult:
         object.__setattr__(self, "fields", _immutable_arrays(self.fields))
         object.__setattr__(self, "diagnostics", _immutable_arrays(self.diagnostics))
         object.__setattr__(self, "metadata", _freeze(self.metadata))
+        if any(key not in FIELD_ARTIFACT_KEYS or not isinstance(value, FieldArtifact)
+               for key, value in self.artifacts.items()):
+            raise ValueError("Result artifacts require explicitly captured field data.")
+        object.__setattr__(self, "artifacts", MappingProxyType(dict(self.artifacts)))
         if self.times.ndim != 1 or self.times.size < 1 or not np.all(np.isfinite(self.times)):
             raise ValueError("Result requires a finite one-dimensional timeline.")
         if np.any(np.diff(self.times) <= 0):
@@ -231,6 +240,12 @@ class RunResult:
                 raise ValueError(f"Field {key} must start with dimensions (time, point).")
             if not np.all(np.isfinite(value)):
                 raise ValueError(f"Field {key} contains non-finite values; no result can be published.")
+
+    def artifact_bytes(self, key: str) -> bytes:
+        artifact = self.artifacts.get(key)
+        if artifact is None:
+            raise ValueError(f"The accepted run has no embedded/captured {key}; recalculate or import a self-contained result.")
+        return artifact.data
 
 
 @dataclass(frozen=True)

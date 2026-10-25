@@ -1,0 +1,16 @@
+# Linux x86-64 installer inputs, verified 2026-10-25. Refresh deliberately when
+# upgrading; downloaded checksum files never replace these repository pins.
+# Micromamba 2.3.3-0 release asset digests (archive and extracted binary):
+# https://api.github.com/repos/mamba-org/micromamba-releases/releases/tags/2.3.3-0
+# Archive SHA256 also matches conda-forge's official release metadata:
+# https://api.anaconda.org/release/conda-forge/micromamba/2.3.3
+e7274528ceb9c20d048a428d6c22d7e02e268f8ffb762c4c365422347c8b8ba2  micromamba-2.3.3-0.tar.bz2
+9496f94a8b78c536573c93d946ec9bba74bd9ff79ee55aaa4b546e30db8f511b  micromamba-2.3.3-0
+# SHA256 of the official source archive linked by https://geant4.web.cern.ch/download/11.4.3.html:
+# https://gitlab.cern.ch/geant4/geant4/-/archive/v11.4.3/geant4-v11.4.3.tar.gz
+718752c1829cbfcf174f0e539d60ee3f76843b894444e61d2228d66a6887ef6e  geant4-11.4.3.tar.gz
+# SHA256 of the official ICRP110 archive:
+# https://cern.ch/geant4-data/datasets/examples/advanced/ICRP110Phantoms/ICRPdata.tar.gz
+# Its MD5 also matches 2aba5409d4e7b7a2f0328e7d3402f187 in Geant4 v11.4.3's
+# examples/advanced/ICRP110_HumanPhantoms/CMakeLists.txt.
+672b3569c35df1bcad15bebf6e85b337e9122af76d82c1e5876870d4d85e38e3  ICRPdata.tar.gz

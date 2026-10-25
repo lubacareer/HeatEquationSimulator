@@ -16,11 +16,13 @@ import sys
 import threading
 import uuid
 from functools import lru_cache
+from io import BytesIO
 from typing import Any
 
 import numpy as np
 
 from .models import Progress, RunResult, ScenarioConfig, SimulationCancelled
+from .artifacts import FieldArtifact
 
 MU0 = 4e-7 * math.pi
 STEFAN_BOLTZMANN = 5.670374419e-8
@@ -367,15 +369,19 @@ def _run_fenics(config: ScenarioConfig, progress: Progress, cancel: threading.Ev
         raise PhysicsBackendUnavailable("Cannot start the FEniCS worker. Install Ubuntu WSL2 and run scripts/setup_wsl_physics.sh. " + str(exc)) from exc
     lines: queue.Queue[str | None] = queue.Queue()
     def read_output() -> None:
-        assert proc.stdout is not None
-        with proc.stdout:
-            for line in proc.stdout:
-                lines.put(line.rstrip())
-        lines.put(None)
+        try:
+            assert proc.stdout is not None
+            with proc.stdout:
+                for line in proc.stdout:
+                    lines.put(line.rstrip())
+        finally:
+            lines.put(None)
     threading.Thread(target=read_output, daemon=True).start()
     log: list[str] = []
     try:
-        while proc.poll() is None or not lines.empty():
+        # Process termination can precede the reader queuing its final traceback.
+        # Only EOF establishes that every output line has been consumed.
+        while True:
             if cancel.is_set():
                 (directory / "cancel").touch()
                 try:
@@ -411,9 +417,12 @@ def _run_fenics(config: ScenarioConfig, progress: Progress, cancel: threading.Ev
     for key in ("exterior_field_path", "weak_operator_path"):
         if key in metadata:
             metadata[key] = str(directory / Path(metadata[key]).name)
+    artifacts = {key: FieldArtifact.capture(directory / filename, root=directory)
+                 for key, filename in (("exterior_field_path", "exterior_fields.npz"),
+                                       ("weak_operator_path", "weak_operators.npz"))}
     return RunResult(directory.name, config, arrays["times"], arrays["points"],
                      {key[6:]: arrays[key] for key in arrays.files if key.startswith("field_")},
-                     {key[5:]: arrays[key] for key in arrays.files if key.startswith("diag_")}, metadata)
+                     {key[5:]: arrays[key] for key in arrays.files if key.startswith("diag_")}, metadata, artifacts=artifacts)
 
 
 def run_simulation(config: ScenarioConfig, progress: Progress | None = None,
@@ -429,8 +438,8 @@ def run_simulation(config: ScenarioConfig, progress: Progress | None = None,
 
 
 @lru_cache(maxsize=4)
-def _load_weak_artifact(path: str) -> dict[str, np.ndarray]:
-    with np.load(path, allow_pickle=False) as archive:
+def _load_weak_artifact(payload: bytes) -> dict[str, np.ndarray]:
+    with np.load(BytesIO(payload), allow_pickle=False) as archive:
         return {key: archive[key].copy() for key in archive.files}
 
 
@@ -454,10 +463,7 @@ def evaluate_weak_residual_torch(config: ScenarioConfig, reference_result: RunRe
     indices = np.asarray(time_indices, dtype=int).ravel()
     if len(indices) != 2 or indices[1] != indices[0] + 1:
         raise ValueError("Provide one consecutive accepted time pair [k-1,k].")
-    path = str(reference_result.metadata.get("weak_operator_path", ""))
-    if not Path(path).is_file():
-        raise ValueError("The originating FE weak-operator artifact is missing: " + path)
-    op = _load_weak_artifact(path)
+    op = _load_weak_artifact(reference_result.artifact_bytes("weak_operator_path"))
     sample = predicted_fields["temperature"]
     device, dtype = sample.device, sample.dtype
     def tensor(value, integer=False):

@@ -16,6 +16,7 @@ import numpy as np
 
 from .models import ScenarioConfig, SimulationCancelled
 from .store import RunStore, json_default
+from .publication import JobPublication
 
 
 def emit(kind: str, **values) -> None:
@@ -45,6 +46,9 @@ def execute(request_path: Path) -> int:
             raise SimulationCancelled("Job cancelled; previous results are preserved.")
         emit("progress", fraction=max(0.0, min(float(fraction), 1.0)), message=message)
 
+    publication = JobPublication(store, request_path, cancel.is_set)
+    store = publication.store
+
     try:
         source = store.load_run(request["source_path"]) if request.get("source_path") else None
         if action == "simulate":
@@ -58,7 +62,8 @@ def execute(request_path: Path) -> int:
             if cancel.is_set():
                 raise SimulationCancelled("Job cancelled")
             path = store.save_run(result)
-            emit("complete", action=action, path=str(path), source_path=str(path))
+            publication.commit()
+            emit("complete", action=action, path=str(store.published_path(path)), source_path=str(store.published_path(path)))
             return 0
         if source is None:
             raise ValueError("Run a simulation before starting an analysis.")
@@ -70,6 +75,7 @@ def execute(request_path: Path) -> int:
             selected_model = store.load_pinn(request["pinn_path"])
             validate_pinn_source(selected_model, source)
         if source.config.config_hash != config.config_hash:
+            progress(.01, "Preparing an observation configuration from accepted fields")
             origin = source
             source = replace(source, run_id=uuid.uuid4().hex, config=config,
                              metadata={**source.metadata, "reused_fields_from": source.run_id})
@@ -118,7 +124,8 @@ def execute(request_path: Path) -> int:
             raise ValueError(f"Unknown action {action}")
         if cancel.is_set():
             raise SimulationCancelled("Job cancelled")
-        emit("complete", action=action, path=str(path), source_path=str(source_path),
+        publication.commit()
+        emit("complete", action=action, path=str(store.published_path(path)), source_path=str(store.published_path(source_path)),
              selected_source="PINN" if selected_model is not None else "Numerical")
         return 0
     except SimulationCancelled as error:
@@ -129,6 +136,7 @@ def execute(request_path: Path) -> int:
         return 1
     finally:
         finished.set()
+        publication.close()
 
 
 if __name__ == "__main__":

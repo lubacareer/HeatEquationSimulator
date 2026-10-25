@@ -1,8 +1,13 @@
 """Physical invariants of the native reference and optional Linux FE integration."""
 from dataclasses import replace
 import os
+import io
+from io import BytesIO
 from pathlib import Path
+import tempfile
 import threading
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -106,6 +111,61 @@ class ThermalPhysicsTests(unittest.TestCase):
         np.testing.assert_allclose(b[:2], 0, atol=1.e-15)
         self.assertAlmostEqual(b[2] / expected, 1., places=12)
 
+    def test_exited_fe_worker_retains_reader_thread_final_traceback(self):
+        from magnetic_torus.physics import PhysicsBackendUnavailable
+        class DelayedOutput(io.StringIO):
+            def __iter__(self):
+                time.sleep(.08)
+                yield "Traceback: delayed final numerical error\n"
+        process = SimpleNamespace(stdout=DelayedOutput(), poll=lambda: 1,
+                                  wait=lambda **_kwargs: 1, terminate=lambda: None)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"MAGNETIC_TORUS_RUNS": directory}), \
+             patch("magnetic_torus.physics.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(PhysicsBackendUnavailable, "delayed final numerical error"):
+                run_simulation(replace(self.config, solver="fenics"))
+            logs = list(Path(directory).glob("*/worker.log"))
+            self.assertEqual(len(logs), 1)
+            self.assertIn("delayed final numerical error", logs[0].read_text())
+
+    def test_recovered_timesteps_do_not_exhaust_the_next_step_retry_budget(self):
+        from magnetic_torus.workers.fenics_worker import _TimestepRejections
+        retries = _TimestepRejections()
+        for _ in range(35):
+            self.assertFalse(retries.rejected(.5, 1 / 256))
+            retries.accepted()
+        self.assertEqual(retries.total, 35)
+        self.assertEqual(retries.consecutive, 0)
+        for _ in range(20):
+            self.assertFalse(retries.rejected(.5, 1 / 256))
+        self.assertTrue(retries.rejected(.5, 1 / 256))
+        self.assertEqual(retries.total, 56)
+        retries.accepted()
+        self.assertFalse(retries.rejected(1 / 256, 1 / 256))
+        self.assertTrue(retries.rejected(1 / 512, 1 / 256))
+
+    def assert_complete_fe_boundary_nodes(self, result):
+        """Compare exported PINN constraints with topology, not locator shape assumptions."""
+        with np.load(BytesIO(result.artifact_bytes("weak_operator_path")), allow_pickle=False) as operators:
+            cells, labels = operators["cells"], operators["cell_labels"]
+        all_nodes = np.arange(len(result.points))
+        conductor = np.unique(cells[labels == 1])
+        outside = np.setdiff1d(all_nodes, conductor)
+        local_faces = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
+        faces = np.sort(cells[:, local_faces].reshape(-1, 3), axis=1)
+        unique_faces, counts = np.unique(faces, axis=0, return_counts=True)
+        exterior = np.unique(unique_faces[counts == 1])
+        conductor_faces = {tuple(face) for face in np.sort(cells[labels == 1][:, local_faces].reshape(-1, 3), axis=1)}
+        vacuum_faces = {tuple(face) for face in np.sort(cells[labels != 1][:, local_faces].reshape(-1, 3), axis=1)}
+        interface = np.unique(np.asarray(list(conductor_faces & vacuum_faces)))
+        exported = {key: np.sort(value) for key, value in result.metadata["pinn_physics"]["bc_nodes"].items()}
+        np.testing.assert_array_equal(exported["0"], np.union1d(outside, interface))
+        np.testing.assert_array_equal(exported["2"], exterior)
+        for index in ("3", "4"):
+            np.testing.assert_array_equal(exported[index], outside)
+        np.testing.assert_array_equal(np.setdiff1d(exported["1"], conductor), outside)
+        self.assertEqual(len(np.intersect1d(exported["1"], conductor)), 1)
+
     @unittest.skipUnless(os.environ.get("TORUS_TEST_FENICS") == "1", "Set TORUS_TEST_FENICS=1 to run the installed WSL FE worker.")
     def test_full_fe_stationary_closed_system_and_weak_operator(self):
         c = replace(self.config, solver="fenics", duration=.02, time_steps=2,
@@ -118,6 +178,7 @@ class ThermalPhysicsTests(unittest.TestCase):
         self.assertTrue(Path(r.metadata["exterior_field_path"]).is_file())
         self.assertEqual(r.metadata["pinn_physics"]["kind"], "fenics_a_phi_vms_v1")
         self.assertGreaterEqual(r.metadata["mumps_memory_limit_mb"], 128)
+        self.assert_complete_fe_boundary_nodes(r)
         np.testing.assert_allclose(r.diagnostics["magnetic_energy_j"],
                                    r.diagnostics["imposed_field_energy_j"] + r.diagnostics["induced_field_energy_j"]
                                    + r.diagnostics["mutual_field_energy_j"], atol=1.e-10)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+from io import BytesIO
 from importlib import import_module
 import json
 import math
@@ -141,12 +142,11 @@ class ThermalOperator:
                 "This result lacks the thermal physics operator. Recalculate the Thermal "
                 "benchmark with the current numerical worker before training.")
         n = len(result.points)
-        # Arrays can be inline, or an artifact path keeps run-history JSON small.
+        # Arrays can be inline or explicitly captured; JSON paths grant no I/O.
         if "operator_path" in raw:
-            path = Path(str(raw["operator_path"]))
-            if not path.is_file():
-                raise UnsupportedPINNConfiguration(f"Thermal PINN operator artifact is missing: {path}")
-            with np.load(path, allow_pickle=False) as artifact:
+            if "thermal_operator_path" not in result.artifacts:
+                raise UnsupportedPINNConfiguration("Thermal PINN operator is not an embedded/captured artifact; recalculate the thermal benchmark.")
+            with np.load(BytesIO(result.artifact_bytes("thermal_operator_path")), allow_pickle=False) as artifact:
                 values = {key: artifact[key] for key in artifact.files}
         else:
             values = raw
@@ -303,8 +303,7 @@ def _weak_adapter(result: RunResult) -> Callable[..., Mapping[str, Any]]:
             "Coupled PINN training needs the numerical worker's differentiable FE weak operator. "
             "Recalculate with the current FEniCS worker, or choose the Thermal benchmark. "
             "A strong-form PINN cannot replace the mixed VMS turbulence equations.") from exc
-    path = result.metadata.get("weak_operator_path")
-    if not path or not Path(str(path)).is_file():
+    if "weak_operator_path" not in result.artifacts:
         raise UnsupportedPINNConfiguration(
             "This coupled result lacks its FE weak-operator artifact. Recalculate the scenario "
             "and retain the run directory before training its PINN.")
@@ -320,9 +319,7 @@ def _operator_fingerprint(operator: ThermalOperator | None, result: RunResult) -
                       operator.volumes, operator.boundary_area, operator.source_weights):
             digest.update(np.ascontiguousarray(array).tobytes())
     else:
-        with Path(str(result.metadata["weak_operator_path"])).open("rb") as file:
-            for chunk in iter(lambda: file.read(1024 * 1024), b""):
-                digest.update(chunk)
+        digest.update(result.artifact_bytes("weak_operator_path"))
     return digest.hexdigest()
 
 
@@ -335,7 +332,7 @@ def _coupled_trial_fields(result: RunResult, scaling: FieldScaling) -> np.ndarra
     known. Learning the induced/circulating correction avoids rediscovering a
     sharply varying external coil field from sparse labels.
     """
-    with np.load(str(result.metadata["weak_operator_path"]), allow_pickle=False) as artifact:
+    with np.load(BytesIO(result.artifact_bytes("weak_operator_path")), allow_pickle=False) as artifact:
         required = ("imposed_vector_potential", "cells", "gradients", "volumes", "node_volumes")
         try:
             op = {key: artifact[key] for key in required}

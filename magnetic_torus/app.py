@@ -738,6 +738,7 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.job_widget.setVisible(busy)
         self.progress_bar.setVisible(busy)
         self.cancel_button.setEnabled(busy)
+        self.source.setEnabled(not busy)
         try:
             self.read_config()
             valid_draft = True
@@ -764,8 +765,11 @@ class TorusWindow(QtWidgets.QMainWindow):
             action = event["action"]
             if action == "simulate" or self.active_path != source_path:
                 self.activate_result(source_path)
-            if event.get("selected_source") == "PINN" and self.pinn is not None:
-                self.source.setCurrentIndex(1)
+            if action in {"trace", "dose"}:
+                selected_source = event.get("selected_source", "Numerical")
+                if selected_source == "PINN" and self.pinn is None:
+                    raise ValueError("The radiation result has no originating PINN to display.")
+                self.source.setCurrentIndex(1 if selected_source == "PINN" else 0)
             if action == "pinn":
                 if self.active is None:
                     raise ValueError("The trained model has no source scenario.")
@@ -808,6 +812,7 @@ class TorusWindow(QtWidgets.QMainWindow):
                 self._notify("Simulation complete · edit parameters and recalculate at any time")
             self._update_actions()
             self.refresh_plots()
+            self._render()
         except Exception as error:
             self._job_failed(str(error), "Loading completed worker artifacts failed.")
 
@@ -866,6 +871,7 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.active = self.store.load_run(path)
         self._selection_revision += 1
         self._comparison_difference = None
+        self._profile_samples = None
         self.active_path = Path(path)
         self.previewing = False
         self.current_index = int(np.argmin(np.abs(self.active.times - old_time)))
@@ -890,7 +896,7 @@ class TorusWindow(QtWidgets.QMainWindow):
             candidates = [float(self.speed.itemText(i).replace("×", "")) for i in range(self.speed.count())]
             nearest = int(np.argmin(np.abs(np.asarray(candidates) - self.active.config.duration / 20)))
             self.speed.setCurrentIndex(nearest)
-        for artifact in sorted(Path(path).parent.glob("pinn-*.h5"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for artifact in sorted(Path(path).parent.rglob("pinn-*.h5"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 candidate = self.store.load_pinn(artifact)
                 if candidate.config_hash == self.active.config.config_hash:
@@ -901,7 +907,7 @@ class TorusWindow(QtWidgets.QMainWindow):
                     break
             except (OSError, ValueError):
                 pass
-        for artifact in sorted(Path(path).parent.glob("dose-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for artifact in sorted(Path(path).parent.rglob("dose-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 candidate = self.store.load_dose(artifact)
                 if (candidate.config_hash == self.active.config.config_hash and candidate.source_run_id == self.active.run_id
@@ -1035,7 +1041,8 @@ class TorusWindow(QtWidgets.QMainWindow):
             if changed_cutaway:
                 scene.rebuild_surface()
             elif scene.result is not None:
-                scene.update_index(scene.index)
+                scene.update_index(scene.index, scene._display_fields, scene._difference, scene._source_label)
+        self._render()
 
     def _detail_changed(self, detail):
         for scene in (self.scene, self.compare_scene):
@@ -1057,7 +1064,8 @@ class TorusWindow(QtWidgets.QMainWindow):
         for scene in (self.scene, self.compare_scene):
             scene.slice_position = value / 1000 * (scene.config.major_radius + scene.config.minor_radius)
             if scene.result is not None:
-                scene.update_index(scene.index)
+                scene.update_index(scene.index, scene._display_fields, scene._difference, scene._source_label)
+        self._render()
 
     def _probe_selected(self, index):
         if self.active is None:
@@ -1099,6 +1107,8 @@ class TorusWindow(QtWidgets.QMainWindow):
     def _render(self):
         if self.active is None or self.previewing:
             return
+        if self.scene.set_color_fields(self.pinn.fields if self.pinn is not None else None) and self.comparison is not None:
+            self._share_color_range()
         display_fields = None
         source_label = None
         if self.source.currentIndex() == 3 and self._comparison_difference is not None:
@@ -1225,12 +1235,25 @@ class TorusWindow(QtWidgets.QMainWindow):
         maximum = max(float(np.max(temperatures[:, mask])), config.melting_temperature + extent)
         enthalpy = np.array([config.heat_capacity_solid * (minimum - config.melting_temperature), 0,
                              config.latent_heat, config.latent_heat + config.heat_capacity_liquid * (maximum - config.melting_temperature)])
-        ax = self.charts[0].reset("Material T(E) · probe state")
-        ax.plot(enthalpy / 1000, [minimum, config.melting_temperature, config.melting_temperature, maximum], color="#d27a35", linewidth=2)
+        regularized = config.solver == "fenics"
+        ax = self.charts[0].reset("Material T(E) · sharp / FE" if regularized else "Material T(E) · probe state")
+        ax.plot(enthalpy / 1000, [minimum, config.melting_temperature, config.melting_temperature, maximum],
+                color="#d27a35", linewidth=2, label="Sharp reference")
+        if regularized:
+            from .physics import regularized_enthalpy
+            transition = config.melting_temperature + np.linspace(-.5, .5, 161) * config.transition_width
+            curve_temperature = np.unique(np.r_[np.linspace(minimum, maximum, 241), transition,
+                                                config.melting_temperature])
+            ax.plot(regularized_enthalpy(curve_temperature, config) / 1000, curve_temperature,
+                    color="#167e86", linestyle="--", linewidth=1.4,
+                    label=f"FE law ({config.transition_width:g} K transition)")
         ax.axvline(0, color="#aabac4", linewidth=.8, linestyle=":")
         ax.axvline(config.latent_heat / 1000, color="#aabac4", linewidth=.8, linestyle=":")
-        self.charts[0].marker, = ax.plot([], [], "o", color="#167e86", markersize=6)
+        self.charts[0].marker, = ax.plot([], [], "o", color="#167e86", markersize=6,
+                                       label="Computed probe" if regularized else "Probe")
         ax.set(xlabel="Specific enthalpy [kJ/kg]", ylabel="Temperature [K]")
+        if regularized:
+            ax.legend(fontsize=6, loc="best")
         self.charts[0].finish()
         ax = self.charts[1].reset("Stored thermal energy", True)
         energy = result.diagnostics.get("recoverable_energy_j", result.diagnostics.get("energy_j"))

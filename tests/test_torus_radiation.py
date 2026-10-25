@@ -10,6 +10,7 @@ import unittest
 import numpy as np
 
 from magnetic_torus.models import PINNResult, RunResult, ScenarioConfig
+from magnetic_torus.artifacts import FieldArtifact
 from magnetic_torus.radiation import (
     C, ELEMENTARY_CHARGE, MEV, PROTON_MASS, FrozenField, calculate_dose, load_spectrum,
     field_source_run, frozen_field, parse_dose_output, relativistic_boris, sample_source, trace_particles,
@@ -45,6 +46,55 @@ class RadiationTests(unittest.TestCase):
         np.testing.assert_array_equal(one.directions, two.directions)
         self.assertTrue(np.all(np.sum(one.positions * one.directions, axis=1) < 0))
         np.testing.assert_allclose(np.linalg.norm(one.directions, axis=1), 1.)
+
+    def test_ground_beam_starts_in_vacuum_and_uses_exposed_disk_area(self):
+        config = ScenarioConfig(ground_enabled=True)
+        radius = 4.
+        source = sample_source(config, 2000, radius)
+        top = -max(config.minor_radius + config.vessel_thickness,
+                   config.habitat_radius + config.habitat_thickness) - .01
+        self.assertTrue(np.all(source.positions[:, 2] >= top))
+        np.testing.assert_allclose(np.linalg.norm(source.positions, axis=1), radius)
+        np.testing.assert_allclose(source.directions, np.tile((-1., 0., 0.), (2000, 1)))
+        impact = min(radius * .6, 1.15 * (config.major_radius + config.minor_radius))
+        # Independent quadrature over horizontal disk strips above the ground.
+        from scipy.integrate import quad
+        exposed, _ = quad(lambda height: 2 * np.sqrt(max(0., impact ** 2 - height ** 2)), max(top, -impact), impact)
+        self.assertAlmostEqual(source.source_area_m2, exposed, places=8)
+        again = sample_source(config, 2000, radius)
+        np.testing.assert_array_equal(source.positions, again.positions)
+
+    def test_ground_isotropic_uses_downward_sky_and_joint_acceptance_measure(self):
+        config = ScenarioConfig(ground_enabled=True, source_kind="isotropic")
+        radius = 4.
+        source = sample_source(config, 4000, radius)
+        top = -max(config.minor_radius + config.vessel_thickness,
+                   config.habitat_radius + config.habitat_thickness) - .01
+        self.assertTrue(np.all(source.positions[:, 2] >= top))
+        self.assertTrue(np.all(source.directions[:, 2] <= 0))
+        self.assertTrue(np.all(np.sum(source.positions * source.directions, axis=1) < 0))
+        np.testing.assert_allclose(np.linalg.norm(source.directions, axis=1), 1., atol=1e-14)
+        # Estimate the accepted fraction of the original, unrestricted 4π
+        # source independently; simply using cap area would admit upward rays.
+        full = sample_source(replace(config, ground_enabled=False), 160000, radius)
+        accepted = (full.positions[:, 2] >= top) & (full.directions[:, 2] <= 0)
+        self.assertAlmostEqual(source.source_area_m2 / full.source_area_m2,
+                               float(np.mean(accepted)), delta=.004)
+        self.assertEqual(source.metadata["fluence_convention"], "unobstructed 4pi scalar fluence")
+        np.testing.assert_array_equal(source.positions, sample_source(config, 4000, radius).positions)
+
+    def test_ground_spectrum_retains_species_and_applies_the_same_source_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "spectrum.json"
+            path.write_text(json.dumps({"schema_version": 1, "energy_unit": "MeV/nucleon", "provenance": "unit test",
+                                        "angular_distribution": "isotropic", "bins": [{"z": 26, "a": 56,
+                                        "energy_mev_nucleon": 500., "weight": 1.}]}))
+            config = ScenarioConfig(ground_enabled=True, source_kind="spectrum", spectrum_path=str(path))
+            source = sample_source(config, 64, 4.)
+            np.testing.assert_array_equal(source.z, 26)
+            np.testing.assert_array_equal(source.a, 56)
+            self.assertTrue(np.all(source.positions[:, 2] >= source.metadata["ground_top_m"]))
+            self.assertTrue(np.all(source.directions[:, 2] <= 0))
 
     def test_heavy_ion_and_spectrum_validation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -128,7 +178,8 @@ class RadiationTests(unittest.TestCase):
             np.savez(path, points=points, cells=cells, magnetic_field=np.zeros((1, 8, 3)),
                      vector_potential=np.zeros((1, 8, 3)), times=np.array([0.]))
             result = RunResult("accepted", ScenarioConfig(particle_count=5), np.array([0.]),
-                               np.zeros((1, 3)), {}, {}, {"exterior_field_path": str(path), "exterior_radius_m": 4.})
+                               np.zeros((1, 3)), {}, {}, {"exterior_field_path": str(path), "exterior_radius_m": 4.},
+                               artifacts={"exterior_field_path": FieldArtifact.capture(path, root=Path(directory))})
             trajectories = trace_particles(result, 0, lambda *_: None, None)
             np.testing.assert_array_equal(trajectories.paths, trajectories.baseline_paths)
             self.assertEqual(trajectories.paths.shape[:2], trajectories.times.shape)
@@ -138,7 +189,7 @@ class RadiationTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("TORUS_TEST_GEANT4") == "1", "Set TORUS_TEST_GEANT4=1 to run the installed transport worker.")
 class Geant4IntegrationTests(unittest.TestCase):
     """Actual transport/geometry smoke checks, not physics-list qualification."""
-    def _transport(self, target, histories):
+    def _transport(self, target, histories, ground=False):
         from scipy.spatial import Delaunay
         directory = Path(tempfile.mkdtemp(prefix=f"torus-geant4-test-{target}-"))
         points = np.array([[x, y, z] for x in (-8., 8.) for y in (-8., 8.) for z in (-8., 8.)])
@@ -147,10 +198,12 @@ class Geant4IntegrationTests(unittest.TestCase):
         np.savez(path, points=points, cells=cells, times=np.array([0.]),
                  vector_potential=np.zeros((1, 8, 3)), magnetic_field=np.zeros((1, 8, 3)))
         config = ScenarioConfig(major_radius=1.6, minor_radius=.2, habitat_radius=1.,
-                                target=target, radiation_histories=histories, coil_current=0., seed_field=0.)
+                                target=target, radiation_histories=histories, coil_current=0., seed_field=0.,
+                                ground_enabled=ground)
         numerical = RunResult("transport-fixture-" + target, config, np.array([0.]), points, {}, {},
                               {"exterior_field_path": str(path), "exterior_radius_m": 7.2,
-                               "validation_status": "Synthetic zero-field transport fixture, not an MHD solution."})
+                               "validation_status": "Synthetic zero-field transport fixture, not an MHD solution."},
+                              artifacts={"exterior_field_path": FieldArtifact.capture(path, root=directory)})
         dose = calculate_dose(numerical, 0, lambda *_: None, None, directory)
         np.testing.assert_allclose(dose.dose_gy, dose.metadata["field_off_dose_gy"], rtol=1e-12, atol=0)
         self.assertTrue(Path(dose.metadata["voxel_dose_path"]).is_file())
@@ -161,6 +214,11 @@ class Geant4IntegrationTests(unittest.TestCase):
         dose = self._transport("water", 1024)
         self.assertAlmostEqual(sum(dose.metadata["organ_masses_kg"]), 64., places=5)
         self.assertGreater(dose.dose_gy[0], 0.)
+
+    def test_ground_water_transport_uses_above_ground_incident_source(self):
+        dose = self._transport("water", 64, ground=True)
+        self.assertEqual(dose.metadata["source"]["source_boundary"], "above-ground vacuum")
+        self.assertLess(dose.metadata["source"]["ground_top_m"], 0.)
 
     def test_male_icrp110_transport(self):
         dose = self._transport("male", 64)

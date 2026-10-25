@@ -11,6 +11,7 @@ import PyQt6.QtCore as QtCore
 
 from .models import ScenarioConfig
 from .store import RunStore
+from .publication import request_cancel
 
 
 class JobController(QtCore.QObject):
@@ -77,6 +78,9 @@ class JobController(QtCore.QObject):
             except ValueError:
                 self.log.emit(text)
                 continue
+            if not isinstance(event, dict):
+                self.log.emit(text)
+                continue
             kind = event.get("event")
             if kind == "progress":
                 self.progress.emit(float(event["fraction"]), event["message"])
@@ -119,8 +123,10 @@ class JobController(QtCore.QObject):
     def cancel(self):
         if self.process is None or self.request_path is None:
             return
+        if not request_cancel(self.request_path):
+            self.progress.emit(1.0, "Results have been published; loading completed output…")
+            return
         self._requested_cancel = True
-        self.request_path.with_suffix(".cancel").touch()
         self.progress.emit(0.0, "Cancelling at the next safe solver boundary…")
 
     def shutdown(self):

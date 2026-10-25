@@ -26,6 +26,7 @@ import numpy as np
 
 from .models import RunResult, ScenarioConfig, preset
 from .store import RunStore, json_default
+from .artifacts import FieldArtifact
 
 
 def load_fe_artifacts(directory: Path) -> RunResult:
@@ -40,7 +41,9 @@ def load_fe_artifacts(directory: Path) -> RunResult:
     return RunResult("fe-validation-" + uuid4().hex[:12], config, arrays["times"], arrays["points"],
                      {key[6:]: value for key, value in arrays.items() if key.startswith("field_")},
                      {key[5:]: value for key, value in arrays.items() if key.startswith("diag_")},
-                     {**metadata, "validation_artifact_source": str(directory)})
+                     {**metadata, "validation_artifact_source": str(directory)},
+                     artifacts={key: FieldArtifact.capture(metadata[key], root=directory)
+                                for key in RunStore.FIELD_ARTIFACTS if metadata.get(key)})
 
 
 def main() -> int:

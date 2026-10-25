@@ -31,6 +31,21 @@ def report(fraction: float, message: str) -> None:
     print("TORUS_PROGRESS " + json.dumps({"fraction": fraction, "message": message}), flush=True)
 
 
+class _TimestepRejections:
+    """Bound one failed-step retry sequence while retaining run-wide diagnostics."""
+    def __init__(self) -> None:
+        self.total = 0
+        self.consecutive = 0
+
+    def rejected(self, next_dt: float, minimum_dt: float) -> bool:
+        self.total += 1
+        self.consecutive += 1
+        return next_dt < minimum_dt or self.consecutive > 20
+
+    def accepted(self) -> None:
+        self.consecutive = 0
+
+
 def run_special_case_benchmarks(output: Path) -> None:
     """Independent analytical FE reductions, not a torus turbulence validation."""
     import basix.ufl
@@ -366,7 +381,7 @@ def run(config: ScenarioConfig, directory: Path) -> None:
     nominal = config.duration / config.time_steps
     next_dt = nominal
     t = 0.
-    failures = 0
+    rejections = _TimestepRejections()
     while t < config.duration - 1.e-12:
         if (directory / "cancel").exists():
             raise RuntimeError("Simulation cancelled at accepted timestep boundary.")
@@ -387,9 +402,9 @@ def run(config: ScenarioConfig, directory: Path) -> None:
             if np.min(extract(4)[conductor_mask]) <= 0:
                 raise RuntimeError("Temperature crossed absolute zero.")
         except Exception as exc:
-            failures += 1; next_dt = step / 2
+            next_dt = step / 2
             current.x.array[:] = previous.x.array
-            if next_dt < nominal / 256 or failures > 20:
+            if rejections.rejected(next_dt, nominal / 256):
                 raise RuntimeError(f"Coupled solve failed after timestep refinement at t={t:g}: {exc}. "
                                    f"For a factorization/memory failure, reduce mesh resolution (start at 3); "
                                    f"MUMPS factor memory is limited to {memory_mb} MB by MAGNETIC_TORUS_MUMPS_MB.") from exc
@@ -399,6 +414,7 @@ def run(config: ScenarioConfig, directory: Path) -> None:
         sample(t, problem.solver.getIterationNumber())
         previous.x.array[:] = current.x.array
         external_previous.x.array[:] = external_a.x.array
+        rejections.accepted()
         next_dt = min(nominal, step * 1.5)
         report(.05 + .9 * t / config.duration, f"Accepted full MHD snapshot · t={t:.4g} s · Newton {problem.solver.getIterationNumber()}")
     # The identical local operators are consumed by differentiable PINN residuals.
@@ -431,7 +447,7 @@ def run(config: ScenarioConfig, directory: Path) -> None:
                 "exterior_radius_m": exterior_radius, "imposed_coil": imposed_coil(config),
                 "exterior_field_path": "exterior_fields.npz", "weak_operator_path": "weak_operators.npz",
                 "pinn_physics": {"kind": "fenics_a_phi_vms_v1", "bc_nodes": bc_nodes, "quadrature_degree": 2},
-                "time_rejections": failures, "material_provenance": config.provenance, "units": "SI"}
+                "time_rejections": rejections.total, "material_provenance": config.provenance, "units": "SI"}
     metadata["seed_field_vector_t"] = seed_vector.tolist()
     metadata["gauge_treatment"] = "Coulomb div-div penalty for induced A; pressure point anchor; phi mass gauge 1e-10"
     metadata["energy_budget_note"] = "Thermal balance includes molecular Joule/viscous/Darcy dissipation; full resolved+subgrid MHD energy closure is not validated."

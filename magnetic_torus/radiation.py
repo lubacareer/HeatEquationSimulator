@@ -20,24 +20,18 @@ import subprocess
 import tempfile
 import time
 import uuid
+from io import BytesIO
 
 import numpy as np
 
 from .models import DoseResult, PINNResult, Progress, RunResult, ScenarioConfig, SimulationCancelled
+from .artifacts import FieldArtifact
 
 C = 299792458.0
 ELEMENTARY_CHARGE = 1.602176634e-19
 ATOMIC_MASS = 1.66053906892e-27
 PROTON_MASS = 1.67262192595e-27
 MEV = ELEMENTARY_CHARGE * 1e6
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _cancelled(cancel: Any) -> bool:
@@ -119,8 +113,73 @@ def load_spectrum(path: str | Path) -> dict[str, Any]:
     return data
 
 
+def _ground_top(config: ScenarioConfig) -> float:
+    """The same tangent ground plane used by Geant4's finite world geometry."""
+    return -max(config.minor_radius + config.vessel_thickness,
+                config.habitat_radius + config.habitat_thickness) - .01
+
+
+def _isotropic_geometry(rng: np.random.Generator, count: int, radius: float) -> tuple[np.ndarray, np.ndarray]:
+    """Uniform sphere and cosine-law incidence for an unobstructed 4π field."""
+    normal = rng.normal(size=(count, 3))
+    normal /= np.linalg.norm(normal, axis=1)[:, None]
+    tangent = np.cross(normal, np.where((np.abs(normal[:, 2]) < .9)[:, None],
+                                       (0., 0., 1.), (0., 1., 0.)))
+    tangent /= np.linalg.norm(tangent, axis=1)[:, None]
+    other = np.cross(normal, tangent)
+    mu = np.sqrt(rng.random(count))
+    phi = rng.uniform(0, 2 * np.pi, count)
+    directions = -normal * mu[:, None] + np.sqrt(1 - mu ** 2)[:, None] * (
+        tangent * np.cos(phi)[:, None] + other * np.sin(phi)[:, None])
+    return normal * radius, directions
+
+
+def _above_ground_geometry(rng: np.random.Generator, count: int, radius: float,
+                           ground_top: float, impact: float | None) -> tuple[np.ndarray, np.ndarray, float]:
+    """Conditional incident vacuum samples and their exact projected measure.
+
+    Beam fluence remains per perpendicular area. Isotropic fluence remains the
+    unobstructed 4π scalar fluence, with the ground blocking the upward sky.
+    For a cap n_z>=c the downward-sky irradiance is π(1+n_z)/2; integrating
+    intensity Φ/(4π) over the cap gives A=πR²(3-2c-c²)/8. Conditioning directions
+    without this acceptance factor would overestimate the delivered fluence.
+    """
+    if impact is not None:
+        chord = float(np.clip(ground_top / impact, -1., 1.))
+        area = impact ** 2 * (math.acos(chord) - chord * math.sqrt(max(0., 1 - chord ** 2)))
+    else:
+        cap = float(np.clip(ground_top / radius, -1., 1.))
+        area = math.pi * radius ** 2 * (3 - 2 * cap - cap ** 2) / 8
+    if area <= 0:
+        raise ValueError("The incident source has no exposed vacuum region above the ground.")
+    positions, directions = [], []
+    remaining = count
+    while remaining:
+        # This ground plane is below the origin, so acceptance is at least
+        # 1/2 for the beam and 3/8 for the original isotropic sphere measure.
+        size = min(65536, max(32, 3 * remaining))
+        if impact is not None:
+            angle = rng.uniform(0, 2 * np.pi, size)
+            rr = impact * np.sqrt(rng.random(size))
+            yy, zz = rr * np.cos(angle), rr * np.sin(angle)
+            point = np.column_stack((np.sqrt(radius ** 2 - rr ** 2), yy, zz))
+            direction = np.tile((-1., 0., 0.), (size, 1))
+            exposed = zz >= ground_top
+        else:
+            point, direction = _isotropic_geometry(rng, size, radius)
+            exposed = (point[:, 2] >= ground_top) & (direction[:, 2] <= 0.)
+        chosen = np.flatnonzero(exposed)[:remaining]
+        positions.append(point[chosen]); directions.append(direction[chosen])
+        remaining -= len(chosen)
+    return np.concatenate(positions), np.concatenate(directions), float(area)
+
+
 def sample_source(config: ScenarioConfig, count: int, radius: float) -> SourceParticles:
     config.validate()
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("Incident primary count must be a positive integer.")
+    if not math.isfinite(radius) or radius <= 0:
+        raise ValueError("Incident source radius must be finite and positive.")
     rng = np.random.default_rng(config.seed)
     z = np.full(count, config.particle_z, dtype=int)
     a = np.full(count, config.particle_a, dtype=int)
@@ -143,25 +202,28 @@ def sample_source(config: ScenarioConfig, count: int, radius: float) -> SourcePa
     if angular == "beam":
         # Uniform projected disk on the interior source sphere, incident along -x.
         impact = min(radius * .60, 1.15 * (config.major_radius + config.minor_radius))
-        angle = rng.uniform(0, 2 * np.pi, count)
-        rr = impact * np.sqrt(rng.random(count))
-        y, zz = rr * np.cos(angle), rr * np.sin(angle)
-        positions = np.column_stack((np.sqrt(radius ** 2 - rr ** 2), y, zz))
-        directions = np.tile((-1., 0., 0.), (count, 1))
-        area = np.pi * impact ** 2
+        if config.ground_enabled:
+            positions, directions, area = _above_ground_geometry(rng, count, radius, _ground_top(config), impact)
+        else:
+            angle = rng.uniform(0, 2 * np.pi, count)
+            rr = impact * np.sqrt(rng.random(count))
+            y, zz = rr * np.cos(angle), rr * np.sin(angle)
+            positions = np.column_stack((np.sqrt(radius ** 2 - rr ** 2), y, zz))
+            directions = np.tile((-1., 0., 0.), (count, 1))
+            area = np.pi * impact ** 2
+        source_metadata["fluence_convention"] = "fluence per projected area normal to beam"
     else:
-        # Uniform source sphere, cosine-law inward directions = isotropic fluence.
-        normal = rng.normal(size=(count, 3))
-        normal /= np.linalg.norm(normal, axis=1)[:, None]
-        tangent = np.cross(normal, np.where((np.abs(normal[:, 2]) < .9)[:, None],
-                                           (0., 0., 1.), (0., 1., 0.)))
-        tangent /= np.linalg.norm(tangent, axis=1)[:, None]
-        other = np.cross(normal, tangent)
-        mu = np.sqrt(rng.random(count))
-        phi = rng.uniform(0, 2 * np.pi, count)
-        directions = -normal * mu[:, None] + np.sqrt(1 - mu ** 2)[:, None] * (
-            tangent * np.cos(phi)[:, None] + other * np.sin(phi)[:, None])
-        positions, area = normal * radius, np.pi * radius ** 2
+        if config.ground_enabled:
+            positions, directions, area = _above_ground_geometry(rng, count, radius, _ground_top(config), None)
+        else:
+            positions, directions = _isotropic_geometry(rng, count, radius)
+            area = np.pi * radius ** 2
+        source_metadata["fluence_convention"] = "unobstructed 4pi scalar fluence"
+    if config.ground_enabled:
+        source_metadata.update(ground_top_m=_ground_top(config), source_boundary="above-ground vacuum",
+                               ground_normalization="exact exposed projected incident measure", sampling_version=2)
+        if angular == "isotropic":
+            source_metadata["ground_horizon"] = "downward incident directions only; no injected ground albedo"
     source_metadata["angular_distribution"] = angular
     return SourceParticles(positions, directions, z, a, energy, float(area), MappingProxyType(source_metadata))
 
@@ -236,10 +298,11 @@ class FrozenField:
 def frozen_field(result: RunResult, snapshot_index: int) -> FrozenField:
     if not 0 <= snapshot_index < len(result.times):
         raise ValueError("Select an accepted field snapshot before tracing particles.")
-    path = result.metadata.get("exterior_field_path")
-    if not path or not Path(str(path)).is_file():
-        raise RuntimeError("This run has no exterior magnetic field artifact. Run the coupled FEniCS solver before tracing particles or calculating dose.")
-    with np.load(str(path), allow_pickle=False) as data:
+    try:
+        payload = result.artifact_bytes("exterior_field_path")
+    except ValueError as error:
+        raise RuntimeError("This run has no exterior magnetic field artifact. Run the coupled FEniCS solver before tracing particles or calculating dose.") from error
+    with np.load(BytesIO(payload), allow_pickle=False) as data:
         if "vector_potential" not in data:
             raise RuntimeError("This field artifact predates exact curl(A) transport. Rerun the FEniCS solver to regenerate the exterior vector potential.")
         times = data["times"]
@@ -247,7 +310,7 @@ def frozen_field(result: RunResult, snapshot_index: int) -> FrozenField:
             raise ValueError("Exterior field timeline does not match the accepted run.")
         radius = float(result.metadata.get("exterior_radius_m", result.config.exterior_radius_factor * (result.config.major_radius + result.config.minor_radius)))
         return FrozenField(data["points"], data["cells"], data["magnetic_field"][snapshot_index], radius,
-                           _sha256_file(Path(str(path))), data["vector_potential"][snapshot_index])
+                           hashlib.sha256(payload).hexdigest(), data["vector_potential"][snapshot_index])
 
 
 def field_source_run(result: RunResult, pinn: PINNResult, output_dir: Path) -> RunResult:
@@ -267,10 +330,7 @@ def field_source_run(result: RunResult, pinn: PINNResult, output_dir: Path) -> R
         raise ValueError("PINN has no finite vector-potential prediction on the complete accepted global FE mesh.")
     cells = result.metadata.get("cells")
     if cells is None:
-        exterior_path = result.metadata.get("exterior_field_path")
-        if not exterior_path or not Path(str(exterior_path)).is_file():
-            raise ValueError("The originating FE mesh artifact is unavailable; rerun this scenario.")
-        with np.load(str(exterior_path), allow_pickle=False) as exterior:
+        with np.load(BytesIO(result.artifact_bytes("exterior_field_path")), allow_pickle=False) as exterior:
             if not np.allclose(exterior["points"], result.points):
                 raise ValueError("PINN/global FE point ordering is inconsistent.")
             cells = exterior["cells"]
@@ -294,7 +354,8 @@ def field_source_run(result: RunResult, pinn: PINNResult, output_dir: Path) -> R
                 "source_model_validation_status": pinn.metadata.get("validation_status", "unvalidated"),
                 "source_model_metrics": dict(pinn.metrics)}
     return RunResult(result.run_id, result.config, result.times, result.points,
-                     pinn.fields, result.diagnostics, metadata)
+                     pinn.fields, result.diagnostics, metadata,
+                     artifacts={**result.artifacts, "exterior_field_path": FieldArtifact.capture(path, root=directory)})
 
 
 class AnalyticCoilField:
@@ -344,9 +405,7 @@ def _intersection(points: np.ndarray, config: ScenarioConfig) -> np.ndarray:
     # Same spherical habitat as the transport geometry.
     hit[np.linalg.norm(points, axis=1) <= config.habitat_radius + config.habitat_thickness] = "habitat"
     if config.ground_enabled:
-        ground_top = -max(config.minor_radius + config.vessel_thickness,
-                          config.habitat_radius + config.habitat_thickness) - .01
-        hit[points[:, 2] < ground_top] = "ground"
+        hit[points[:, 2] < _ground_top(config)] = "ground"
     return hit
 
 
@@ -356,7 +415,7 @@ def trace_particles(result: RunResult, snapshot_index: int, progress: Progress,
     if not 0 <= snapshot_index < len(result.times):
         raise ValueError("Select an accepted snapshot before tracing particles.")
     field_map = (AnalyticCoilField(config) if config.solver == "thermal_benchmark"
-                 and not result.metadata.get("exterior_field_path") else frozen_field(result, snapshot_index))
+                 and "exterior_field_path" not in result.artifacts else frozen_field(result, snapshot_index))
     source = sample_source(config, config.particle_count, field_map.radius * .85)
     mass = np.where(source.a == 1, PROTON_MASS, source.a * ATOMIC_MASS)
     gamma = 1 + source.energy_mev_nucleon * source.a * MEV / (mass * C ** 2)

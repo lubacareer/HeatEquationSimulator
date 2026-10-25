@@ -9,6 +9,7 @@ import numpy as np
 
 from magnetic_torus.models import ScenarioConfig, RunResult, DoseResult, PINNResult, preset
 from magnetic_torus.store import RunStore
+from magnetic_torus.artifacts import FieldArtifact
 
 
 class ContractStoreTests(unittest.TestCase):
@@ -25,9 +26,17 @@ class ContractStoreTests(unittest.TestCase):
 
     def test_validation_rejects_nonphysical_and_noninteger_parameters(self):
         for change in ({"major_radius": float("nan")}, {"efficiency": 1.1}, {"density": -1},
-                       {"particle_z": 1.5}, {"particle_a": True}, {"habitat_radius": 4}, {"seed": -1}):
+                       {"particle_z": 1.5}, {"particle_a": True}, {"habitat_radius": 4}, {"seed": -1},
+                       {"time_steps": 40.0}, {"resolution": 3.0}, {"coil_turns": True}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 replace(self.config, **change).validate()
+
+    def test_import_rejects_fractional_or_boolean_atomic_numbers(self):
+        for z in (26.9, 26.0, True, "26"):
+            config = {**self.config.to_dict(), "composition": [[z, 1.0]]}
+            with self.subTest(z=z), self.assertRaises(ValueError):
+                ScenarioConfig.from_dict(config)
+        self.assertEqual(ScenarioConfig.from_dict({**self.config.to_dict(), "composition": [[26, 1]]}).composition, ((26, 1.),))
 
     def test_observer_settings_reuse_physics_but_not_full_configuration_identity(self):
         changed = replace(self.config, particle_energy_mev_nucleon=400, target="female", pinn_epochs=100)
@@ -67,7 +76,8 @@ class ContractStoreTests(unittest.TestCase):
     def test_export_contains_independent_field_artifacts(self):
         artifact = Path(self.temporary.name) / "original-exterior.npz"
         np.savez(artifact, points=np.arange(12).reshape(4, 3))
-        result = replace(self.result(), metadata={"exterior_field_path": str(artifact)})
+        result = replace(self.result(), metadata={"exterior_field_path": str(artifact)},
+                         artifacts={"exterior_field_path": FieldArtifact.capture(artifact, root=self.temporary.name)})
         path = self.store.save_run(result)
         destination = Path(self.temporary.name) / "export" / "result.h5"
         destination.parent.mkdir()

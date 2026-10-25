@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+from magnetic_torus.artifacts import FieldArtifact
 
 try:
     import torch
@@ -246,7 +247,8 @@ class TorusPINNTests(unittest.TestCase):
                               "vector_potential": vector, "electric_potential": scalar}, {},
                              {"weak_operator_path": str(artifact), "conductor_mask": [True] * 4,
                               "pinn_physics": {"kind": "fenics_a_phi_vms_v1", "bc_nodes": {}},
-                              "validation_status": "manufactured single-cell weak-form benchmark"})
+                              "validation_status": "manufactured single-cell weak-form benchmark"},
+                             artifacts={"weak_operator_path": FieldArtifact.capture(artifact, root=directory)})
             fields = {name: torch.tensor(values[:2], dtype=torch.float64, requires_grad=True)
                       for name, values in run.fields.items()}
             residuals = evaluate_weak_residual_torch(config, run, fields, [0, 1])
