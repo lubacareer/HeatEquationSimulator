@@ -14,6 +14,9 @@ from ..geometry import conductor_mask
 from .session import WorkspaceSession
 
 
+_CHART_MARGINS = {"left": 0.25, "right": 0.96, "bottom": 0.33, "top": 0.88}
+
+
 class ChartCard(QtWidgets.QFrame):
     time_clicked = QtCore.pyqtSignal(float)
 
@@ -26,6 +29,10 @@ class ChartCard(QtWidgets.QFrame):
         self.title = QtWidgets.QLabel()
         self.title.setStyleSheet("font-weight: 600; padding: 3px 7px;")
         toolbar.addWidget(self.title, 1)
+        self._header_controls = QtWidgets.QHBoxLayout()
+        self._header_controls.setContentsMargins(0, 0, 0, 0)
+        self._header_controls.setSpacing(3)
+        toolbar.addLayout(self._header_controls)
         detach = QtWidgets.QToolButton()
         detach.setText("↗")
         detach.setToolTip("Expand this chart")
@@ -33,7 +40,7 @@ class ChartCard(QtWidgets.QFrame):
         toolbar.addWidget(detach)
         self.layout_.addLayout(toolbar)
         self.figure = Figure(figsize=(4.0, 2.4), dpi=100, facecolor="white")
-        self.figure.subplots_adjust(left=0.21, right=0.96, bottom=0.24, top=0.96)
+        self.figure.subplots_adjust(**_CHART_MARGINS)
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.setMinimumHeight(105)
         self.layout_.addWidget(self.canvas)
@@ -49,10 +56,17 @@ class ChartCard(QtWidgets.QFrame):
         self.canvas.mpl_connect("button_release_event", self._remember_view)
         self.canvas.mpl_connect("button_press_event", self._click)
 
+    def add_header_control(self, control: QtWidgets.QWidget):
+        """Embed a focused plot control beside the title and expand button."""
+        self._header_controls.addWidget(control)
+
     def reset(self, title: str, time_axis=False):
         self._background = None
         self.title.setText(title)
         self.figure.clear()
+        # Figure.clear resets subplot parameters. Reapply margins for compact
+        # cards so absolute Kelvin ticks and axis labels remain inside canvas.
+        self.figure.subplots_adjust(**_CHART_MARGINS)
         self.ax = self.figure.add_subplot(111)
         self.ax.tick_params(labelsize=8, colors="#526a79")
         self.ax.grid(True, color="#e7edf1", linewidth=0.6)
@@ -164,6 +178,19 @@ class ChartPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self.session = session
         self.cards = [ChartCard() for _ in range(3)]
+        self.energy_mode = QtWidgets.QComboBox()
+        self.energy_mode.addItems(["Change (ΔE)", "Stored total"])
+        self.energy_mode.setToolTip(
+            "Change since the initial accepted snapshot, or total recoverable energy above the discharge cutoff"
+        )
+        self.energy_mode.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.energy_mode.setMinimumContentsLength(6)
+        self.energy_mode.setMaximumWidth(130)
+        self.energy_mode.setEnabled(False)
+        self.cards[1].add_header_control(self.energy_mode)
+        self.energy_mode.currentIndexChanged.connect(self._energy_mode_changed)
         self.profile_samples = None
         self.thermal_mode = "Probe temperature"
         self.shield_mode = "First-contact outcomes"
@@ -239,6 +266,8 @@ class ChartPanel(QtWidgets.QWidget):
             card.empty(title, message)
 
     def _refresh(self):
+        self.energy_mode.setVisible(self.session.view == "Thermal")
+        self.energy_mode.setEnabled(self.session.active is not None)
         if self.session.active is None:
             self.empty()
             return
@@ -328,28 +357,7 @@ class ChartPanel(QtWidgets.QWidget):
         if regularized:
             ax.legend(fontsize=6, loc="best")
         self.cards[0].finish()
-        ax = self.cards[1].reset("Stored thermal energy", True)
-        energy = result.diagnostics.get(
-            "recoverable_energy_j", result.diagnostics.get("energy_j")
-        )
-        if energy is not None:
-            ax.plot(
-                result.times,
-                energy / 3.6e6,
-                color="#187e86",
-                linewidth=1.8,
-                label="Stored",
-            )
-            ax.plot(
-                result.times,
-                energy * config.efficiency / 3.6e6,
-                color="#d89e39",
-                linewidth=1.4,
-                label=f"Usable at η={config.efficiency:g}",
-            )
-            ax.legend(fontsize=7, loc="best")
-        ax.set(xlabel="Time [s]", ylabel="Energy [kWh]")
-        self.cards[1].finish(current)
+        self._energy_plot()
         choice = self.thermal_mode
         ax = self.cards[2].reset(choice, choice != "Temperature profile")
         if choice == "Temperature profile":
@@ -410,37 +418,143 @@ class ChartPanel(QtWidgets.QWidget):
                     )
             ax.set(xlabel="Time [s]", ylabel="Power [W]")
         else:
+            probe_temperature = temperatures[:, self.session.probe_index]
+            histories = [probe_temperature]
             ax.plot(
                 result.times,
-                temperatures[:, self.session.probe_index],
+                probe_temperature,
                 color="#d27a35",
                 linewidth=1.8,
                 label="Numerical",
-            )
-            ax.axhline(
-                config.melting_temperature,
-                color="#a2b4bf",
-                linestyle=":",
-                linewidth=1,
-                label="Melting point",
             )
             if (
                 self.session.pinn is not None
                 and "temperature" in self.session.pinn.fields
             ):
+                pinn_temperature = self.session.pinn.fields["temperature"][
+                    :, self.session.probe_index
+                ]
+                histories.append(pinn_temperature)
                 ax.plot(
                     result.times,
-                    self.session.pinn.fields["temperature"][
-                        :, self.session.probe_index
-                    ],
+                    pinn_temperature,
                     color="#187e86",
                     linestyle="--",
                     label="PINN",
                 )
+            low = min(float(np.min(values)) for values in histories)
+            high = max(float(np.max(values)) for values in histories)
+            padding = max(0.1 * (high - low), 0.005)
+            low, high = low - padding, high + padding
+            ax.set_ylim(low, high)
+            ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+            notes = []
+            if low <= config.melting_temperature <= high:
+                ax.axhline(
+                    config.melting_temperature,
+                    color="#a2b4bf",
+                    linestyle=":",
+                    linewidth=1,
+                    label="Melting point",
+                )
+            else:
+                direction = "above" if config.melting_temperature > high else "below"
+                notes.append(
+                    f"Tm = {config.melting_temperature:g} K ({direction} range)"
+                )
+            notes.append(
+                f"Probe ΔT = {probe_temperature[-1] - probe_temperature[0]:+.6g} K"
+            )
+            ax.text(
+                0.02,
+                0.98,
+                "\n".join(notes),
+                transform=ax.transAxes,
+                va="top",
+                fontsize=6.2,
+                color="#526a79",
+                bbox={
+                    "facecolor": "white",
+                    "alpha": 0.85,
+                    "edgecolor": "none",
+                    "pad": 1.5,
+                },
+            )
             ax.set(xlabel="Time [s]", ylabel="Temperature [K]")
         if ax.get_legend_handles_labels()[0]:
             ax.legend(fontsize=7, loc="best")
         self.cards[2].finish(current)
+
+    def _energy_mode_changed(self):
+        if self.session.active is not None and self.session.view == "Thermal":
+            self._energy_plot()
+            self.update_frame(self.session.display_selection())
+
+    def _energy_plot(self):
+        result = self.session.active
+        if result is None:
+            return
+        card = self.cards[1]
+        recoverable = result.diagnostics.get("recoverable_energy_j")
+        energy = (
+            recoverable
+            if recoverable is not None
+            else result.diagnostics.get("energy_j")
+        )
+        if energy is None:
+            card.empty("Thermal energy", "This run has no thermal energy diagnostic")
+            return
+        config = result.config
+        change = self.energy_mode.currentIndex() == 0
+        title = (
+            ("Energy change" if change else "Stored energy")
+            if recoverable is not None
+            else ("Enthalpy change" if change else "Enthalpy total")
+        )
+        ax = card.reset(title, True)
+        values = (energy - energy[0]) / 3.6e6 if change else energy / 3.6e6
+        ax.plot(
+            result.times,
+            values,
+            color="#187e86",
+            linewidth=1.8,
+            label=("Stored ΔE" if change else "Stored")
+            if recoverable is not None
+            else "Enthalpy",
+        )
+        ax.plot(
+            result.times,
+            values * config.efficiency,
+            color="#d89e39",
+            linewidth=1.4,
+            label=f"{'Usable' if recoverable is not None else 'Scaled'} at η={config.efficiency:g}",
+        )
+        initial = float(energy[0]) / 3.6e6
+        net_change = float(energy[-1] - energy[0]) / 3.6e6
+        initial_text = (
+            f"Initial: {initial:.6g} kWh stored; {initial * config.efficiency:.6g} kWh usable"
+            if recoverable is not None
+            else f"Initial enthalpy integral: {initial:.6g} kWh"
+        )
+        reference = (
+            f"Discharge reference: {config.discharge_temperature:g} K"
+            if recoverable is not None
+            else f"Enthalpy reference: Tm = {config.melting_temperature:g} K"
+        )
+        ax.text(
+            0.02,
+            0.98,
+            f"{initial_text}\n{reference}\nNet ΔE: {net_change:+.6g} kWh",
+            transform=ax.transAxes,
+            va="top",
+            fontsize=6.2,
+            color="#526a79",
+            bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none", "pad": 1.5},
+        )
+        ax.margins(y=0.2)
+        ax.legend(fontsize=6, loc="lower right")
+        ax.set(xlabel="Time [s]", ylabel="ΔEnergy [kWh]" if change else "Energy [kWh]")
+        card.finish(self.session.current_time)
 
     def _dynamo_plots(self):
         result = self.session.active

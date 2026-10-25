@@ -15,6 +15,8 @@ python interface3.py
 
 Select **Thermal benchmark**, set **Simulation duration [s]** in **Run setup** at the top of the sidebar, then select **Run simulation** for the quickest computed animation. Geometry and thermal properties remain editable in the same window; press **Recalculate scenario** without restarting. After running, right-click the 3D view to inspect a point. Accepted results remain visible while a job runs and survive failures and cancellation. **Iron** and **Lunar habitat** select the full FEniCS worker; their engineering/material values are illustrative.
 
+The thermal energy chart defaults to **Change (ΔE)**; select **Stored total** for absolute values. Stored energy is recoverable heat relative to the configured discharge temperature; it includes heat present before charging. Probe temperatures use the computed temperature range, with an annotation when the melting point is outside that range.
+
 For a new desktop environment:
 
 ```powershell

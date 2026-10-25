@@ -23,6 +23,17 @@ Reproduce with `python -B scripts/run_checks.py`, `python -B scripts/desktop_smo
   thermal reference (2048 points), a 1282×780 window, Medium detail, opacity 100%,
   and optional overlays off. This is separate from the earlier 31.77 FPS record;
   timings depend on the machine and workload.
+- Thermal plot regressions preserve small changes on large baselines: the
+  recorded 5 s Iron run adds 65 kJ to 65.1327 kWh initially stored and warms from
+  1800 K to approximately 1800.0277 K. Heating stops at 3.25 s; the remaining
+  plateau is expected with zero discharge/radiation loss. The default change
+  view exposes this signal, labels the 1700 K discharge reference, and retains
+  absolute totals as an option. Probe axes fit computed histories rather than
+  an off-scale melting point. Compact-card checks cover complete axis labels and
+  reference annotations; equations, inputs, and accepted fields are unchanged.
+  With those clarified chart layouts, the latest five-run median is 50.82 FPS
+  versus 52.17 FPS before the plot changes (within the 10% regression budget,
+  and approximately 13.1% faster than the original 44.93 FPS baseline).
 
 Reproduce paired timing using the same Python environment and graphical session:
 
