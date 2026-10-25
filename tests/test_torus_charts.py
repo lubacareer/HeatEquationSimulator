@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PyQt6 import QtWidgets
+from matplotlib.colors import to_rgba
 
 from magnetic_torus.models import PINNResult, RunResult, ScenarioConfig
 from magnetic_torus.ui.charts import ChartCard, ChartPanel
@@ -272,6 +273,83 @@ class ThermalChartTests(unittest.TestCase):
         self.assertGreaterEqual(bounds.y0, figure.y0)
         self.assertLessEqual(bounds.x1, figure.x1)
         self.assertLessEqual(bounds.y1, figure.y1)
+
+    def test_failed_pinn_fields_show_values_limits_colors_and_actual_training_epochs(
+        self,
+    ):
+        errors = {
+            "enthalpy_normalized_rmse": 0.0000542,
+            "velocity_normalized_rmse": 0.286,
+            "magnetic_field_normalized_rmse": 0.000268,
+            "vector_potential_normalized_rmse": 0.00523,
+            "pressure_normalized_rmse": 0.463,
+            "electric_potential_normalized_rmse": 0.726,
+            "temperature_normalized_rmse": 0.00195,
+            "liquid_fraction_normalized_rmse": 0.0,
+        }
+        model = PINNResult(
+            "failed-fit",
+            self.result.run_id,
+            self.result.config.config_hash,
+            self.result.fields,
+            {"loss": np.array([0.5, 0.137])},
+            {
+                **errors,
+                "validation_loss": 0.137,
+                "physics_loss": 1.0e-6,
+                "boundary_loss": 1.0e-6,
+                "epochs": 250.0,
+            },
+            {"validation_status": "failed", "training_epochs": 5000},
+        )
+        self.session.set_pinn(model)
+        self.session.view = "PINN"
+        self.panel.refresh()
+        self.assertIn("250 epochs", self.panel.cards[0].title.text())
+        self.assertNotIn("5000", self.panel.cards[0].title.text())
+        ax = self.panel.cards[1].ax
+        for bar, value in zip(ax.patches, errors.values()):
+            np.testing.assert_allclose(
+                bar.get_facecolor(), to_rgba("#c87e37" if value > 0.1 else "#258d95")
+            )
+        labels = [text.get_text() for text in ax.texts]
+        for value in ("0.286", "0.463", "0.726"):
+            self.assertIn(value, labels)
+        np.testing.assert_allclose(ax.lines[0].get_xdata(), [0.1, 0.1])
+        self.assertIn("Limit 0.1", [text.get_text() for text in ax.get_legend().texts])
+        for card in self.panel.cards[1:]:
+            card.setFixedSize(330, 150)
+        self.application.processEvents()
+        for card in self.panel.cards[1:]:
+            card.canvas.draw()
+            renderer = card.canvas.get_renderer()
+            figure = card.figure.bbox
+            low, high = card.ax.get_ylim()
+            for tick in card.ax.yaxis.get_major_ticks():
+                if tick.label1.get_visible() and low <= tick.get_loc() <= high:
+                    with self.subTest(
+                        card=card.title.text(), label=tick.label1.get_text()
+                    ):
+                        bounds = tick.label1.get_window_extent(renderer)
+                        self.assertGreaterEqual(bounds.x0, figure.x0)
+                        self.assertGreaterEqual(bounds.y0, figure.y0)
+                        self.assertLessEqual(bounds.x1, figure.x1)
+                        self.assertLessEqual(bounds.y1, figure.y1)
+        self.assertIn(
+            "electric potential", [label.get_text() for label in ax.get_yticklabels()]
+        )
+        self.assertFalse(
+            self.panel.cards[2].ax.yaxis.get_major_formatter().get_useOffset()
+        )
+        self.assertEqual(self.panel.cards[2].ax.yaxis.get_offset_text().get_text(), "")
+        requested = []
+        self.panel.training_settings_requested.connect(lambda: requested.append(True))
+        self.assertFalse(self.panel.training_settings_button.isHidden())
+        self.panel.training_settings_button.click()
+        self.assertEqual(requested, [True])
+        self.session.view = "Thermal"
+        self.panel.refresh()
+        self.assertTrue(self.panel.training_settings_button.isHidden())
 
 
 if __name__ == "__main__":

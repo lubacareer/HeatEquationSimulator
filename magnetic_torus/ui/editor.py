@@ -15,6 +15,7 @@ class ScenarioEditor(QtWidgets.QFrame):
         super().__init__(parent)
         self._loading = False
         self._base_config = preset("Thermal benchmark")
+        self._section_buttons: dict[str, QtWidgets.QToolButton] = {}
         self._draft_timer = QtCore.QTimer(self)
         self._draft_timer.setSingleShot(True)
         self._draft_timer.setInterval(160)
@@ -78,6 +79,7 @@ class ScenarioEditor(QtWidgets.QFrame):
         self.run_button.setObjectName("run")
         layout.addWidget(self.run_button)
         scroll = QtWidgets.QScrollArea()
+        self._scroll_area = scroll
         scroll.setWidgetResizable(True)
         scroll_content = QtWidgets.QWidget()
         self.sections_layout = QtWidgets.QVBoxLayout(scroll_content)
@@ -213,6 +215,7 @@ class ScenarioEditor(QtWidgets.QFrame):
         )
         button.setCheckable(True)
         button.setChecked(opened)
+        self._section_buttons[title] = button
         layout.addWidget(button)
         content = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(content)
@@ -278,6 +281,18 @@ class ScenarioEditor(QtWidgets.QFrame):
         (
             target_layout if target_layout is not None else self.sections_layout
         ).addWidget(section)
+
+    def show_training_settings(self):
+        """Reveal existing training inputs without changing the draft scenario."""
+        self._section_buttons["Advanced solver & training"].setChecked(True)
+        QtCore.QTimer.singleShot(0, self._focus_training_epochs)
+
+    def _focus_training_epochs(self):
+        editor = self.editors["pinn_epochs"]
+        self._scroll_area.ensureWidgetVisible(editor, 10, 20)
+        editor.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        if isinstance(editor, QtWidgets.QLineEdit):
+            editor.selectAll()
 
     def read_config(self):
         base = getattr(self, "_base_config", preset("Thermal benchmark")).to_dict()

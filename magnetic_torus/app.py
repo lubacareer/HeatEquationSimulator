@@ -11,6 +11,7 @@ import numpy as np
 os.environ.setdefault("QT_API", "pyqt6")
 from PyQt6 import QtCore, QtGui, QtWidgets
 from .jobs import JobController
+from .learning.diagnostics import failed_checks, validation_message
 from .models import preset
 from .scene import QUANTITIES, SceneWidget, SceneOptions
 from .store import RunStore
@@ -285,6 +286,9 @@ class TorusWindow(QtWidgets.QMainWindow):
         for chart in self.chart_panel.cards:
             chart.time_clicked.connect(self.playback.seek_time)
         self.chart_panel.notice.connect(self.message.setText)
+        self.chart_panel.training_settings_requested.connect(
+            self._show_training_settings
+        )
         self.exports.notified.connect(self._notify)
         self.exports.progress.connect(self._job_progress)
         self.exports.busy_changed.connect(self._busy_changed)
@@ -435,9 +439,18 @@ class TorusWindow(QtWidgets.QMainWindow):
                 self.session.set_pinn(
                     self.store.load_pinn(event["path"]), Path(event["path"])
                 )
+                checks = failed_checks(self.session.pinn)
+                if checks:
+                    self._log(
+                        f"PINN {self.session.pinn.run_id} · failed validation checks\n"
+                        + "\n".join(
+                            f"  {check.label}: {check.value:.6g} (limit {check.limit:g})"
+                            for check in checks
+                        )
+                    )
                 self.set_view("PINN")
                 self._notify(
-                    f"PINN validation: {self.session.pinn.metadata.get('validation_status', 'unvalidated')}. Inspect held-out field errors and conservation in this view.",
+                    validation_message(self.session.pinn),
                     sticky=self.session.pinn.metadata.get("validation_status")
                     != "passed",
                 )
@@ -606,6 +619,13 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.message.setText(message)
         self.message.show()
         self.editor.run_button.setEnabled(False)
+
+    def _show_training_settings(self):
+        self.sidebar_button.setChecked(True)
+        self.sidebar.show()
+        if self.body.sizes()[0] < self.editor.minimumWidth():
+            self.body.setSizes([285, max(1, self.body.width() - 285)])
+        self.editor.show_training_settings()
 
     def activate_result(self, path):
         if self.exports.busy:

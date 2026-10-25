@@ -11,6 +11,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
 from ..geometry import conductor_mask
+from ..learning.diagnostics import FIELD_RMSE_LIMIT, failed_checks, training_epochs
 from .session import WorkspaceSession
 
 
@@ -173,11 +174,22 @@ class ChartPanel(QtWidgets.QWidget):
     """Rebuild plots only after selection changes; update artists during playback."""
 
     notice = QtCore.pyqtSignal(str)
+    training_settings_requested = QtCore.pyqtSignal()
 
     def __init__(self, session: WorkspaceSession, parent=None):
         super().__init__(parent)
         self.session = session
         self.cards = [ChartCard() for _ in range(3)]
+        self.training_settings_button = QtWidgets.QToolButton()
+        self.training_settings_button.setText("Adjust training")
+        self.training_settings_button.setToolTip(
+            "Open the existing training epochs and batch controls in Parameters"
+        )
+        self.training_settings_button.clicked.connect(
+            lambda: self.training_settings_requested.emit()
+        )
+        self.training_settings_button.hide()
+        self.cards[0].add_header_control(self.training_settings_button)
         self.energy_mode = QtWidgets.QComboBox()
         self.energy_mode.addItems(["Change (ΔE)", "Stored total"])
         self.energy_mode.setToolTip(
@@ -267,6 +279,7 @@ class ChartPanel(QtWidgets.QWidget):
 
     def _refresh(self):
         self.energy_mode.setVisible(self.session.view == "Thermal")
+        self.training_settings_button.setVisible(self.session.view == "PINN")
         self.energy_mode.setEnabled(self.session.active is not None)
         if self.session.active is None:
             self.empty()
@@ -781,7 +794,12 @@ class ChartPanel(QtWidgets.QWidget):
             ):
                 card.empty(title, "Train a PINN for the active saved scenario")
             return
-        ax = self.cards[0].reset("Training convergence")
+        epochs = training_epochs(self.session.pinn)
+        ax = self.cards[0].reset(
+            f"Training · {epochs} epochs"
+            if epochs is not None
+            else "Training convergence"
+        )
         for key, values in self.session.pinn.history.items():
             values = np.asarray(values)
             if (
@@ -797,19 +815,34 @@ class ChartPanel(QtWidgets.QWidget):
         self.cards[0].finish()
         status = self.session.pinn.metadata.get("validation_status", "unvalidated")
         ax = self.cards[1].reset(f"Held-out fields · {status}")
+        self.cards[1].figure.subplots_adjust(left=0.34)
         metrics = [
             (key, value)
             for key, value in self.session.pinn.metrics.items()
             if np.isfinite(value) and key.endswith("_normalized_rmse")
         ][:8]
         if metrics:
-            ax.barh(
+            failures = {check.metric for check in failed_checks(self.session.pinn)}
+            bars = ax.barh(
                 np.arange(len(metrics)),
                 [value for key, value in metrics],
-                color="#258d95",
+                color=[
+                    "#c87e37" if key in failures else "#258d95"
+                    for key, value in metrics
+                ],
+            )
+            ax.bar_label(
+                bars,
+                labels=[f"{value:.3g}" for key, value in metrics],
+                padding=3,
+                fontsize=6.5,
             )
             ax.axvline(
-                0.1, color="#c87e37", linestyle=":", linewidth=1, label="Field gate"
+                FIELD_RMSE_LIMIT,
+                color="#c87e37",
+                linestyle=":",
+                linewidth=1,
+                label=f"Limit {FIELD_RMSE_LIMIT:g}",
             )
             ax.set_yticks(
                 np.arange(len(metrics)),
@@ -818,8 +851,12 @@ class ChartPanel(QtWidgets.QWidget):
                     for key, value in metrics
                 ],
             )
-            ax.set_xlabel("Held-out normalized RMSE [dimensionless]")
-            ax.legend(fontsize=6)
+            ax.tick_params(axis="y", labelsize=6.5)
+            ax.set_xlim(
+                0, max(FIELD_RMSE_LIMIT, max(value for key, value in metrics)) * 1.3
+            )
+            ax.set_xlabel("Normalized RMSE [dimensionless]")
+            ax.legend(fontsize=6, loc="lower right")
         self.cards[1].finish()
         ax = self.cards[2].reset("Temperature · held scenario", True)
         for fields_, label, color, style in (
@@ -835,6 +872,7 @@ class ChartPanel(QtWidgets.QWidget):
                     label=label,
                 )
         ax.set(xlabel="Time [s]", ylabel="Temperature [K]")
+        ax.ticklabel_format(axis="y", style="plain", useOffset=False)
         ax.legend(fontsize=7)
         self.cards[2].finish(
             float(self.session.active.times[self.session.current_index])

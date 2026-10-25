@@ -11,6 +11,7 @@ import numpy as np
 from .. import __version__
 from ..models import Progress
 from .fields import STEFAN_BOLTZMANN, _cancelled, _scalar_field
+from .diagnostics import ENERGY_DEFECT_LIMIT, FIELD_RMSE_LIMIT, LOSS_LIMIT, RESIDUAL_RMS_LIMIT
 
 if TYPE_CHECKING:
     from .training import TrainingRun
@@ -147,15 +148,15 @@ def validate_prediction(run: TrainingRun, predicted: dict[str, np.ndarray], init
         _coupled_conservation(run, predicted, metrics, progress, cancel)
     if not all(math.isfinite(value) for value in metrics.values()):
         raise FloatingPointError("PINN validation produced non-finite errors or conservation defects; no result was published.")
-    conservation_ok = (metrics.get("energy_defect_relative", 0.) <= .05
-                       and metrics["enthalpy_residual_rms"] <= .1 if data.thermal else
-                       all(value <= .1 for key, value in metrics.items() if key.endswith("_residual_rms")))
-    fields_ok = all(value <= .1 for key, value in metrics.items() if key.endswith("_normalized_rmse"))
+    conservation_ok = (metrics.get("energy_defect_relative", 0.) <= ENERGY_DEFECT_LIMIT
+                       and metrics["enthalpy_residual_rms"] <= RESIDUAL_RMS_LIMIT if data.thermal else
+                       all(value <= RESIDUAL_RMS_LIMIT for key, value in metrics.items() if key.endswith("_residual_rms")))
+    fields_ok = all(value <= FIELD_RMSE_LIMIT for key, value in metrics.items() if key.endswith("_normalized_rmse"))
     missing_validation = [name for name in data.scaling.names if name + "_normalized_rmse" not in metrics]
     run.metadata["fields_without_heldout_labels"] = missing_validation
-    run.metadata["validation_status"] = ("passed" if metrics["validation_loss"] <= 1e-2
-                                      and metrics["physics_loss"] <= 1e-2
-                                      and metrics["boundary_loss"] <= 1e-2 and conservation_ok
+    run.metadata["validation_status"] = ("passed" if metrics["validation_loss"] <= LOSS_LIMIT
+                                      and metrics["physics_loss"] <= LOSS_LIMIT
+                                      and metrics["boundary_loss"] <= LOSS_LIMIT and conservation_ok
                                       and fields_ok and not missing_validation else "failed")
     run.metadata["validation_criteria"] = (
         "held-out normalized MSE ≤ 0.01; each field normalized RMSE ≤ 0.1; training physics/boundary MSE ≤ 0.01; "

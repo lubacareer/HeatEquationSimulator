@@ -329,5 +329,44 @@ class DesktopSourceTests(unittest.TestCase):
         self.assertTrue(self.window.source.isEnabled())
 
 
+    def test_failed_pinn_explains_gates_and_adjust_training_reveals_existing_inputs(self):
+        source_path = self.activate(self.tetra_result("failed-fit-source"))
+        accepted = self.window.session.active
+        model = PINNResult(
+            "failed-fit", accepted.run_id, accepted.config.config_hash, accepted.fields,
+            {"loss": np.array([.5, .137])},
+            {"validation_loss": .137, "physics_loss": 1.e-6, "boundary_loss": 1.e-6,
+             "velocity_normalized_rmse": .286, "pressure_normalized_rmse": .463,
+             "electric_potential_normalized_rmse": .726, "charge_residual_rms": .2, "epochs": 250.},
+            {"validation_status": "failed", "training_epochs": 5000},
+        )
+        model_path = self.window.store.save_pinn(model)
+        self.window.editor.set_config(replace(accepted.config, pinn_epochs=2500))
+        self.window.session.job_revision = self.window.session.selection_revision
+        self.window._job_completed({"action": "pinn", "source_path": str(source_path), "path": str(model_path)})
+        message = self.window.message.text()
+        self.assertIn("250 epochs", message)
+        for check in ("held-out loss 0.137 > 0.01", "velocity normalized RMSE 0.286 > 0.1",
+                      "pressure normalized RMSE 0.463 > 0.1", "electric potential normalized RMSE 0.726 > 0.1"):
+            self.assertIn(check, message)
+        self.assertIn("Accepted numerical results remain available", message)
+        self.assertIn("1 more failed checks", message)
+        self.assertIn("charge residual: 0.2 (limit 0.1)", self.window.log_text.toPlainText())
+        self.assertIs(self.window.session.active, accepted)
+        before = self.window.editor.read_config().to_dict()
+        self.window.sidebar_button.setChecked(False)
+        self.window.chart_panel.training_settings_button.click()
+        self.application.processEvents()
+        self.application.processEvents()
+        epoch = self.window.editor.editors["pinn_epochs"]
+        self.assertTrue(self.window.sidebar.isVisible())
+        self.assertTrue(epoch.isVisible())
+        self.assertIs(self.window.focusWidget(), epoch)
+        scroll = self.window.editor._scroll_area
+        self.assertTrue(scroll.viewport().rect().intersects(QtCore.QRect(epoch.mapTo(scroll.viewport(), QtCore.QPoint()), epoch.size())))
+        self.assertEqual(self.window.editor.read_config().to_dict(), before)
+        self.assertIs(self.window.session.active, accepted)
+
+
 if __name__ == "__main__":
     unittest.main()

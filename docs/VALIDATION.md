@@ -47,6 +47,29 @@ historical pre-refactor checkout, copy the benchmark script onto that checkout;
 the harness supports both workspace interfaces. It rejects mismatched fixture
 sizes/counts and a slowdown greater than 10%.
 
+## Coupled Iron PINN follow-up (2026-10-25)
+
+The reported default Iron fit used 250 CUDA epochs, batch size 256 and seed 42,
+against 43 accepted FE snapshots on 1961 points. A separate private diagnostic
+changed only the epoch count to 1000 and completed in 161.7 seconds. It preserved
+the user's saved runs and used the same equations, normalization, split and gates.
+
+| Check | 250 epochs | 1000 epochs | Required |
+| --- | ---: | ---: | ---: |
+| Held-out normalized MSE | 0.1373 | 0.0514 | ≤0.01 |
+| Velocity normalized RMSE | 0.2865 | 0.2744 | ≤0.1 |
+| Pressure normalized RMSE | 0.4630 | 0.2419 | ≤0.1 |
+| Electric-potential normalized RMSE | 0.7260 | 0.4179 | ≤0.1 |
+
+Both fits correctly remain **failed**. Temperature RMSE improved from
+5.42e-5 K to 1.68e-5 K; magnetic-field accuracy and all independently checked
+normalized residuals meet their gates. Those passing checks do not override
+the failed field-accuracy gates. Longer training improves this fit but does not
+qualify the coupled PINN. The source is fully solid, with only 39 free velocity
+nodes; training-label sampling and electrical-potential conditioning remain
+specific investigation targets. Diagnostic evidence is in
+`.cache/iron_pinn_diagnostic/report.json`.
+
 ## Checks exercised
 
 - Sharp T(E) branches and latent-heat plateau; SI heat-capacity units; regularized constitutive continuity.
