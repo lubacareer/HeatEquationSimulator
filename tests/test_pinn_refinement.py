@@ -236,8 +236,7 @@ class PINNRefinementTests(unittest.TestCase):
                 run.history["validation_loss"].append(run.losses.validation_loss())
                 run.metadata["heldout_evaluated_epoch"] = epoch
                 run.metadata["actual_training_steps"] = epoch
-                if stage != "Correction Adam":
-                    run.metadata["last_physics_evaluated_epoch"] = epoch
+                run.metadata["last_physics_evaluated_epoch"] = epoch
                 schedule.append((stage, stage_end, detail))
 
             groups = training._train_corrections(
@@ -315,19 +314,24 @@ class PINNRefinementTests(unittest.TestCase):
         )
         self.assertEqual(run.metadata["last_physics_evaluated_epoch"], 152)
         self.assertEqual(run.metadata["function_evaluations"]["adam"], 140)
-        self.assertTrue(all("physics@50" in text for text in messages[50:150]))
+        self.assertTrue(
+            all(
+                f"physics@{epoch}" in text
+                for epoch, text in enumerate(messages[50:150], 51)
+            )
+        )
         self.assertEqual(
             sum(stage["steps"] for stage in run.metadata["training_stages"]), 152
         )
         self.assertEqual(run.history["physics_loss"][-1], 0.0)
 
-    def test_cancelled_extra_label_evaluation_cannot_apply_an_update(self):
+    def test_cancelled_extra_physics_evaluation_cannot_apply_an_update(self):
         run = self.prepare()
-        original = run.losses.sampled_training_loss
+        original = run.losses.thermal_physics
 
         def cancel_additional(*args, **kwargs):
             value = original(*args, **kwargs)
-            if kwargs.get("active_fields") is not None:
+            if len(run.history["epoch"]) >= 50:
                 run.losses.cancel.set()
             return value
 
@@ -337,9 +341,7 @@ class PINNRefinementTests(unittest.TestCase):
                 "_training_diagnostics",
                 return_value={"fields": {"enthalpy": 0.06}, "residuals": {}},
             ),
-            patch.object(
-                run.losses, "sampled_training_loss", side_effect=cancel_additional
-            ),
+            patch.object(run.losses, "thermal_physics", side_effect=cancel_additional),
         ):
             with self.assertRaises(SimulationCancelled):
                 training._train_model(run, lambda *_: None, run.losses.cancel)
@@ -388,6 +390,95 @@ class PINNRefinementTests(unittest.TestCase):
                 for parameter in field.model.branch_parameters()
             )
         )
+
+    def test_additional_adam_uses_full_joint_loss_and_nonzero_equation_gradients(self):
+        run = self.prepare()
+        for key in run.history:
+            run.history[key] = [50.0 if key == "epoch" else 0.0]
+        parameter = run.field.model[-1].bias
+        observed = {}
+
+        def record(objective, _stage, **_kwargs):
+            observed.update(
+                {key: float(value.detach()) for key, value in objective.items()}
+            )
+            observed["gradient"] = float(parameter.grad)
+            observed["parameter"] = float(parameter.detach())
+            raise SimulationCancelled("stop fixture after one accepted update")
+
+        with (
+            patch.object(
+                training,
+                "_training_diagnostics",
+                return_value={"fields": {"enthalpy": 0.06}, "residuals": {}},
+            ),
+            patch.object(
+                run.losses,
+                "sampled_training_loss",
+                side_effect=lambda: (parameter.sum() + 1).square(),
+            ) as labels,
+            patch.object(
+                run.losses,
+                "thermal_physics",
+                side_effect=lambda: (
+                    (parameter.sum() - 2).square(),
+                    (parameter.sum() - 3).square(),
+                ),
+            ),
+        ):
+            with self.assertRaises(SimulationCancelled):
+                training._train_corrections(
+                    run,
+                    training._audit_intervals(run.field.data),
+                    np.arange(2),
+                    record,
+                    run.losses.cancel,
+                )
+        labels.assert_called_once_with()
+        self.assertEqual(
+            {
+                key: observed[key]
+                for key in ("loss", "data_loss", "physics_loss", "boundary_loss")
+            },
+            {"loss": 14.0, "data_loss": 1.0, "physics_loss": 4.0, "boundary_loss": 9.0},
+        )
+        self.assertAlmostEqual(observed["gradient"], -8.0, places=5)
+        self.assertGreater(observed["parameter"], 0.0)
+        self.assertEqual(
+            run.metadata["additional_optimizer_steps_completed"]["adam"], 1
+        )
+
+    def test_thermal_physics_4096_forwards_preserve_loss_and_parameter_gradients(self):
+        # Synthetic finite labels isolate batch equivalence, not physical accuracy.
+        runs = [batching.prepared_labels(), batching.prepared_labels()]
+        values, gradients, calls = [], [], []
+        for limit, run in zip((256, 4096), runs):
+            rows = []
+            hook = run.field.model.register_forward_pre_hook(
+                lambda _module, args: rows.append(len(args[0]))
+            )
+            with patch.object(training, "_FULL_LABEL_BATCH_SIZE", limit):
+                physics, boundary = run.losses.thermal_physics(
+                    4, np.arange(run.field.data.point_count)
+                )
+                loss = physics + boundary
+                loss.backward()
+            hook.remove()
+            values.append(loss.detach())
+            gradients.append(
+                torch.cat(
+                    [
+                        parameter.grad.flatten()
+                        for parameter in run.field.model.parameters()
+                    ]
+                )
+            )
+            calls.append(rows)
+        torch.testing.assert_close(values[0], values[1], rtol=1e-11, atol=1e-12)
+        torch.testing.assert_close(gradients[0], gradients[1], rtol=1e-11, atol=1e-12)
+        self.assertLessEqual(max(calls[0]), 256)
+        self.assertEqual(calls[1], [2600, 1300])
+        self.assertTrue(all(count <= 4096 for count in calls[1]))
 
     def test_trained_wrapper_preserves_initial_state_and_each_dirichlet_mask(self):
         # Hard-constraint integration fixture, not an FE solve or qualification.
