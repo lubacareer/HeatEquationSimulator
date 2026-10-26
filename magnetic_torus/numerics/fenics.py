@@ -26,10 +26,11 @@ def _run_fenics(config: ScenarioConfig, progress: Progress, cancel: threading.Ev
     request = directory / "request.json"
     request.write_text(json.dumps(config.to_dict()), encoding="utf-8")
     worker = Path(__file__).resolve().parent.parent / "workers" / "fenics_worker.py"
+    interpreter = os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3")
     if sys.platform == "win32":
-        command = ["wsl", "-d", wsl_distribution(), "--", "/usr/bin/python3", wsl_path(worker), wsl_path(request), wsl_path(directory)]
+        command = ["wsl", "-d", wsl_distribution(), "--", interpreter, wsl_path(worker), wsl_path(request), wsl_path(directory)]
     else:
-        command = [os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3"), str(worker), str(request), str(directory)]
+        command = [interpreter, str(worker), str(request), str(directory)]
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
