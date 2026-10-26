@@ -311,6 +311,61 @@ class PINNConditioningTests(unittest.TestCase):
                         threading.Event(),
                     )
 
+    def test_trial_exceptions_restore_weights_gradients_and_optimizer_before_propagating(
+        self,
+    ):
+        for step in (_bounded_lbfgs_step, _recovering_lbfgs_step):
+            for error in (
+                SimulationCancelled("cancelled during trial"),
+                FloatingPointError("non-finite trial"),
+                RuntimeError("unexpected trial failure"),
+                KeyboardInterrupt("interrupted trial"),
+            ):
+                with self.subTest(step=step.__name__, error=type(error).__name__):
+                    parameter = torch.nn.Parameter(torch.zeros((), dtype=torch.float64))
+                    optimizer = torch.optim.LBFGS(
+                        [parameter],
+                        lr=1.0,
+                        max_iter=1,
+                        max_eval=8,
+                        history_size=20,
+                        line_search_fn="strong_wolfe",
+                    )
+
+                    def warmup():
+                        optimizer.zero_grad(set_to_none=True)
+                        loss = (parameter - 1).square()
+                        loss.backward()
+                        return loss
+
+                    optimizer.step(warmup)
+                    parameter.grad = torch.full_like(parameter, 0.75)
+                    original_weight = parameter.detach().clone()
+                    original_gradient = parameter.grad.clone()
+                    original_state = deepcopy(optimizer.state_dict())
+                    calls = []
+
+                    def objective():
+                        optimizer.zero_grad(set_to_none=True)
+                        loss = (parameter - 3).square()
+                        loss.backward()
+                        calls.append(True)
+                        if len(calls) == 2:
+                            self.assertFalse(
+                                torch.equal(parameter.detach(), original_weight)
+                            )
+                            optimizer.param_groups[0]["lr"] = 0.125
+                            raise error
+                        return loss
+
+                    with self.assertRaises(type(error)) as caught:
+                        step(optimizer, (parameter,), objective, threading.Event())
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(len(calls), 2)
+                    self.assertTrue(torch.equal(parameter.detach(), original_weight))
+                    self.assertTrue(torch.equal(parameter.grad, original_gradient))
+                    self.assertEqual(optimizer.state_dict(), original_state)
+
     def test_repeated_budget_exhaustion_recovers_real_training_descent(self):
         parameter = torch.nn.Parameter(torch.ones((), dtype=torch.float64))
         optimizer = torch.optim.LBFGS(

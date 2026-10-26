@@ -749,15 +749,22 @@ def _bounded_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Ca
         evaluations += 1
         return closure()
 
-    try:
-        optimizer.step(counted_closure)
-    except _RefinementEvaluationBudget:
+    def restore():
         with torch.no_grad():
             for parameter, weight, gradient in zip(parameters, weights, gradients):
                 parameter.copy_(weight)
                 parameter.grad = gradient
         optimizer.load_state_dict(state)
+
+    try:
+        optimizer.step(counted_closure)
+    except _RefinementEvaluationBudget:
+        restore()
         return evaluations, True
+    except BaseException:
+        # PyTorch may still have trial weights installed when a closure fails.
+        restore()
+        raise
     return evaluations, False
 
 
