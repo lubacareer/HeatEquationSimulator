@@ -527,6 +527,15 @@ class TorusWindow(QtWidgets.QMainWindow):
         active_path = (
             str(self.session.active_path) if self.session.active_path else None
         )
+        comparison_path = next(
+            (
+                record["path"]
+                for record in records
+                if self.session.comparison is not None
+                and record.get("run_id") == self.session.comparison.run_id
+            ),
+            None,
+        )
         for combo in (self.editor.history, self.editor.compare_history):
             combo.blockSignals(True)
             combo.clear()
@@ -534,7 +543,8 @@ class TorusWindow(QtWidgets.QMainWindow):
             for record in records:
                 label = f"{record['name']} · {record['created'][11:19]}"
                 combo.addItem(label, record["path"])
-            index = combo.findData(active_path) if combo == self.editor.history else 0
+            path = active_path if combo == self.editor.history else comparison_path
+            index = combo.findData(path)
             combo.setCurrentIndex(max(0, index))
             combo.blockSignals(False)
 
@@ -638,11 +648,27 @@ class TorusWindow(QtWidgets.QMainWindow):
             self.source.setCurrentText("Numerical")
             self._set_quantity_availability()
         result = self.session.active
+        if self.session.comparison is not None:
+            comparison = self.session.comparison
+            try:
+                self.playback.comparison_indices(comparison)
+            except ValueError:
+                self._clear_comparison()
+            else:
+                self.session.set_comparison(comparison)
+        self.playback.clamp_to_timeline()
         self.scene.clear_analysis()
         self.scene.set_result(
             result, self.quantity.currentText(), self.session.current_index
         )
         self.scene.set_dose(self.session.dose)
+        if self.session.comparison is not None:
+            self.compare_scene.set_quantity(self.quantity.currentText())
+            self.compare_scene.plotter.camera = self.scene.plotter.camera
+            self._share_color_range()
+        self.compare_scene.setVisible(
+            self.session.view == "Compare" and self.session.comparison is not None
+        )
         self.badge.setText(
             "COUPLED MHD" if result.config.solver == "fenics" else "THERMAL BENCHMARK"
         )
@@ -668,29 +694,34 @@ class TorusWindow(QtWidgets.QMainWindow):
             f"Loaded {result.config.name} · accepted numerical snapshots"
         )
 
+    def _clear_comparison(self):
+        self.session.set_comparison(None)
+        if self.source.currentText() == "Run difference":
+            with QtCore.QSignalBlocker(self.source):
+                self.source.setCurrentText("Numerical")
+            self.session.source = "Numerical"
+        config = (
+            self.session.active.config
+            if self.session.active is not None
+            else self.compare_scene.config
+        )
+        self.compare_scene.preview(config)
+        self.compare_scene.hide()
+        self.scene.set_shared_color_range(None)
+        self.compare_scene.set_shared_color_range(None)
+
     def _compare_selected(self, index):
         path = self.editor.compare_history.itemData(index)
         if not path:
-            self.session.set_comparison(None)
-            if self.source.currentText() == "Run difference":
-                self.source.setCurrentText("Numerical")
-            self.compare_scene.hide()
+            self._clear_comparison()
             self._update_actions()
+            self.refresh_plots()
+            self._render()
             return
         try:
             comparison = self.store.load_run(path)
             if self.session.active is not None:
-                active_times = self.session.active.times
-                start = max(active_times[0], comparison.times[0])
-                end = min(active_times[-1], comparison.times[-1])
-                if start > end:
-                    raise ValueError(
-                        "The selected runs have no overlapping physical timeline."
-                    )
-                if not np.any((active_times >= start) & (active_times <= end)):
-                    raise ValueError(
-                        "The shared timeline contains no accepted active snapshot."
-                    )
+                self.playback.comparison_indices(comparison)
             self.session.set_comparison(comparison)
             self.compare_scene.set_result(
                 self.session.comparison, self.quantity.currentText()
@@ -704,6 +735,7 @@ class TorusWindow(QtWidgets.QMainWindow):
             self._share_color_range()
             self.set_view("Compare")
         except Exception as error:
+            self.refresh_history()
             self._notify(str(error), error=True)
 
     def _quantity_changed(self):
@@ -765,10 +797,16 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.playback.update_position()
         self.chart_panel.update_frame(selection)
         if self.session.view == "Compare" and self.session.comparison is not None:
+            _, indices = self.playback.comparison_indices(self.session.comparison)
             other = int(
-                np.argmin(
-                    np.abs(self.session.comparison.times - self.session.current_time)
-                )
+                indices[
+                    np.argmin(
+                        np.abs(
+                            self.session.comparison.times[indices]
+                            - self.session.current_time
+                        )
+                    )
+                ]
             )
             self.compare_scene.update_index(other)
 

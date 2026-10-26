@@ -223,6 +223,100 @@ class WorkspaceFeatureTests(unittest.TestCase):
         self.assertIs(self.window.session.active, active)
         self.assertIn("no accepted active snapshot", self.window.message.text())
 
+    def test_overlap_without_comparison_snapshot_restores_prior_history_selection(self):
+        self.activate(accepted_run("middle-active", (0.4, 0.5, 0.6)))
+        previous_path = self.select_comparison(
+            accepted_run("previous-middle-comparison", (0.4, 0.5, 0.6))
+        )
+        self.window.source.setCurrentText("Run difference")
+        previous = self.window.session.comparison
+        difference = self.window.session.comparison_difference
+        self.select_comparison(accepted_run("outside-snapshots", (0.3, 0.7)))
+        self.assertIs(self.window.session.comparison, previous)
+        self.assertIs(self.window.session.comparison_difference, difference)
+        self.assertEqual(self.window.source.currentText(), "Run difference")
+        self.assertEqual(
+            self.window.editor.compare_history.currentData(), str(previous_path)
+        )
+        self.assertIn("no accepted comparison snapshot", self.window.message.text())
+
+    def test_comparison_scene_chooses_nearest_snapshot_within_the_shared_interval(self):
+        self.activate(accepted_run("narrow-active", (0.4, 0.5, 0.6)))
+        self.select_comparison(accepted_run("wider-comparison", (0.39, 0.59, 1.0)))
+        self.assertEqual(self.window.session.current_time, 0.4)
+        self.assertEqual(self.window.compare_scene.index, 1)
+        self.window.playback.seek_time(0.6)
+        self.assertEqual(self.window.compare_scene.index, 1)
+
+    def test_reactivation_revalidates_comparison_clamps_and_rebuilds_difference(self):
+        comparison_path = self.select_comparison(
+            accepted_run("retained-comparison", (0.55, 0.6, 1.6), shift=2.0)
+        )
+        previous = self.window.session.comparison
+        self.window.source.setCurrentText("Run difference")
+        camera = np.asarray(list(self.window.scene.plotter.camera_position))
+        new = accepted_run("coarse-new-active", (0.0, 1.5, 2.0), shift=5.0)
+        self.activate(new)
+        self.assertIs(self.window.session.comparison, previous)
+        self.assertEqual(self.window.session.current_time, 1.5)
+        self.assertEqual(self.window.playback._play_position, 1.5)
+        self.assertEqual(self.window.scene.index, 1)
+        self.assertEqual(self.window.playback.time_label.text(), "t = 1.5 s")
+        self.assertEqual(self.window.source.currentText(), "Numerical")
+        np.testing.assert_allclose(
+            self.window.session.comparison_difference["temperature"][1], 3.0
+        )
+        self.assertEqual(
+            self.window.editor.compare_history.currentData(), str(comparison_path)
+        )
+        np.testing.assert_allclose(
+            list(self.window.scene.plotter.camera_position), camera
+        )
+        self.assertEqual(
+            self.window.scene.color_range(), self.window.compare_scene.color_range()
+        )
+        self.assertFalse(self.window.compare_scene.isHidden())
+
+    def test_reactivation_clears_comparison_when_either_run_lacks_a_shared_snapshot(
+        self,
+    ):
+        for name, comparison_times, new_times in (
+            ("no-overlap", (0.4, 0.5, 0.6), (1.0, 1.5, 2.0)),
+            ("no-active-snapshot", (0.4, 0.5, 0.6), (0.0, 2.0)),
+            ("no-comparison-snapshot", (0.3, 0.7), (0.4, 0.5, 0.6)),
+        ):
+            with self.subTest(case=name):
+                self.activate(accepted_run("original-" + name))
+                self.select_comparison(
+                    accepted_run("comparison-" + name, comparison_times)
+                )
+                self.window.source.setCurrentText("Run difference")
+                new = accepted_run("new-" + name, new_times, shift=10.0)
+                camera = np.asarray(list(self.window.scene.plotter.camera_position))
+                self.activate(new)
+                self.assertIsNone(self.window.session.comparison)
+                self.assertIsNone(self.window.session.comparison_difference)
+                self.assertIsNone(self.window.compare_scene.result)
+                self.assertTrue(self.window.compare_scene.isHidden())
+                self.assertEqual(self.window.session.source, "Numerical")
+                self.assertEqual(self.window.source.currentText(), "Numerical")
+                self.assertIsNone(self.window.editor.compare_history.currentData())
+                self.assertFalse(self.window.source.model().item(3).isEnabled())
+                self.assertEqual(
+                    self.window.scene.index, self.window.session.current_index
+                )
+                self.assertEqual(
+                    self.window.playback._play_position,
+                    self.window.session.current_time,
+                )
+                values = new.fields["temperature"][:, :4]
+                np.testing.assert_allclose(
+                    self.window.scene.color_range(), [values.min(), values.max()]
+                )
+                np.testing.assert_allclose(
+                    list(self.window.scene.plotter.camera_position), camera
+                )
+
     def test_reactivation_preserves_camera_physical_time_probe_overlays_and_chart_zoom(
         self,
     ):

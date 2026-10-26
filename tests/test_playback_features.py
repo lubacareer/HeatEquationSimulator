@@ -153,6 +153,29 @@ class PlaybackFeatureTests(unittest.TestCase):
         self.controller.clamp_to_timeline()
         self.assertEqual(self.frames, [])
 
+    def test_comparison_indices_require_accepted_snapshots_from_both_runs(self):
+        self.session.activate(accepted_run("middle", (0.4, 0.5, 0.6)), "middle.h5")
+        active, other = self.controller.comparison_indices(
+            accepted_run("valid", (0.39, 0.59, 1.0))
+        )
+        np.testing.assert_array_equal(active, [0, 1, 2])
+        np.testing.assert_array_equal(other, [1])
+        active, other = self.controller.comparison_indices(
+            accepted_run("endpoint", (0.6, 0.8))
+        )
+        np.testing.assert_array_equal(active, [2])
+        np.testing.assert_array_equal(other, [0])
+        for times, message in (
+            ((0.3, 0.7), "no accepted comparison snapshot"),
+            ((0.41, 0.49), "no accepted active snapshot"),
+            ((0.7, 0.8), "no overlapping physical timeline"),
+        ):
+            with self.subTest(times=times), self.assertRaisesRegex(ValueError, message):
+                self.controller.comparison_indices(accepted_run("invalid", times))
+        self.session.active = None
+        with self.assertRaisesRegex(ValueError, "Load an active run"):
+            self.controller.comparison_indices(accepted_run("no-active"))
+
     def test_particle_and_thermal_playback_pause_each_other(self):
         self.session.trajectories = {"snapshot_index": 2}
         self.controller.toggle_play()

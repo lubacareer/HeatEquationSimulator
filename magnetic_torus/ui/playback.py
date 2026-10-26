@@ -83,6 +83,25 @@ class PlaybackController(QtWidgets.QFrame):
             & (result.times <= self.session.timeline_end())
         )
 
+    def comparison_indices(self, comparison):
+        """Require accepted snapshots from both runs in their shared interval."""
+        active = self.session.active
+        if active is None:
+            raise ValueError("Load an active run before comparing snapshots.")
+        start = max(active.times[0], comparison.times[0])
+        end = min(active.times[-1], comparison.times[-1])
+        if start > end:
+            raise ValueError("The selected runs have no overlapping physical timeline.")
+        indices = []
+        for name, result in (("active", active), ("comparison", comparison)):
+            accepted = np.flatnonzero((result.times >= start) & (result.times <= end))
+            if not len(accepted):
+                raise ValueError(
+                    f"The shared timeline contains no accepted {name} snapshot."
+                )
+            indices.append(accepted)
+        return tuple(indices)
+
     def clamp_to_timeline(self):
         """Align state and playback time without requesting a recursive render."""
         indices = self._timeline_indices()
