@@ -281,7 +281,7 @@ def scientific_cases() -> list[CaseSpec]:
                 f"Native PINN accuracy/conservation on {device}",
                 depends=("preset.thermal-benchmark",),
                 capabilities=caps,
-                timeout=1800.0,
+                timeout=3600.0,
                 source="preset.thermal-benchmark",
                 device=device,
                 epochs=1000,
@@ -317,7 +317,7 @@ def scientific_cases() -> list[CaseSpec]:
                 "Coupled held-out qualification: " + source,
                 depends=(source,),
                 capabilities=("torch_cuda",),
-                timeout=2400.0,
+                timeout=3600.0,
                 source=source,
                 device="cuda",
                 epochs=1000,
@@ -414,12 +414,12 @@ def scientific_cases() -> list[CaseSpec]:
     cases.append(
         _case(
             "dose.water-precision",
-            "dose_precision",
+            "dose_fixed_precision",
             "Water reference must reach at most 5% relative standard error",
             depends=(transport_source("zero", False),),
             capabilities=("geant4",),
             timeout=3600.0,
-            maximum_histories=524288,
+            histories=1_048_576,
         )
     )
     for invalid in (

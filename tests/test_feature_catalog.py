@@ -156,8 +156,15 @@ class FeatureCatalogTests(unittest.TestCase):
         self.assertEqual(self.by_id["feature.native_pinn"].parameters["epochs"], 1000)
         self.assertEqual(self.by_id["feature.coupled_pinn"].parameters["epochs"], 250)
         self.assertEqual(
-            self.by_id["feature.dose_water"].parameters["histories"], 524288
+            self.by_id["feature.dose_water"].parameters["histories"], 1_048_576
         )
+        self.assertEqual(
+            self.by_id["feature.dose_water"].parameters["action"],
+            "dose_fixed_precision",
+        )
+        self.assertEqual(self.by_id["feature.dose_water"].timeout, 1800.0)
+        for name in ("feature.native_pinn", "feature.coupled_pinn"):
+            self.assertEqual(self.by_id[name].timeout, 600.0)
         anatomy = self.by_id["feature.dose_anatomy"].parameters
         self.assertEqual(
             (
@@ -356,10 +363,25 @@ class FixedWaterPrecisionTests(unittest.TestCase):
         source = RunResult(
             "zero-source", config, np.array([0.0, 0.02]), np.zeros((1, 3)), {}, {}, {}
         )
-        for dose, error, passed in (
-            (1.0, 0.04, True),
-            (1.0, 0.06, False),
-            (0.0, 0.0, False),
+        features, _ = all_cases(ROOT, profile="features")
+        cases = {
+            "features": next(
+                case for case in features if case.id == "feature.dose_water"
+            ),
+            "full": next(
+                case for case in scientific_cases() if case.id == "dose.water-precision"
+            ),
+        }
+        for profile, dose, error, passed in (
+            (profile, dose, error, passed)
+            for profile in cases
+            for dose, error, passed in (
+                (1.0, 0.04, True),
+                (1.0, 0.05, True),
+                (1.0, 0.050855404763649886, False),
+                (1.0, 0.06, False),
+                (0.0, 0.0, False),
+            )
         ):
             calls = []
 
@@ -386,15 +408,11 @@ class FixedWaterPrecisionTests(unittest.TestCase):
                 )
 
             with (
-                self.subTest(dose=dose, error=error),
+                self.subTest(profile=profile, dose=dose, error=error),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 checks = scientific.Checks()
-                parameters = {
-                    "action": "dose_fixed_precision",
-                    "histories": 524288,
-                    "source_case": "feature.zero_field",
-                }
+                parameters = dict(cases[profile].parameters)
                 with (
                     patch.object(scientific, "_radiation_source", return_value=source),
                     patch(
@@ -411,14 +429,77 @@ class FixedWaterPrecisionTests(unittest.TestCase):
                         lambda *_: None,
                         threading.Event(),
                     )
-                self.assertEqual(calls, [524288])
+                self.assertEqual(calls, [1_048_576])
                 self.assertEqual(len(metrics["attempts"]), 1)
+                self.assertEqual(metrics["attempts"][0]["histories"], 1_048_576)
+                self.assertEqual(
+                    metrics["configuration"]["radiation_histories"], 1_048_576
+                )
+                self.assertEqual(metrics["seed"], config.seed)
                 self.assertTrue(Path(artifacts["dose_path"]).is_file())
                 self.assertEqual(not checks.failed, passed, checks.records)
                 self.assertEqual(
                     scientific.HANDLERS["dose_fixed_precision"],
                     scientific._dose_reference,
                 )
+
+    def test_both_profiles_keep_the_same_zero_field_geometry_and_incident_source(self):
+        features, _ = all_cases(ROOT, profile="features")
+        feature = {case.id: case for case in features}
+        full = {case.id: case for case in scientific_cases()}
+        configurations = (
+            scientific._config(feature["feature.zero_field"].parameters),
+            scientific._config(full["fe.transport.zero.vacuum"].parameters),
+        )
+        self.assertEqual(configurations[0].to_dict(), configurations[1].to_dict())
+        for case, config in (
+            (feature["feature.dose_water"], configurations[0]),
+            (full["dose.water-precision"], configurations[1]),
+        ):
+            with self.subTest(case=case.id), tempfile.TemporaryDirectory() as directory:
+                source = RunResult(
+                    "accepted-zero",
+                    config,
+                    np.array([0.0, 0.02]),
+                    np.zeros((1, 3)),
+                    {},
+                    {},
+                    {},
+                )
+                parameters = {
+                    **case.parameters,
+                    "field": "zero",
+                    "ground": False,
+                    "species": "proton",
+                    "energy": 100.0,
+                    "source": "beam",
+                    "target": "water",
+                    "physics_list": "Shielding",
+                }
+                with patch.object(scientific, "_load_dependency", return_value=source):
+                    observer = scientific._radiation_source(
+                        {"parameters": parameters}, parameters, Path(directory)
+                    )
+                self.assertEqual(
+                    observer.config.physics_hash, source.config.physics_hash
+                )
+                self.assertEqual(observer.metadata["reused_fields_from"], source.run_id)
+                self.assertEqual(
+                    (
+                        observer.config.seed,
+                        observer.config.ground_enabled,
+                        observer.config.source_kind,
+                        observer.config.target,
+                        observer.config.particle_z,
+                        observer.config.particle_a,
+                        observer.config.particle_energy_mev_nucleon,
+                        observer.config.transport_physics_list,
+                        observer.config.incident_fluence_m2,
+                    ),
+                    (42, False, "beam", "water", 1, 1, 100.0, "Shielding", 1.0),
+                )
+                self.assertEqual(observer.config.radiation_histories, 1_048_576)
+                self.assertEqual(source.config, config)
 
 
 if __name__ == "__main__":

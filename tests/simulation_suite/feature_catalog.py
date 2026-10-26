@@ -90,7 +90,7 @@ _PROVIDER_PARAMETERS = {
     "feature.dose_water": {
         "action": "dose_fixed_precision",
         "source_case": "feature.zero_field",
-        "histories": 524288,
+        "histories": 1_048_576,
     },
     "native.reference": {"action": "references"},
     "fe.references": {"action": "fe_references"},
@@ -279,7 +279,7 @@ def feature_cases() -> list[CaseSpec]:
             "dose_fixed_precision",
             "One fixed water ensemble; measured relative standard error must be at most 5%",
             source_case="feature.zero_field",
-            histories=524288,
+            histories=1_048_576,
             depends=("feature.zero_field",),
             capabilities=("geant4",),
             timeout=1800,

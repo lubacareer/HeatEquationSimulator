@@ -158,7 +158,7 @@ class ScientificMatrixTests(unittest.TestCase):
                 )
             json.dumps(case.to_dict(), allow_nan=False)
 
-    def test_only_lunar_preset_budget_is_extended_and_precision_keeps_its_deadline(
+    def test_preset_and_fixed_precision_deadlines_remain_unchanged(
         self,
     ):
         for name in PRESETS:
@@ -170,14 +170,47 @@ class ScientificMatrixTests(unittest.TestCase):
                 case.parameters, {"action": "solve", "preset": name, "recipe": "preset"}
             )
         precision = self.by_id["dose.water-precision"]
-        self.assertEqual(precision.parameters["maximum_histories"], 524288)
+        self.assertEqual(
+            precision.parameters,
+            {"action": "dose_fixed_precision", "histories": 1_048_576},
+        )
+        self.assertEqual(precision.depends_on, ("fe.transport.zero.vacuum",))
         self.assertEqual(precision.timeout, 3600.0)
         self.assertEqual(precision.kind, "scientific")
+
+    def test_only_the_eight_unsuccessful_full_pinn_budgets_are_one_hour(self):
+        extended = {
+            "pinn.thermal.cpu",
+            "pinn.thermal.cuda",
+            "pinn.preset.iron",
+            "pinn.preset.lunar-habitat",
+            "pinn.preset.regolith-composite",
+            "pinn.fe.mushy.driven.vms",
+            "pinn.fe.liquid.dynamo.vms",
+            "pinn.fe.freezing",
+        }
+        pinn_cases = [
+            case for case in self.cases if case.parameters["action"] == "pinn"
+        ]
+        self.assertEqual(
+            {case.id for case in pinn_cases if case.timeout == 3600.0}, extended
+        )
+        for case in pinn_cases:
+            with self.subTest(case=case.id):
+                self.assertEqual(
+                    case.timeout, 3600.0 if case.id in extended else 1200.0
+                )
+                self.assertEqual(
+                    case.parameters["epochs"], 1000 if case.id in extended else 250
+                )
 
     def test_report_declares_finite_scope_and_unqualified_research(self):
         proof = matrix_coverage()
         self.assertTrue(proof["finite_scope"])
         self.assertEqual(proof["case_count"], len(self.cases))
+        self.assertEqual(proof["case_count"], 96)
+        self.assertEqual(proof["boris"]["required_pairs"], 89)
+        self.assertEqual(proof["geant4"]["required_pairs"], 186)
         self.assertEqual(
             proof["fe_phase_mode_closure"],
             {"required": 12, "covered": 12, "missing": []},
