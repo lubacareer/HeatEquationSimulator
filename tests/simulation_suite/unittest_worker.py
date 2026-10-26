@@ -35,7 +35,7 @@ def main() -> int:
 
         tests = unittest.TestSuite(remaining(tests))
     result = unittest.TextTestRunner(verbosity=2).run(tests)
-    missing = bool(result.skipped) and request.get("profile") == "full"
+    missing = bool(result.skipped) and request.get("profile") in {"features", "full"}
     status = (
         "PASS" if result.wasSuccessful() and not missing and result.testsRun else "FAIL"
     )
@@ -62,9 +62,7 @@ def main() -> int:
     if not result.testsRun:
         data["reason"] = "No tests were discovered; this module is not covered."
     elif missing:
-        data["reason"] = (
-            "Required full-profile tests were skipped; see skipped records."
-        )
+        data["reason"] = "Required profile tests were skipped; see skipped records."
     elif not result.wasSuccessful():
         data["reason"] = "Unittest failures/errors; see the case log and tracebacks."
     args.result.write_text(json.dumps(data, indent=2), encoding="utf-8")

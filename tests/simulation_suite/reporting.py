@@ -8,7 +8,9 @@ import json
 from pathlib import Path
 
 
-def summarize(results: list[dict], *, full_coverage: bool) -> dict:
+def summarize(
+    results: list[dict], *, full_coverage: bool, feature_coverage: bool = False
+) -> dict:
     counts = dict(Counter(item.get("status", "ERROR") for item in results))
     passed = bool(results) and all(
         item.get("status") == "PASS"
@@ -22,8 +24,33 @@ def summarize(results: list[dict], *, full_coverage: bool) -> dict:
         "counts": counts,
         "selected_cases": len(results),
         "full_coverage": bool(full_coverage and passed),
+        "feature_coverage": bool(feature_coverage and passed),
         "selection_passed": passed,
     }
+
+
+def mark_stopped(report: dict, *, reason: str) -> None:
+    """An invocation stop never manufactures a failed scientific qualification."""
+    report["stop_reason"] = reason
+    report["interrupted"] = reason == "user"
+    report["budget_exhausted"] = reason == "budget"
+    completed = {
+        item["id"]
+        for item in report.get("results", [])
+        if item.get("status") not in {"NOT_RUN", "INTERRUPTED"}
+    }
+    report["pending_case_ids"] = [
+        item["id"] for item in report.get("manifest", []) if item["id"] not in completed
+    ]
+    summary = summarize(
+        report.get("results", []), full_coverage=False, feature_coverage=False
+    )
+    summary.update(
+        status="BUDGET_EXHAUSTED" if reason == "budget" else "FAIL",
+        selection_passed=False,
+        pending_cases=len(report["pending_case_ids"]),
+    )
+    report["summary"] = summary
 
 
 def render_html(report: dict) -> str:
@@ -61,7 +88,10 @@ pre{white-space:pre-wrap}code{overflow-wrap:anywhere}th{background:#eef3f6}
 </style><h1>Magnetic Torus test report</h1>""" + (
         f"<p>Status: <strong>{esc(summary.get('status', 'RUNNING'))}</strong>. "
         f"Full coverage passed: {esc(summary.get('full_coverage', False))}. "
+        f"Feature coverage passed: {esc(summary.get('feature_coverage', False))}. "
         f"Profile: {esc(report.get('profile', ''))}.</p>"
+        f"<p>Stop reason: {esc(report.get('stop_reason') or 'none')}. "
+        f"Pending cases: {esc(', '.join(report.get('pending_case_ids', [])) or 'none')}.</p>"
         f"<p>Run: <code>{esc(report.get('run_dir', ''))}</code>. Commit: "
         f"<code>{esc(report.get('revision', ''))}</code>.</p>"
         f"<p>Non-passing cases: {esc(', '.join(failures) or 'none recorded')}.</p>"

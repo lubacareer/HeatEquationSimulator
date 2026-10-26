@@ -110,10 +110,12 @@ class OwnedProcessGroup:
                 pass
 
 
-def stop_owned_wsl(case_dir: Path) -> str | None:
+def stop_owned_wsl(case_dir: Path, *, timeout: float = 10.0) -> str | None:
     """Last resort: target only same-user Linux commands carrying this case path."""
     if os.name != "nt" or not case_dir.drive:
         return None
+    if timeout <= 0:
+        return "No invocation cleanup time remains for WSL confirmation."
     root = (
         "/mnt/"
         + case_dir.drive[0].lower()
@@ -147,7 +149,7 @@ print('Owned WSL processes terminated:', len(targets))
             input=code,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout,
             encoding="utf-8",
             errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW,

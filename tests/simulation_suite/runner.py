@@ -21,7 +21,8 @@ import threading
 import time
 import traceback
 
-from .reporting import summarize, write_reports
+from .reporting import mark_stopped, summarize, write_reports
+from .budget import InvocationStopped
 from .processes import OwnedProcessGroup, stop_owned_wsl
 from .spec import CaseSpec
 
@@ -55,11 +56,17 @@ def software_versions() -> dict:
     }
 
 
-def _sha(path: Path) -> str:
+def _sha(path: Path, budget=None) -> str:
     digest = hashlib.sha256()
+    if budget is not None:
+        budget.poll()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
+            if budget is not None:
+                budget.poll()
             digest.update(block)
+    if budget is not None:
+        budget.poll()
     return digest.hexdigest()
 
 
@@ -69,18 +76,20 @@ def _inside(path: Path, root: Path) -> Path:
     return resolved
 
 
-def _artifact_hash(path: Path, run_dir: Path) -> str:
+def _artifact_hash(path: Path, run_dir: Path, budget=None) -> str:
+    if budget is not None:
+        budget.poll()
     resolved = _inside(path, run_dir)
     if not resolved.exists():
         raise FileNotFoundError(resolved)
     if resolved.is_file():
-        return _sha(resolved)
+        return _sha(resolved, budget)
     digest = hashlib.sha256()
     for file in sorted(resolved.rglob("*")):
         if file.is_file():
             _inside(file, run_dir)
             digest.update(file.relative_to(resolved).as_posix().encode())
-            digest.update(_sha(file).encode())
+            digest.update(_sha(file, budget).encode())
     return digest.hexdigest()
 
 
@@ -89,7 +98,10 @@ def case_fingerprint(
     root: Path,
     capabilities: dict,
     dependency_results: dict | None = None,
+    budget=None,
 ) -> str:
+    if budget is not None:
+        budget.poll()
     files = {}
     patterns = case.dependencies or (
         "magnetic_torus/**/*.py",
@@ -98,11 +110,11 @@ def case_fingerprint(
     for name in ("runner.py", "processes.py", "spec.py", "unittest_worker.py"):
         path = root / "tests" / "simulation_suite" / name
         if path.is_file():
-            files[path.relative_to(root).as_posix()] = _sha(path)
+            files[path.relative_to(root).as_posix()] = _sha(path, budget)
     for pattern in patterns:
         for path in sorted(root.glob(pattern)):
             if path.is_file():
-                files[path.relative_to(root).as_posix()] = _sha(path)
+                files[path.relative_to(root).as_posix()] = _sha(path, budget)
     payload = {
         "case": case.to_dict(),
         "files": files,
@@ -126,6 +138,8 @@ def case_fingerprint(
             for key, value in (dependency_results or {}).items()
         },
     }
+    if budget is not None:
+        budget.poll()
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -149,7 +163,11 @@ def _failed_dependencies(case: CaseSpec, parents: dict) -> list[str]:
     ]
 
 
-def reusable_result(result: dict, expected_fingerprint: str, run_dir: Path) -> bool:
+def reusable_result(
+    result: dict, expected_fingerprint: str, run_dir: Path, budget=None
+) -> bool:
+    if budget is not None:
+        budget.poll()
     if not _passes_gates(result) or result.get("fingerprint") != expected_fingerprint:
         return False
     try:
@@ -166,7 +184,7 @@ def reusable_result(result: dict, expected_fingerprint: str, run_dir: Path) -> b
         if set(artifacts.values()) != set(result.get("artifact_hashes", {})):
             return False
         for path, digest in result.get("artifact_hashes", {}).items():
-            if _artifact_hash(Path(path), run_dir) != digest:
+            if _artifact_hash(Path(path), run_dir, budget) != digest:
                 return False
     except (OSError, ValueError, KeyError, TypeError):
         return False
@@ -186,7 +204,7 @@ def _environment(case_dir: Path, profile: str) -> dict[str, str]:
         "QT_API": "pyqt6",
     }
     for name in ("TORUS_TEST_DESKTOP", "TORUS_TEST_FENICS", "TORUS_TEST_GEANT4"):
-        environment[name] = "1" if profile == "full" else "0"
+        environment[name] = "1" if profile in {"features", "full"} else "0"
     temporary = case_dir / "tmp"
     temporary.mkdir()
     for name in ("TMP", "TEMP", "TMPDIR"):
@@ -199,9 +217,17 @@ def _environment(case_dir: Path, profile: str) -> dict[str, str]:
 
 
 def _stop_owned_process(
-    process: subprocess.Popen, case_dir: Path, *, external: bool
+    process: subprocess.Popen, case_dir: Path, *, external: bool, budget=None
 ) -> list[str]:
     notes = []
+
+    def timeout(seconds):
+        return (
+            max(0.001, min(seconds, budget.remaining_seconds(hard=True)))
+            if budget is not None
+            else seconds
+        )
+
     (case_dir / "cancel").touch()
     for request in case_dir.rglob("request.json"):
         try:
@@ -212,12 +238,12 @@ def _stop_owned_process(
         except (OSError, ValueError):
             pass
     try:
-        process.wait(timeout=15 if external else 1)
+        process.wait(timeout=timeout(15 if external else 1))
         return notes
     except subprocess.TimeoutExpired:
         pass
     if external:
-        note = stop_owned_wsl(case_dir)
+        note = stop_owned_wsl(case_dir, timeout=timeout(10))
         if note:
             notes.append(note)
     if os.name == "nt":
@@ -225,7 +251,7 @@ def _stop_owned_process(
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 capture_output=True,
-                timeout=10,
+                timeout=timeout(10),
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
         except (OSError, subprocess.SubprocessError) as error:
@@ -236,7 +262,7 @@ def _stop_owned_process(
         except ProcessLookupError:
             pass
     try:
-        process.wait(timeout=3)
+        process.wait(timeout=timeout(3))
     except subprocess.TimeoutExpired:
         if os.name != "nt":
             try:
@@ -246,7 +272,7 @@ def _stop_owned_process(
         else:
             process.kill()
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=timeout(5))
         except subprocess.TimeoutExpired:
             notes.append("The owned child did not acknowledge forced termination.")
     return notes
@@ -332,6 +358,7 @@ def run_case(
     dependency_results: dict | None = None,
     profile: str = "full",
     stop_event: threading.Event | None = None,
+    budget=None,
 ) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", case.id):
         raise ValueError("Case IDs must be safe directory names.")
@@ -344,7 +371,7 @@ def run_case(
         raise ValueError("Case timeouts must be finite and positive.")
     stop = stop_event or threading.Event()
     parents = dependency_results or {}
-    fingerprint = case_fingerprint(case, root, capabilities, parents)
+    fingerprint = case_fingerprint(case, root, capabilities, parents, budget=budget)
     result = {
         "id": case.id,
         "category": case.category,
@@ -407,6 +434,9 @@ def run_case(
     (case_dir / "request.json").write_text(
         json.dumps(request, indent=2), encoding="utf-8"
     )
+    if budget is not None:
+        budget.poll()
+        budget.register_owned_path(case_dir)
     substitutions = {
         "python": sys.executable,
         "root": str(root),
@@ -458,11 +488,22 @@ def run_case(
             reader.start()
             while process.poll() is None:
                 interrupted = stop.is_set()
+                stop_reason = "user" if interrupted else None
+                if budget is not None:
+                    try:
+                        budget.poll()
+                    except InvocationStopped as stopped:
+                        interrupted = True
+                        stop_reason = stopped.reason
                 if interrupted or time.monotonic() - started > case.timeout:
                     result.update(
                         status="INTERRUPTED" if interrupted else "TIMEOUT",
                         execution="FAIL",
-                        reason="User interrupted the run."
+                        reason=(
+                            "Invocation time budget exhausted."
+                            if stop_reason == "budget"
+                            else "User interrupted the run."
+                        )
                         if interrupted
                         else f"Case exceeded {case.timeout:g} seconds.",
                     )
@@ -473,7 +514,10 @@ def run_case(
                             name in case.capabilities
                             for name in ("fenics", "geant4", "torch_cpu", "torch_cuda")
                         ),
+                        budget=budget,
                     )
+                    if stop_reason is not None:
+                        result["stop_reason"] = stop_reason
                     break
                 time.sleep(0.1)
             reader.join(timeout=3)
@@ -494,7 +538,7 @@ def run_case(
             stop.set()
             if process is not None:
                 result["cleanup_notes"] = _stop_owned_process(
-                    process, case_dir, external=True
+                    process, case_dir, external=True, budget=budget
                 )
             result.update(
                 status="INTERRUPTED",
@@ -504,7 +548,7 @@ def run_case(
         except Exception as error:
             if process is not None and process.poll() is None:
                 result["cleanup_notes"] = _stop_owned_process(
-                    process, case_dir, external=True
+                    process, case_dir, external=True, budget=budget
                 )
             result.update(status="ERROR", execution="FAIL", reason=str(error))
             log.write(traceback.format_exc())
@@ -527,7 +571,9 @@ def run_case(
         for value in result.get("artifacts", {}).values():
             if not isinstance(value, str):
                 raise ValueError("Case artifact paths must be strings.")
-            result["artifact_hashes"][value] = _artifact_hash(Path(value), run_dir)
+            result["artifact_hashes"][value] = _artifact_hash(
+                Path(value), run_dir, budget
+            )
     except (OSError, ValueError) as error:
         result.update(
             status="ERROR",
@@ -562,6 +608,7 @@ def execute(
     previous: dict | None = None,
     full_selection: bool = True,
     stop_event: threading.Event | None = None,
+    budget=None,
 ) -> dict:
     stop = stop_event or threading.Event()
     old = {
@@ -581,66 +628,97 @@ def execute(
         "manifest": [case.to_dict() for case in cases],
         "results": results,
         "retained_results": list(old.values()),
+        "pending_case_ids": [case.id for case in cases],
+        "coverage_scope": profile,
         "software": software_versions(),
     }
+    stop_reason = None
+    if budget is not None:
+        try:
+            budget.poll()
+        except InvocationStopped as stopped:
+            stop_reason = stopped.reason
     try:
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=10,
+        revision = (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=max(0.001, min(10.0, budget.remaining_seconds()))
+                if budget is not None
+                else 10,
+            )
+            if stop_reason is None
+            else None
         )
         report["revision"] = (
-            revision.stdout.strip() if revision.returncode == 0 else "unknown"
+            revision.stdout.strip()
+            if revision is not None and revision.returncode == 0
+            else "unknown"
         )
     except (OSError, subprocess.SubprocessError):
         report["revision"] = "unknown"
     write_reports(run_dir, report)
     for index, case in enumerate(cases, 1):
+        if stop_reason is not None:
+            break
         print(f"\n[{index}/{len(cases)}] {case.id}: {case.description}", flush=True)
         parents = {key: by_id[key] for key in case.depends_on if key in by_id}
-        fingerprint = case_fingerprint(case, root, capabilities, parents)
-        cached = old.get(case.id, {})
-        available = all(
-            capabilities.get(name, {}).get("available") for name in case.capabilities
-        )
-        if (
-            available
-            and not _failed_dependencies(case, parents)
-            and reusable_result(cached, fingerprint, run_dir)
-        ):
-            result = {**cached, "reused": True}
-        else:
-            try:
-                result = run_case(
-                    case,
-                    root=root,
-                    run_dir=run_dir,
-                    capabilities=capabilities,
-                    dependency_results=parents,
-                    profile=profile,
-                    stop_event=stop,
-                )
-            except Exception as error:
-                result = {
-                    "id": case.id,
-                    "category": case.category,
-                    "kind": case.kind,
-                    "status": "ERROR",
-                    "execution": "FAIL",
-                    "qualification": "NOT_RUN",
-                    "reason": f"Runner setup failed: {error}",
-                    "metrics": {},
-                    "artifacts": {},
-                    "elapsed_s": 0.0,
-                    "fingerprint": fingerprint,
-                }
+        try:
+            if budget is not None:
+                budget.poll()
+            fingerprint = case_fingerprint(
+                case, root, capabilities, parents, budget=budget
+            )
+            cached = old.get(case.id, {})
+            available = all(
+                capabilities.get(name, {}).get("available")
+                for name in case.capabilities
+            )
+            if (
+                available
+                and not _failed_dependencies(case, parents)
+                and reusable_result(cached, fingerprint, run_dir, budget=budget)
+            ):
+                result = {**cached, "reused": True}
+            else:
+                try:
+                    result = run_case(
+                        case,
+                        root=root,
+                        run_dir=run_dir,
+                        capabilities=capabilities,
+                        dependency_results=parents,
+                        profile=profile,
+                        stop_event=stop,
+                        budget=budget,
+                    )
+                except InvocationStopped:
+                    raise
+                except Exception as error:
+                    result = {
+                        "id": case.id,
+                        "category": case.category,
+                        "kind": case.kind,
+                        "status": "ERROR",
+                        "execution": "FAIL",
+                        "qualification": "NOT_RUN",
+                        "reason": f"Runner setup failed: {error}",
+                        "metrics": {},
+                        "artifacts": {},
+                        "elapsed_s": 0.0,
+                        "fingerprint": fingerprint,
+                    }
+        except InvocationStopped as stopped:
+            stop_reason = stopped.reason
+            break
         by_id[case.id] = result
         results.append(result)
         report["retained_results"] = [
             item for item in report["retained_results"] if item.get("id") != case.id
         ]
+        report["pending_case_ids"] = [item.id for item in cases if item.id not in by_id]
         print(
             f"  {result['status']} ({result['elapsed_s']:.1f}s) {result.get('reason', '')}",
             flush=True,
@@ -650,12 +728,21 @@ def execute(
             full_coverage=False,
         )
         report["summary"].update(status="RUNNING", selection_passed=False)
+        if budget is not None:
+            report["invocation_budget"] = budget.report_fields()
+            stop_reason = budget.stop_reason
         write_reports(run_dir, report)
     report["finished_at"] = datetime.now(timezone.utc).isoformat()
     report["interrupted"] = stop.is_set()
-    matrix = coverage.get("scientific_matrix", {})
-    matrix_complete = profile != "full" or matrix.get("complete", False)
-    if full_selection and profile == "full" and not matrix_complete:
+    matrix_key = "feature_matrix" if profile == "features" else "scientific_matrix"
+    matrix = coverage.get(matrix_key, {})
+    matrix_complete = profile == "fast" or matrix.get("complete", False)
+    if (
+        full_selection
+        and profile in {"features", "full"}
+        and not matrix_complete
+        and stop_reason is None
+    ):
         results.append(
             {
                 "id": "coverage.integrity",
@@ -667,12 +754,15 @@ def execute(
             }
         )
     report["summary"] = summarize(
-        results, full_coverage=profile == "full" and full_selection and matrix_complete
+        results,
+        full_coverage=profile == "full" and full_selection and matrix_complete,
+        feature_coverage=profile == "features" and full_selection and matrix_complete,
     )
-    if stop.is_set():
-        report["summary"].update(
-            status="FAIL", selection_passed=False, full_coverage=False
-        )
+    if budget is not None:
+        report["invocation_budget"] = budget.report_fields()
+        stop_reason = stop_reason or budget.stop_reason
+    if stop_reason is not None or stop.is_set():
+        mark_stopped(report, reason=stop_reason or "user")
     write_reports(run_dir, report)
     return report
 

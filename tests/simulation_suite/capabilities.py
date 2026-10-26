@@ -13,9 +13,93 @@ import json
 import os
 import subprocess
 import sys
+import time
 from typing import Any
 
-from magnetic_torus.backend_environment import wsl_distribution
+from magnetic_torus.backend_environment import wsl_distribution, wsl_path
+from .budget import InvocationInterrupted
+
+
+def _probe_poll(budget, stop_event):
+    if budget is not None:
+        budget.poll()
+    elif stop_event is not None and stop_event.is_set():
+        raise InvocationInterrupted()
+
+
+def _owned_probe(command, *, timeout, input_text, budget, stop_event):
+    from .processes import OwnedProcessGroup, stop_owned_wsl
+
+    _probe_poll(budget, stop_event)
+    deadline = time.monotonic() + timeout
+    if budget is not None:
+        deadline = min(deadline, budget.work_deadline)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        )
+        if os.name == "nt"
+        else 0,
+        start_new_session=os.name != "nt",
+    )
+    owner = None
+    try:
+        owner = OwnedProcessGroup(process)
+        payload = input_text
+        while True:
+            _probe_poll(budget, stop_event)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _probe_poll(budget, stop_event)
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(
+                    input=payload, timeout=min(0.1, remaining)
+                )
+                _probe_poll(budget, stop_event)
+                return subprocess.CompletedProcess(
+                    command, process.returncode, stdout, stderr
+                )
+            except subprocess.TimeoutExpired:
+                payload = None
+    finally:
+        if process.poll() is None:
+            if (
+                budget is not None
+                and budget.preflight_token is not None
+                and command[0] == "wsl"
+            ):
+                stop_owned_wsl(
+                    budget.preflight_token,
+                    timeout=min(5.0, max(0.001, budget.remaining_seconds(hard=True))),
+                )
+            if owner is not None:
+                owner.close()
+            if process.poll() is None:
+                process.kill()
+            try:
+                process.wait(
+                    timeout=min(2.0, max(0.001, budget.remaining_seconds(hard=True)))
+                    if budget is not None
+                    else 2.0
+                )
+            except subprocess.TimeoutExpired:
+                pass
+        if owner is not None:
+            owner.close()
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def _record(
@@ -30,18 +114,33 @@ def _record(
 
 
 def _run_json(
-    command: list[str], *, timeout: float = 60.0, input_text: str | None = None
+    command: list[str],
+    *,
+    timeout: float = 60.0,
+    input_text: str | None = None,
+    budget=None,
+    stop_event=None,
 ) -> tuple[dict[str, Any] | None, str]:
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            input=input_text,
-            timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        completed = (
+            _owned_probe(
+                command,
+                timeout=timeout,
+                input_text=input_text,
+                budget=budget,
+                stop_event=stop_event,
+            )
+            if budget is not None or stop_event is not None
+            else subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                input=input_text,
+                timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
         )
     except subprocess.TimeoutExpired:
         return None, f"Capability probe exceeded {timeout:g} seconds."
@@ -295,7 +394,7 @@ def _backend_command(*, interpreter: str = "/usr/bin/python3") -> list[str]:
     return [interpreter, "-"]
 
 
-def detect_capabilities() -> dict[str, dict[str, Any]]:
+def detect_capabilities(*, budget=None, stop_event=None) -> dict[str, dict[str, Any]]:
     """Check every required runtime without mutating user runs or environments."""
     versions = {"python": sys.version.split()[0]}
     for package in (
@@ -308,31 +407,53 @@ def detect_capabilities() -> dict[str, dict[str, Any]]:
         "pyvistaqt",
         "vtk",
     ):
+        _probe_poll(budget, stop_event)
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = "not installed"
     caps = {}
-    desktop, error = _run_json([sys.executable, "-B", "-c", _DESKTOP_PROBE])
+    options = (
+        {"budget": budget, "stop_event": stop_event}
+        if budget is not None or stop_event is not None
+        else {}
+    )
+    desktop, error = _run_json([sys.executable, "-B", "-c", _DESKTOP_PROBE], **options)
     caps["desktop"] = desktop or _record(False, error)
-    torch, error = _run_json([sys.executable, "-B", "-c", _TORCH_PROBE])
+    torch, error = _run_json([sys.executable, "-B", "-c", _TORCH_PROBE], **options)
     for name in ("torch_cpu", "torch_cuda"):
         caps[name] = (
             torch.get(name, _record(False, "Torch probe omitted " + name))
             if torch
             else _record(False, error)
         )
+    preflight_tag = []
+    if budget is not None and budget.preflight_token is not None:
+        budget.register_preflight()
+        token = budget.preflight_token / "probe"
+        preflight_tag = [wsl_path(token) if os.name == "nt" else str(token)]
     fenics, error = _run_json(
-        _backend_command(
-            interpreter=os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3"),
-        ),
+        [
+            *_backend_command(
+                interpreter=os.environ.get(
+                    "MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3"
+                ),
+            ),
+            *preflight_tag,
+        ],
         input_text=_FENICS_PROBE,
+        **options,
     )
     caps["fenics"] = fenics or _record(False, error)
     transport, error = _run_json(
-        [*_backend_command(), os.environ.get("TORUS_GEANT4_WORKER", "")],
+        [
+            *_backend_command(),
+            os.environ.get("TORUS_GEANT4_WORKER", ""),
+            *preflight_tag,
+        ],
         timeout=60.0,
         input_text=_TRANSPORT_PROBE,
+        **options,
     )
     for name in ("geant4", "icrp110"):
         caps[name] = (
@@ -341,6 +462,7 @@ def detect_capabilities() -> dict[str, dict[str, Any]]:
             else _record(False, error)
         )
     for cap in caps.values():
+        _probe_poll(budget, stop_event)
         cap.setdefault("versions", {})
         cap["versions"] = {**versions, **cap["versions"]}
         cap.setdefault("details", {})
