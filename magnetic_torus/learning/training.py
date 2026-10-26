@@ -21,6 +21,21 @@ from .fields import (FORMAT_VERSION, STEFAN_BOLTZMANN, FieldScaling, ThermalOper
                      regularized_enthalpy_to_state_torch, validate_pinn_source)
 from .validation import validate_prediction
 
+_HOST_TRAINING_CACHE_BYTES = 64 * 1024 ** 2
+_FULL_LABEL_BATCH_SIZE = 4096
+
+
+@dataclass(frozen=True)
+class _FixedTrainingCache:
+    targets: np.ndarray
+    training_rows: np.ndarray
+    points: np.ndarray
+    times: np.ndarray
+
+    @property
+    def nbytes(self) -> int:
+        return sum(array.nbytes for array in (self.targets, self.training_rows, self.points, self.times))
+
 
 @dataclass(frozen=True)
 class TrainingData:
@@ -34,6 +49,7 @@ class TrainingData:
     validation_ids: np.ndarray
     scaling: FieldScaling
     reference: np.ndarray
+    cache: _FixedTrainingCache | None = None
 
     @property
     def config(self) -> ScenarioConfig:
@@ -50,6 +66,32 @@ class TrainingData:
     @property
     def output_width(self) -> int:
         return self.reference.shape[2]
+
+
+def _fixed_training_cache(result: RunResult, scaling: FieldScaling, reference: np.ndarray,
+                          train_ids: np.ndarray, byte_limit: int,
+                          cancel: threading.Event | None = None) -> _FixedTrainingCache | None:
+    nt, nn, width = reference.shape
+    required = (len(train_ids) * width + nt * nn + nn * 3 + nt) * 8
+    if required > byte_limit:
+        return None
+    targets = np.empty((len(train_ids), width), dtype=np.float64)
+    for start in range(0, len(train_ids), _FULL_LABEL_BATCH_SIZE):
+        if cancel is not None:
+            _cancelled(cancel)
+        ids = train_ids[start:start + _FULL_LABEL_BATCH_SIZE]
+        ti, pi = np.divmod(ids, nn)
+        np.divide(reference[ti, pi] - scaling.offsets, scaling.scales,
+                  out=targets[start:start + len(ids)])
+    if cancel is not None:
+        _cancelled(cancel)
+    rows = np.full(nt * nn, -1, dtype=np.int64)
+    rows[train_ids] = np.arange(len(train_ids), dtype=np.int64)
+    points = np.asarray(result.points / (result.config.major_radius + result.config.minor_radius), dtype=np.float64)
+    times = np.asarray((result.times - float(result.times[0])) / float(result.times[-1] - result.times[0]), dtype=np.float64)
+    for array in (targets, rows, points, times):
+        array.setflags(write=False)
+    return _FixedTrainingCache(targets, rows, points, times)
 
 
 @dataclass
@@ -70,15 +112,20 @@ class NeuralField:
     toroidal_thermal_inputs: bool
     coupled_trial: np.ndarray | None
     coupled_free: np.ndarray
+    full_label_batch_size: int = _FULL_LABEL_BATCH_SIZE
 
     def input_at(self, time_ids: np.ndarray, point_ids: np.ndarray, *, grad: bool = False) -> Any:
         data = self.data
         result = data.result
-        coordinate = np.column_stack((result.points[point_ids] / self.length_scale,
-                                       (result.times[time_ids] - self.start_time) / self.time_scale))
+        if data.cache is None:
+            coordinate = np.column_stack((result.points[point_ids] / self.length_scale,
+                                           (result.times[time_ids] - self.start_time) / self.time_scale))
+        else:
+            coordinate = np.column_stack((data.cache.points[point_ids], data.cache.times[time_ids]))
         return self.torch.tensor(coordinate, requires_grad=grad, **self.kw)
 
-    def forward(self, inputs: Any, point_ids: np.ndarray | None = None, time_ids: np.ndarray | None = None) -> Any:
+    def forward(self, inputs: Any, point_ids: np.ndarray | None = None, time_ids: np.ndarray | None = None,
+                *, forward_batch_size: int | None = None) -> Any:
         data = self.data
         config = data.config
         operator = data.operator
@@ -109,7 +156,10 @@ class NeuralField:
             # elliptic fields. A time-only Fourier basis avoids asking a
             # low-frequency tanh network to smooth those changes away.
             network_inputs = torch.cat((network_inputs, torch.sin(phase), torch.cos(phase)), dim=1)
-        correction = torch.cat([self.model(chunk) for chunk in network_inputs.split(self.maximum_batch)], dim=0)
+        batch_size = self.maximum_batch if forward_batch_size is None else forward_batch_size
+        if not 1 <= batch_size <= _FULL_LABEL_BATCH_SIZE:
+            raise ValueError("Neural forward batches must contain between 1 and 4096 samples.")
+        correction = torch.cat([self.model(chunk) for chunk in network_inputs.split(batch_size)], dim=0)
         if not data.thermal:
             assert self.coupled_trial is not None
             if point_ids is None or time_ids is None:
@@ -194,14 +244,23 @@ class TrainingLosses:
             validity[ti == 0] = False
         return validity
 
-    def errors_at(self, ids: np.ndarray, *, training: bool = False) -> tuple[Any, np.ndarray]:
+    def errors_at(self, ids: np.ndarray, *, training: bool = False,
+                  forward_batch_size: int | None = None) -> tuple[Any, np.ndarray]:
         field = self.field
         data = field.data
         scaling = data.scaling
         ti, pi = np.divmod(ids, data.point_count)
-        target = field.torch.as_tensor((data.reference[ti, pi] - scaling.offsets) / scaling.scales, **field.kw)
+        if training and data.cache is not None:
+            rows = data.cache.training_rows[ids]
+            if np.any(rows < 0):
+                raise ValueError("A held-out label cannot enter the training-target cache.")
+            normalized = data.cache.targets[rows]
+        else:
+            normalized = (data.reference[ti, pi] - scaling.offsets) / scaling.scales
+        target = field.torch.as_tensor(normalized, **field.kw)
         validity = self.validity_at(ids, training=training)
-        return (field.forward(field.input_at(ti, pi), pi, ti) - target).square(), validity
+        return (field.forward(field.input_at(ti, pi), pi, ti,
+                              forward_batch_size=forward_batch_size) - target).square(), validity
 
     def _label_loss(self, errors: Any, validity: np.ndarray, counts: np.ndarray | None = None) -> Any:
         field = self.field
@@ -247,15 +306,17 @@ class TrainingLosses:
         """Accumulate a full training-label mean while releasing each batch graph."""
         field, data = self.field, self.field.data
         total = field.torch.zeros((), **field.kw)
-        for offset in range(0, len(data.train_ids), field.maximum_batch):
+        for offset in range(0, len(data.train_ids), field.full_label_batch_size):
             _cancelled(self.cancel)
-            ids = data.train_ids[offset:offset + field.maximum_batch]
-            loss = self._label_loss(*self.errors_at(ids, training=True), counts=self.training_counts)
-            if not bool(field.torch.isfinite(loss)):
-                raise FloatingPointError("PINN training-label objective became non-finite.")
+            ids = data.train_ids[offset:offset + field.full_label_batch_size]
+            loss = self._label_loss(*self.errors_at(ids, training=True,
+                forward_batch_size=field.full_label_batch_size), counts=self.training_counts)
             if backward:
                 loss.backward()
             total += loss.detach()
+            _cancelled(self.cancel)
+        if not bool(field.torch.isfinite(total)):
+            raise FloatingPointError("PINN training-label objective became non-finite.")
         return total
 
     def validation_loss(self) -> float:
@@ -263,7 +324,7 @@ class TrainingLosses:
         data = field.data
         scaling = data.scaling
         torch = field.torch
-        totals = np.zeros(len(scaling.names))
+        totals = torch.zeros(len(scaling.names), **field.kw)
         counts = np.zeros(len(scaling.names), dtype=np.int64)
         with torch.no_grad():
             for offset in range(0, len(data.validation_ids), field.maximum_batch):
@@ -272,13 +333,16 @@ class TrainingLosses:
                 errors, validity = self.errors_at(ids)
                 valid_tensor = torch.as_tensor(validity, **field.kw)
                 column = 0
+                sums = []
                 for field_index, field_width in enumerate(scaling.widths):
                     counts[field_index] += int(validity[:, column:column + field_width].sum())
-                    totals[field_index] += float((errors[:, column:column + field_width] *
-                        valid_tensor[:, column:column + field_width]).sum().item())
+                    sums.append((errors[:, column:column + field_width] *
+                                 valid_tensor[:, column:column + field_width]).sum())
                     column += field_width
+                totals += torch.stack(sums)
+        host_totals = totals.cpu().numpy()
         valid_fields = counts > 0
-        return float(np.mean(totals[valid_fields] / counts[valid_fields]))
+        return float(np.mean(host_totals[valid_fields] / counts[valid_fields]))
 
     def thermal_physics(self, ti: int | None = None, centers: np.ndarray | None = None) -> tuple[Any, Any]:
         field = self.field
@@ -395,7 +459,8 @@ def _prepare_data(result: RunResult, cancel: threading.Event) -> TrainingData:
     reference = scaling.references(result)
     if thermal and not np.allclose(reference[0, :, 0], reference[0, 0, 0], rtol=1e-12, atol=1e-9):
         raise UnsupportedPINNConfiguration("The thermal PINN trial function requires the benchmark's uniform initial enthalpy.")
-    return TrainingData(result, thermal, operator, weak, rng, train_ids, validation_ids, scaling, reference)
+    cache = _fixed_training_cache(result, scaling, reference, train_ids, _HOST_TRAINING_CACHE_BYTES, cancel)
+    return TrainingData(result, thermal, operator, weak, rng, train_ids, validation_ids, scaling, reference, cache)
 
 
 def _prepare_training(data: TrainingData, progress: Progress, cancel: threading.Event,
@@ -488,7 +553,13 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
         "physics": result.metadata["pinn_physics"]["kind"] if data.thermal else "coupled_fe_weak_operator",
         "turbulence": bool(config.turbulence), "device": str(field.device), "torch_version": str(field.torch.__version__),
         "seed": config.seed, "training_samples": int(len(data.train_ids)),
-        "heldout_samples": int(len(data.validation_ids)), "max_forward_batch": field.maximum_batch,
+        "heldout_samples": int(len(data.validation_ids)),
+        "max_forward_batch": max(field.maximum_batch, field.full_label_batch_size),
+        "stochastic_label_batch_size": field.maximum_batch,
+        "full_label_batch_size": field.full_label_batch_size,
+        "host_training_cache_bytes": data.cache.nbytes if data.cache is not None else 0,
+        "host_training_cache_limit_bytes": _HOST_TRAINING_CACHE_BYTES,
+        "host_training_cache_scope": "training targets and fixed coordinates only; streaming fallback above limit",
         "heldout_split": "disjoint seeded point-time labels; physics collocation may use the same locations",
         "normalization_fitted_on": "training labels only",
         "data_loss_aggregation": "mean of per-field free-DOF MSE; stratified training labels; prescribed initial/Dirichlet labels excluded from training only",
