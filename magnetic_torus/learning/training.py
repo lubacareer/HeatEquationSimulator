@@ -347,6 +347,21 @@ class TrainingLosses:
         return float(np.mean(host_totals[valid_fields] / counts[valid_fields]))
 
     def thermal_physics(self, ti: int | None = None, centers: np.ndarray | None = None) -> tuple[Any, Any]:
+        data = self.field.data
+        ti = int(data.rng.integers(1, data.snapshot_count)) if ti is None else ti
+        centers = (data.rng.choice(data.point_count, min(self.field.maximum_batch, data.point_count), replace=False)
+                   if centers is None else centers)
+        terms = self.thermal_components(ti, centers)
+        boundary = terms["initial_error"].square().mean()
+        return terms["residual"].square().mean(), boundary
+
+    def thermal_components(self, ti: int, centers: np.ndarray) -> dict[str, Any]:
+        """Return local accepted-interval residuals at unique source nodes.
+
+        The residual is the same conservative backward-Euler equation used by
+        the reference. Research samplers may inspect detached values without
+        reading numerical labels or replacing this discrete operator.
+        """
         field = self.field
         data = field.data
         config = data.config
@@ -359,10 +374,11 @@ class TrainingLosses:
         # Match the reference's accepted backward-Euler interval exactly. A
         # continuous-time strong residual would conflict with coarse reference
         # snapshots merely because of numerical temporal truncation error.
-        ti = int(data.rng.integers(1, data.snapshot_count)) if ti is None else ti
         physical_time = float((result.times[ti - 1] + result.times[ti]) / 2)
-        centers = (data.rng.choice(data.point_count, min(field.maximum_batch, data.point_count), replace=False)
-                   if centers is None else centers)
+        centers = np.asarray(centers, dtype=np.int64)
+        if (centers.ndim != 1 or not len(centers) or len(np.unique(centers)) != len(centers)
+                or np.any(centers < 0) or np.any(centers >= data.point_count)):
+            raise ValueError("Thermal residual centers must be nonempty unique source-node indices.")
         support, positions, edge_indices, edge_values = operator.neighborhood(centers)
         pair_points = np.tile(support, 2)
         pair_times = np.repeat(np.asarray([ti - 1, ti]), len(support))
@@ -392,8 +408,9 @@ class TrainingLosses:
         initial = field.predict(field.input_at(np.zeros(len(centers), dtype=np.int64), centers), centers,
                            np.zeros(len(centers), dtype=np.int64),
                            forward_batch_size=_FULL_LABEL_BATCH_SIZE)["enthalpy"]
-        boundary = ((initial - torch.as_tensor(data.reference[0, centers, 0], **kw)) / scaling.scales[0]).square().mean()
-        return residual.square().mean(), boundary
+        initial_error = (initial - torch.as_tensor(data.reference[0, centers, 0], **kw)) / scaling.scales[0]
+        fraction = fields["liquid_fraction"].reshape(2, len(support))[1, positions]
+        return {"residual": residual, "initial_error": initial_error, "liquid_fraction": fraction}
 
     def coupled_components(self, ti: int) -> Mapping[str, Any]:
         field = self.field
