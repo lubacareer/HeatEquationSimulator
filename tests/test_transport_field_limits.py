@@ -80,6 +80,11 @@ class TransportFailureDiagnosticTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch.object(geant4, "frozen_field", return_value=field),
+                patch.object(
+                    geant4,
+                    "_geant4_command",
+                    return_value=["torus-dose-run", "request.json"],
+                ),
                 patch.object(geant4.subprocess, "Popen", side_effect=failed_worker),
             ):
                 with self.assertRaises(RuntimeError) as error:
