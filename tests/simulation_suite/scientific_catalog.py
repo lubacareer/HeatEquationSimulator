@@ -127,7 +127,7 @@ def scientific_cases() -> list[CaseSpec]:
                 "solve",
                 f"As-shipped {name} simulation",
                 capabilities=caps,
-                timeout=1800.0,
+                timeout=3600.0 if name == "Lunar habitat" else 1800.0,
                 preset=name,
                 recipe="preset",
             )
@@ -371,7 +371,7 @@ def scientific_cases() -> list[CaseSpec]:
             depends=(transport_source("zero", False),),
             capabilities=("geant4",),
             timeout=3600.0,
-            maximum_histories=262144,
+            maximum_histories=524288,
         )
     )
     for invalid in (

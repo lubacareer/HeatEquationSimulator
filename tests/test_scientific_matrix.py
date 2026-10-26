@@ -158,6 +158,22 @@ class ScientificMatrixTests(unittest.TestCase):
                 )
             json.dumps(case.to_dict(), allow_nan=False)
 
+    def test_only_lunar_preset_budget_is_extended_and_precision_keeps_its_deadline(
+        self,
+    ):
+        for name in PRESETS:
+            case = self.by_id["preset." + name.lower().replace(" ", "-")]
+            self.assertEqual(
+                case.timeout, 3600.0 if name == "Lunar habitat" else 1800.0
+            )
+            self.assertEqual(
+                case.parameters, {"action": "solve", "preset": name, "recipe": "preset"}
+            )
+        precision = self.by_id["dose.water-precision"]
+        self.assertEqual(precision.parameters["maximum_histories"], 524288)
+        self.assertEqual(precision.timeout, 3600.0)
+        self.assertEqual(precision.kind, "scientific")
+
     def test_report_declares_finite_scope_and_unqualified_research(self):
         proof = matrix_coverage()
         self.assertTrue(proof["finite_scope"])

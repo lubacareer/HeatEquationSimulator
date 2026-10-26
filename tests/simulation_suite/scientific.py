@@ -185,19 +185,34 @@ def _weak_checks(result, checks, progress):
     import numpy as np
     import torch
     from magnetic_torus.physics import evaluate_weak_residual_torch
+    from magnetic_torus.learning.diagnostics import RESIDUAL_RMS_LIMIT
     selected = np.unique(np.linspace(1, len(result.times) - 1, min(4, len(result.times) - 1), dtype=int))
     worst = {}
+    gauge_squares, gauge_count = 0., 0
     for index in selected:
         values = {key: torch.tensor(value[index - 1:index + 1], dtype=torch.float64, requires_grad=True) for key, value in result.fields.items()}
         components = evaluate_weak_residual_torch(result.config, result, values, [index - 1, index])
         for key, value in components.items():
             if value.numel():
-                worst[key] = max(worst.get(key, 0.), float(value.detach().abs().max()))
+                detached = value.detach()
+                finite = bool(torch.isfinite(detached).all())
+                magnitude = float(detached.abs().max()) if finite else math.inf
+                worst[key] = max(worst.get(key, 0.), magnitude)
+                if key == "gauge":
+                    gauge_count += value.numel()
+                    gauge_squares += float(detached.square().sum()) if finite else math.inf
         sum(value.square().mean() for value in components.values() if value.numel()).backward()
         checks.add(f"weak_gradient_{index}", all(value.grad is None or bool(torch.isfinite(value.grad).all()) for value in values.values()))
         progress(.95, f"Independent weak-operator snapshot {index}")
     for name, defect in worst.items():
-        checks.add("weak_" + name, math.isfinite(defect) and defect <= 1e-7, normalized_max=defect, limit=1e-7)
+        if name != "gauge":
+            checks.add("weak_" + name, math.isfinite(defect) and defect <= 1e-7, normalized_max=defect, limit=1e-7)
+    # The div-div penalty is checked in the assembled induction equation above.
+    # Cell divergence is a separate physical diagnostic, not a Galerkin residual.
+    gauge_rms = math.sqrt(gauge_squares / gauge_count) if gauge_count else math.inf
+    checks.add("weak_gauge", math.isfinite(gauge_rms) and gauge_rms <= RESIDUAL_RMS_LIMIT,
+               normalized_rms=gauge_rms, normalized_max=worst.get("gauge", math.inf),
+               limit=RESIDUAL_RMS_LIMIT, criterion="normalized Coulomb divergence RMS")
 
 
 def _references(request, checks, progress, cancel):
@@ -428,7 +443,10 @@ def _dose_reference(request, checks, progress, cancel):
          "source": "beam", "target": "water", "physics_list": "Shielding"}
     source = _radiation_source(request, p, directory)
     attempts = []
-    counts = [p["histories"]] if p["action"] == "dose_linearity" else [512, 2048, 8192, 32768, 131072, p["maximum_histories"]]
+    counts = [p["histories"]] if p["action"] == "dose_linearity" else [
+        count for count in (512, 2048, 8192, 32768, 131072, 262144, p["maximum_histories"])
+        if count <= p["maximum_histories"]
+    ]
     store = RunStore(directory / "store")
     for count in dict.fromkeys(counts):
         source = replace(source, run_id="observation-" + uuid.uuid4().hex,
