@@ -92,6 +92,8 @@ Training method version 5 adds a fixed native physics warmup and, when training-
 
 Training can fail its validation gates. Failed models remain inspectable and labelled failed. **PINN-sourced** radiation requires a passed model with the originating scenario and full global A prediction. Numerical FE fields can supply radiation analyses without training a PINN. Agreement with a numerical source does not independently qualify that source's physics.
 
+Nine bounded research pilots tried front/residual sampling, causal weighting, time FiLM, temporal potential correction and label-gradient balancing. A Lunar potential correction reduced that field's normalized error from 0.6405 to 0.00000585, but every whole-model pilot still failed its original accuracy/conservation gates. The disabled desktop modes remain disabled. The separate research command, measured comparisons and limitations are documented in [docs/PINN_EXPERIMENTS.md](docs/PINN_EXPERIMENTS.md).
+
 ### Geant4 and ICRP110 targets
 
 ```powershell

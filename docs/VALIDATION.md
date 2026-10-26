@@ -236,6 +236,29 @@ resolution-8 five-repeat benchmark. Evidence:
 The complete one-hour representative invocation and enlarged water ensemble
 remain pending; these short checks do not replace them.
 
+## Bounded proposal experiments: 2026-10-26
+
+Nine real pilots on saved accepted sources tried front/residual sampling, cached
+causal weighting, time FiLM, a temporal potential branch, and inverse
+label-gradient balancing. All completed; all still failed whole-model
+qualification under the original gates. Native front + causal reduced enthalpy
+normalized RMSE from 0.8051 to 0.7511, still above 0.1. Lunar FiLM + causal
+reduced pressure error from 0.6072 to 0.4622 but worsened conservation; Iron
+label-gradient balancing worsened pressure/potential error.
+
+The temporal Lunar potential branch reduced phi normalized RMSE from 0.64046 to
+0.00000584837 without changing reference labels or the FE gauge. The other
+fields were frozen; continuity RMS 0.8604, charge RMS 1.5266 and physics loss
+0.38385 still failed. This component improvement does not qualify Lunar or
+enable PINN radiation. No disabled desktop training mode was re-enabled.
+
+See [PINN_EXPERIMENTS.md](PINN_EXPERIMENTS.md) for protocol differences,
+training-only adaptation, source/checkpoint hashes, timings and the private
+research command. Evidence and comparison images are under
+`.cache/pinn-proposal-research/`. These short single-seed pilots do not replace
+canonical full-profile replay, the enlarged water run, or the existing release
+gates. The original completed full report and accepted sources were preserved.
+
 ## Release gates still open
 
 - Full coupled manufactured-solution convergence and published MHD Taylor–Green comparison for the adapted A–phi mixed VMS closure.

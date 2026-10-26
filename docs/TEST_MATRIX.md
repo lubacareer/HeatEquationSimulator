@@ -54,7 +54,7 @@ The earlier 125-case run had 94 passes, 16 failures, five errors, one timeout, a
 
 Desktop PINN training is restricted to single-phase native thermal sources and stationary coupled sources. Phase-changing thermal and time-varying coupled training are disabled in the normal workspace with a visible reason; numerical solves and saved PINN inspection remain available. The full profile deliberately retains the original research accuracy cases for those disabled modes. They are not deleted, skip-passed, or converted into successful qualification. Consequently, full research coverage can still fail while the representative enabled-feature profile passes.
 
-The current catalog contains **136 full-profile cases**: 96 scientific/simulation cases, 36 isolated regression modules, two isolated FE regression methods, a desktop journey, and a performance benchmark. The representative profile contains **55 cases**: the same 36 regression modules, 17 scientific/reference/rejection cases, and the two desktop cases. Counts update automatically as regression modules are added; the historical 129-case report predates the newer regressions. Inspect the executable catalog without starting workers:
+The current catalog contains **142 full-profile cases**: 96 scientific/simulation cases, 42 isolated regression modules, two isolated FE regression methods, a desktop journey, and a performance benchmark. The representative profile contains **61 cases**: the same 42 regression modules, 17 scientific/reference/rejection cases, and the two desktop cases. Counts update automatically as regression modules are added; the historical 129-case report predates the newer regressions. Inspect the executable catalog without starting workers:
 
 ```powershell
 conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --list
@@ -101,6 +101,8 @@ Method version 5 adds fixed native data warmup and physics-ramp phases within pr
 Short regressions and diagnostic pilots do not replace the canonical accuracy/conservation cases. Qualification of the new method for the eight previously unsuccessful full-profile PINNs, and the new fixed water precision ensemble, remains pending.
 
 Training progress identifies Adam batch losses versus deterministic refinement losses and gives the epoch of the latest held-out evaluation. Held-out loss is measured every ten epochs and retained between checks. Repeated rounded values alone do not establish a stall; step/recovery diagnostics distinguish unchanged parameters from applied updates. A stationary optimizer is not evidence that the scientific qualification gates passed.
+
+The separate [bounded research experiments](PINN_EXPERIMENTS.md) add sampling, causal weighting, time modulation and gauge-correction regressions. Their nine real pilots all remain whole-model scientific failures; these experimental strategies are not selected by the normal trainer or substituted for canonical suite cases. Research final audits restore the original source residual oracle and keep all accuracy limits.
 
 Finite-map radiation transport validates physical-world and primary containment before enabling its field path. Nonzero fields use a propagation-step cap derived from actual accepted-mesh clearance; out-of-map queries remain fatal and report their coordinates. Exactly zero maps use ordinary transportation for both paired ensembles after the same validation, with no approximate-zero threshold. Dose metadata records the map clearance, integration mode, step limit, and actual field-query diagnostics.
 
