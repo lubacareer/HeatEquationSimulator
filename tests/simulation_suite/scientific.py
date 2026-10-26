@@ -529,6 +529,24 @@ HANDLERS = {"solve": _solve, "references": _references, "fe_references": _fe_ref
             "boris": _boris, "dose": _dose, "dose_precision": _dose_reference, "dose_linearity": _dose_reference, "invalid": _invalid}
 
 
+def _json_safe(value):
+    """Retain nonfinite diagnostic evidence without emitting invalid JSON."""
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    from magnetic_torus.store import json_default
+    return _json_safe(json_default(value))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request", type=Path, required=True)
@@ -570,10 +588,10 @@ def main(argv=None):
     finally:
         finished.set()
     result["elapsed_s"] = time.monotonic() - start
-    from magnetic_torus.store import json_default
+    result = _json_safe(result)
     args.result.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.result.with_suffix(".partial")
-    temporary.write_text(json.dumps(result, indent=2, default=json_default, allow_nan=False), encoding="utf-8")
+    temporary.write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
     os.replace(temporary, args.result)
     print(json.dumps({"status": result["status"], "reason": result["reason"], "elapsed_s": result["elapsed_s"]}), flush=True)
     return exit_code

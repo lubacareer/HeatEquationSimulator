@@ -32,6 +32,8 @@ conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --
 
 The pairwise generator has stable tie-breaking. Coverage is checked against the actual executable cases, including missing enum levels, missing pairs, presets, all 12 MHD triples, and CPU/CUDA problem combinations. Removing required rows fails the coverage proof. Numeric values outside the listed discrete radiation energies receive validation/boundary tests; this is not an exhaustive test of every continuous scenario or every multiway interaction.
 
+Comparison selection and result reactivation require accepted snapshots from both runs in the shared time interval. Loading a new active run revalidates the retained comparison, clears it when invalid, and clamps playback before display. The MP4 smoke check records the resize frame count and requires capture to continue afterward, in addition to decoding every frame at the expected dimensions.
+
 Functional transport rows use small samples to exercise interactions and report their actual uncertainty. They do not claim 5% dose precision. The separate water precision gate increases histories up to 262,144 and requires a nonzero score with relative standard error ≤5%; zero hits fail. Anatomical rows test execution/scoring across targets, not independent anatomical dosimetry qualification. Coupled PINN accuracy remains a required scientific gate even if later functional rejection tests pass.
 
 Dependent training and transport require passing source cases: execution must pass, and scientific parents must also pass qualification. A failed or incomplete prerequisite makes its dependents `BLOCKED` before starting work or reusing a cached result. Negative tests construct their rejected inputs from passing prerequisites, so expected rejection coverage remains independent.
@@ -57,6 +59,8 @@ Each invocation creates `.cache/test-suite/<UTC timestamp>/` with:
 - `report.json` and escaped `report.html`, updated after each case, including execution status separately from scientific qualification, versions/capabilities, configuration/seed/metrics, coverage, and artifact hashes.
 - `cases/<case ID>/attempt-0001/` containing the exact request, live `output.log`, structured worker result, runner result, and case-specific fields/checkpoints/exports. Reruns create another attempt.
 - `.cache/test-suite/latest/report.json` and `report.html`, copies of the latest finished report. Resume the original timestamp directory so its artifacts remain available.
+
+Non-finite scientific evidence is recorded as the explicit strings `NaN`, `Infinity`, or `-Infinity`, including nested metrics and failed checks. Structured results remain strict JSON; these representations do not change scientific pass/fail decisions.
 
 The terminal prints the exact report directory and resume command. To rerun only selected cases (including their prerequisites):
 
