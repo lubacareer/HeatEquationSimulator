@@ -12,6 +12,7 @@ os.environ.setdefault("QT_API", "pyqt6")
 from PyQt6 import QtCore, QtGui, QtWidgets
 from .jobs import JobController
 from .learning.diagnostics import failed_checks, validation_message
+from .learning.support import pinn_training_unavailable_reason
 from .models import preset
 from .scene import QUANTITIES, SceneWidget, SceneOptions
 from .store import RunStore
@@ -34,6 +35,8 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.store = RunStore(data_dir)
         self.jobs = JobController(self.store, self)
         self.session = WorkspaceSession()
+        self._pinn_support_result = None
+        self._pinn_support_reason = None
         self._build()
         self.exports = ExportController(
             self.session,
@@ -340,6 +343,10 @@ class TorusWindow(QtWidgets.QMainWindow):
             config = self.editor.read_config()
             if action != "simulate" and self.session.active is None:
                 raise ValueError("Run a simulation first.")
+            if action == "pinn":
+                reason = self._pinn_training_unavailable_reason()
+                if reason is not None:
+                    raise ValueError(reason)
             self.playback.stop_all()
             pinn_path = None
             if action in {"dose", "trace"} and self.source.currentIndex():
@@ -395,8 +402,18 @@ class TorusWindow(QtWidgets.QMainWindow):
             valid_draft = False
         self.editor.run_button.setEnabled(not busy and valid_draft)
         has_result = self.session.active is not None
+        training_reason = self._pinn_training_unavailable_reason()
+        self.editor.train_button.setEnabled(
+            has_result and not busy and training_reason is None
+        )
+        self.editor.train_button.setToolTip(
+            training_reason or "Train a PINN for the accepted simulation."
+        )
+        self.editor.training_unavailable_label.setText(training_reason or "")
+        self.editor.training_unavailable_label.setVisible(
+            has_result and training_reason is not None
+        )
         for control in (
-            self.editor.train_button,
             self.editor.trace_button,
             self.editor.dose_button,
         ):
@@ -410,6 +427,15 @@ class TorusWindow(QtWidgets.QMainWindow):
             self.session.comparison_difference is not None
             and self.session.view == "Compare"
         )
+
+    def _pinn_training_unavailable_reason(self):
+        result = self.session.active
+        if result is not self._pinn_support_result:
+            self._pinn_support_result = result
+            self._pinn_support_reason = (
+                pinn_training_unavailable_reason(result) if result is not None else None
+            )
+        return self._pinn_support_reason
 
     def _job_completed(self, event):
         try:
