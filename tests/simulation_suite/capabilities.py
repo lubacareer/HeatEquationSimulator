@@ -8,6 +8,7 @@ they never solve a physical scenario, install packages, or enter the main app.
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
 import json
 import os
 import subprocess
@@ -63,7 +64,50 @@ def _run_json(
     )
 
 
-_DESKTOP_PROBE = r"""
+def desktop_environment(app, window, plotter, *, include_window_state=False) -> dict:
+    """Describe the actual graphics context without importing Qt or VTK here."""
+    renderer = plotter.ren_win
+    opengl = {}
+    labels = {
+        "OpenGL vendor string": "opengl_vendor",
+        "OpenGL renderer string": "opengl_renderer",
+        "OpenGL version string": "opengl_version",
+    }
+    for line in (renderer.ReportCapabilities() or "").splitlines():
+        label, separator, value = line.partition(":")
+        if separator and label.strip() in labels:
+            opengl[labels[label.strip()]] = value.strip()
+    surface = window.screen() or app.primaryScreen()
+    geometry = list(surface.geometry().getRect()) if surface is not None else None
+    details = {
+        "qt_platform": app.platformName(),
+        "vtk_render_window_class": renderer.GetClassName(),
+        **{key: opengl.get(key, "unavailable") for key in labels.values()},
+        "screen": geometry[2:] if geometry is not None else None,
+        "screen_name": surface.name() if surface is not None else None,
+        "screen_geometry": geometry,
+        "device_pixel_ratio": float(surface.devicePixelRatio())
+        if surface is not None
+        else None,
+        "refresh_rate_hz": round(float(surface.refreshRate()), 3)
+        if surface is not None
+        else None,
+    }
+    if include_window_state:
+        details["render_size_px"] = [int(value) for value in plotter.window_size]
+        details["window_state"] = {
+            "visible": bool(window.isVisible()),
+            "minimized": bool(window.isMinimized()),
+            "active": bool(window.isActiveWindow()),
+        }
+    return details
+
+
+# The isolated probe and benchmark use the same metadata rules. Embed only this
+# pure helper, keeping graphics imports out of the orchestrator process.
+_DESKTOP_PROBE = (
+    inspect.getsource(desktop_environment)
+    + r"""
 import json, os
 import numpy as np
 from PyQt6 import QtCore, QtWidgets
@@ -89,15 +133,17 @@ try:
     pixels = plotter.screenshot(return_img=True)
     if pixels is None or pixels.ndim != 3 or min(pixels.shape[:2]) < 16 or np.ptp(pixels) == 0:
         raise RuntimeError('VTK did not produce a nonconstant rendered image.')
+    details = desktop_environment(app, window, plotter)
+    details['render_shape'] = list(pixels.shape)
     print(json.dumps({'available': True, 'reason': 'Qt screen and VTK render/readback succeeded.',
         'versions': {'qt': QtCore.QT_VERSION_STR, 'pyvista': pv.__version__, 'vtk': vtkVersion.GetVTKVersion()},
-        'details': {'qt_platform': app.platformName(), 'screen': [surface.size().width(), surface.size().height()],
-                    'render_shape': list(pixels.shape)}}))
+        'details': details}))
 finally:
     plotter.close()
     window.close()
     app.processEvents()
 """
+)
 
 _TORCH_PROBE = r"""
 import json, platform, torch
