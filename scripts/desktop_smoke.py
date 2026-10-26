@@ -215,21 +215,48 @@ try:
     timings.sort()
     median_fps = 1 / timings[len(timings) // 2]
     # A full-size annotated MP4 is encoded using the actual renderer.
-    window.exports.begin_movie_export(str(directory / "smoke.mp4"))
-    movie_size = tuple(window.exports._movie_size)
     resize_frame_counts = []
+    initial_raw_sizes = []
+    raw_frame_captures = []
+    real_screenshot = window.scene.plotter.screenshot
+
+    def observe_screenshot(*args, **kwargs):
+        starting = window.exports._starting
+        capturing_frame = window.exports.writer is not None and not starting
+        frame_index = window.exports._movie_position
+        after_resize = bool(resize_frame_counts)
+        image = real_screenshot(*args, **kwargs)
+        if image is not None:
+            raw_size = (int(image.shape[1]), int(image.shape[0]))
+            if starting:
+                initial_raw_sizes.append(raw_size)
+            elif capturing_frame:
+                raw_frame_captures.append(
+                    {
+                        "frame_index": frame_index,
+                        "raw_size": raw_size,
+                        "after_resize": after_resize,
+                    }
+                )
+        return image
 
     def resize_during_export():
         window.resize(1133, 731)
         resize_frame_counts.append(window.exports._movie_position)
 
-    QtCore.QTimer.singleShot(20, resize_during_export)
-    deadline = time.monotonic() + 60
-    while window.exports.writer is not None:
-        application.processEvents()
-        if time.monotonic() > deadline:
-            raise TimeoutError("Animation export timed out")
-        time.sleep(0.005)
+    window.scene.plotter.screenshot = observe_screenshot
+    try:
+        window.exports.begin_movie_export(str(directory / "smoke.mp4"))
+        movie_size = tuple(window.exports._movie_size)
+        QtCore.QTimer.singleShot(20, resize_during_export)
+        deadline = time.monotonic() + 60
+        while window.exports.writer is not None:
+            application.processEvents()
+            if time.monotonic() > deadline:
+                raise TimeoutError("Animation export timed out")
+            time.sleep(0.005)
+    finally:
+        window.scene.plotter.screenshot = real_screenshot
     export_frame_count = window.exports._movie_position
     _check(
         (directory / "smoke.mp4").stat().st_size > 1000,
@@ -258,6 +285,28 @@ try:
         "MP4 dimensions must match the encoder",
     )
     _check(encoded_frames >= 60, (encoded_frames, video_metadata))
+    _check(
+        bool(initial_raw_sizes), "Export startup must capture the real renderer size"
+    )
+    initial_raw_size = initial_raw_sizes[0]
+    resized_raw_capture = next(
+        (
+            capture
+            for capture in raw_frame_captures
+            if capture["after_resize"]
+            and resize_frame_count
+            <= capture["frame_index"]
+            < min(export_frame_count, encoded_frames)
+            and capture["raw_size"] != initial_raw_size
+            and capture["raw_size"] != movie_size
+        ),
+        None,
+    )
+    _check(
+        resized_raw_capture is not None,
+        "A successfully encoded post-resize frame must change raw renderer size "
+        f"and require resampling (initial={initial_raw_size}, encoder={movie_size})",
+    )
     window.editor.set_config(replace(window.session.active.config, particle_count=8))
     window.start_job("trace")
     wait_job()
@@ -327,6 +376,8 @@ try:
                 "resized_during_mp4": bool(resize_frame_counts),
                 "resize_frame_count": resize_frame_count,
                 "export_frame_count": export_frame_count,
+                "initial_raw_size": initial_raw_size,
+                "resized_raw_capture": resized_raw_capture,
             }
         ),
         flush=True,
