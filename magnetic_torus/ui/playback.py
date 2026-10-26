@@ -83,6 +83,18 @@ class PlaybackController(QtWidgets.QFrame):
             & (result.times <= self.session.timeline_end())
         )
 
+    def clamp_to_timeline(self):
+        """Align state and playback time without requesting a recursive render."""
+        indices = self._timeline_indices()
+        if not len(indices):
+            return
+        self.session.current_index = int(
+            indices[np.argmin(np.abs(indices - self.session.current_index))]
+        )
+        self._play_position = float(
+            self.session.active.times[self.session.current_index]
+        )
+
     def stop_all(self):
         self.stop_play()
         self.particle_timer.stop()

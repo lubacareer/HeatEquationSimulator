@@ -115,6 +115,44 @@ class PlaybackFeatureTests(unittest.TestCase):
         self.controller.step(100)
         self.assertLessEqual(self.session.current_time, 0.6)
 
+    def test_timeline_clamp_handles_overlap_bounds_without_requesting_a_render(self):
+        for times, current, expected in (
+            ((0.3, 0.8, 1.6), 0, 2),
+            ((0.0, 0.3, 0.6), 4, 2),
+            ((0.55,), 4, 2),
+            ((0.3, 0.8, 1.6), 3, 3),
+        ):
+            with self.subTest(times=times, current=current):
+                self.session.set_comparison(accepted_run("clamp", times))
+                self.session.view = "Compare"
+                self.session.current_index = current
+                self.controller._play_position = -99.0
+                self.frames.clear()
+                self.controller.clamp_to_timeline()
+                self.assertEqual(self.session.current_index, expected)
+                self.assertEqual(
+                    self.controller._play_position, self.session.active.times[expected]
+                )
+                self.assertEqual(self.frames, [])
+                self.controller.update_position()
+                self.assertIn(
+                    f"{self.session.current_time:.4g}",
+                    self.controller.time_label.text(),
+                )
+                self.assertEqual(self.frames, [])
+
+    def test_timeline_clamp_is_safe_without_a_valid_overlap_or_active_result(self):
+        self.session.activate(accepted_run("coarse", (0.0, 2.0)), "coarse.h5")
+        self.session.set_comparison(accepted_run("between", (0.5, 1.5)))
+        self.session.view = "Compare"
+        self.controller._play_position = 99.0
+        self.controller.clamp_to_timeline()
+        self.assertEqual(self.session.current_index, 0)
+        self.assertEqual(self.controller._play_position, 99.0)
+        self.session.active = None
+        self.controller.clamp_to_timeline()
+        self.assertEqual(self.frames, [])
+
     def test_particle_and_thermal_playback_pause_each_other(self):
         self.session.trajectories = {"snapshot_index": 2}
         self.controller.toggle_play()

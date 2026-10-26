@@ -5,6 +5,7 @@ import os
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PyQt6 import QtWidgets
@@ -155,6 +156,72 @@ class WorkspaceFeatureTests(unittest.TestCase):
         self.assertIs(self.window.session.comparison, previous)
         self.assertIs(self.window.session.active, self.result)
         self.assertIn("no overlapping physical timeline", self.window.message.text())
+
+    def test_selecting_comparison_clamps_time_before_render_and_updates_linked_controls(
+        self,
+    ):
+        emissions = []
+        self.window.playback.render_requested.connect(lambda: emissions.append(True))
+        for name, times, current in (
+            ("late-start", (0.55, 1.0, 2.0), 0.0),
+            ("early-end", (0.0, 0.2, 0.55), 2.0),
+            ("current-valid", (0.2, 0.55, 1.0), 0.55),
+            ("one-snapshot", (0.55,), 2.0),
+        ):
+            with self.subTest(comparison=name):
+                self.window.set_view("Thermal")
+                self.window.playback.seek_time(current)
+                self.window.playback._play_position = -99.0
+                emissions.clear()
+                with patch.object(
+                    self.window, "_render", wraps=self.window._render
+                ) as render:
+                    self.select_comparison(accepted_run(name, times))
+                self.assertEqual(render.call_count, 1)
+                self.assertEqual(emissions, [])
+                self.assertEqual(self.window.session.current_time, 0.55)
+                self.assertEqual(self.window.playback._play_position, 0.55)
+                self.assertEqual(self.window.scene.index, 2)
+                comparison = self.window.session.comparison
+                self.assertEqual(
+                    comparison.times[self.window.compare_scene.index], 0.55
+                )
+                self.assertEqual(self.window.playback.time_label.text(), "t = 0.55 s")
+                start, end = max(0.0, times[0]), min(2.0, times[-1])
+                expected_slider = (
+                    int(1000 * (0.55 - start) / (end - start)) if end > start else 0
+                )
+                self.assertEqual(self.window.playback.timeline.value(), expected_slider)
+                for card in self.window.chart_panel.cards:
+                    if card.cursor is not None:
+                        np.testing.assert_array_equal(
+                            card.cursor.get_xdata(), [0.55, 0.55]
+                        )
+
+    def test_reentering_compare_clamps_before_render_without_emitting_seek(self):
+        self.select_comparison(accepted_run("later-window", (0.55, 1.0, 2.0)))
+        self.window.set_view("Thermal")
+        self.window.playback.seek_time(0.0)
+        emissions = []
+        self.window.playback.render_requested.connect(lambda: emissions.append(True))
+        with patch.object(self.window, "_render", wraps=self.window._render) as render:
+            self.window.set_view("Compare")
+        self.assertEqual(self.window.session.current_time, 0.55)
+        self.assertEqual(self.window.playback._play_position, 0.55)
+        self.assertEqual(render.call_count, 1)
+        self.assertEqual(emissions, [])
+
+    def test_overlap_without_active_snapshot_is_rejected_without_replacing_comparison(
+        self,
+    ):
+        self.activate(accepted_run("coarse", (0.0, 2.0)))
+        self.select_comparison(accepted_run("previous-window", (0.0, 1.0, 2.0)))
+        previous = self.window.session.comparison
+        active = self.window.session.active
+        self.select_comparison(accepted_run("between-snapshots", (0.5, 1.5)))
+        self.assertIs(self.window.session.comparison, previous)
+        self.assertIs(self.window.session.active, active)
+        self.assertIn("no accepted active snapshot", self.window.message.text())
 
     def test_reactivation_preserves_camera_physical_time_probe_overlays_and_chart_zoom(
         self,

@@ -550,6 +550,7 @@ class TorusWindow(QtWidgets.QMainWindow):
 
     def set_view(self, view):
         self.session.view = view
+        self.playback.clamp_to_timeline()
         self.thermal_plot.setVisible(view == "Thermal")
         self.shield_plot.setVisible(view == "Shielding")
         for button in self.view_group.buttons():
@@ -678,12 +679,18 @@ class TorusWindow(QtWidgets.QMainWindow):
             return
         try:
             comparison = self.store.load_run(path)
-            if self.session.active is not None and max(
-                self.session.active.times[0], comparison.times[0]
-            ) > min(self.session.active.times[-1], comparison.times[-1]):
-                raise ValueError(
-                    "The selected runs have no overlapping physical timeline."
-                )
+            if self.session.active is not None:
+                active_times = self.session.active.times
+                start = max(active_times[0], comparison.times[0])
+                end = min(active_times[-1], comparison.times[-1])
+                if start > end:
+                    raise ValueError(
+                        "The selected runs have no overlapping physical timeline."
+                    )
+                if not np.any((active_times >= start) & (active_times <= end)):
+                    raise ValueError(
+                        "The shared timeline contains no accepted active snapshot."
+                    )
             self.session.set_comparison(comparison)
             self.compare_scene.set_result(
                 self.session.comparison, self.quantity.currentText()
