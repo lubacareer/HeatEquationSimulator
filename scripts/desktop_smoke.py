@@ -217,11 +217,11 @@ try:
     # A full-size annotated MP4 is encoded using the actual renderer.
     window.exports.begin_movie_export(str(directory / "smoke.mp4"))
     movie_size = tuple(window.exports._movie_size)
-    resized = []
+    resize_frame_counts = []
 
     def resize_during_export():
         window.resize(1133, 731)
-        resized.append(True)
+        resize_frame_counts.append(window.exports._movie_position)
 
     QtCore.QTimer.singleShot(20, resize_during_export)
     deadline = time.monotonic() + 60
@@ -230,6 +230,7 @@ try:
         if time.monotonic() > deadline:
             raise TimeoutError("Animation export timed out")
         time.sleep(0.005)
+    export_frame_count = window.exports._movie_position
     _check(
         (directory / "smoke.mp4").stat().st_size > 1000,
         'Check failed: (directory / "smoke.mp4").stat().st_size > 1000',
@@ -243,7 +244,15 @@ try:
             "Every resized MP4 frame must preserve its encoded dimensions",
         )
         encoded_frames += 1
-    _check(bool(resized), "Window must resize during the real renderer export")
+    _check(
+        bool(resize_frame_counts), "Window must resize during the real renderer export"
+    )
+    resize_frame_count = resize_frame_counts[0]
+    _check(
+        export_frame_count > resize_frame_count,
+        "At least one frame must be captured after resizing the export window "
+        f"(resize={resize_frame_count}, final={export_frame_count})",
+    )
     _check(
         tuple(video_metadata["size"]) == movie_size,
         "MP4 dimensions must match the encoder",
@@ -315,7 +324,9 @@ try:
                 "particle_replay": True,
                 "inspected_saved_pinn": inspected_pinn,
                 "pinn_fixture_kind": "display-only; not a trained model",
-                "resized_during_mp4": bool(resized),
+                "resized_during_mp4": bool(resize_frame_counts),
+                "resize_frame_count": resize_frame_count,
+                "export_frame_count": export_frame_count,
             }
         ),
         flush=True,
