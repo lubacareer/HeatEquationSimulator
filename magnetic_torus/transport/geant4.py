@@ -60,6 +60,26 @@ def _stop_worker(process: subprocess.Popen, pid_path: Path, *, via_wsl: bool) ->
         pass
 
 
+def _transport_error_detail(log: str) -> str:
+    """Keep the first fatal diagnostic instead of unrelated initialization output."""
+    offset = 0
+    while (start := log.find("G4Exception-START", offset)) >= 0:
+        start = log.rfind("\n", 0, start) + 1
+        end = log.find("G4Exception-END", start)
+        if end >= 0:
+            end = log.find("\n", end)
+        block = log[start:end if end >= 0 else None]
+        if "*** Fatal" in block:
+            return block[:6000].strip()
+        if end < 0:
+            break
+        offset = end + 1
+    for line in log.splitlines():
+        if "Dose transport error:" in line:
+            return line[:6000]
+    return log[-3000:].strip()
+
+
 def parse_dose_output(data: Mapping[str, Any], result: RunResult, snapshot_index: int,
                       *, expected_field_sha256: str | None = None) -> DoseResult:
     """Validate the worker provenance before accepting scientific dose output."""
@@ -166,9 +186,8 @@ def calculate_dose(result: RunResult, snapshot_index: int, progress: Progress,
             _stop_worker(process, artifact_dir / "worker.pid", via_wsl=command[0] == "wsl")
             raise
     if process.returncode != 0 or not output_path.is_file():
-        detail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
-        raise RuntimeError("Geant4 transport failed. Install its worker and datasets with bash scripts/setup_geant4.sh in WSL Ubuntu. "
-                           f"For anatomical scoring verify ICRP110 data and habitat dimensions. Exit code: {process.returncode}. Log: {log_path}\n{detail}")
+        detail = _transport_error_detail(log_path.read_text(encoding="utf-8", errors="replace"))
+        raise RuntimeError(f"Geant4 transport failed. Exit code: {process.returncode}. Log: {log_path}\n{detail}")
     data = json.loads(output_path.read_text(encoding="utf-8"))
     voxel_path = artifact_dir / "voxel_dose.bin"
     if voxel_path.is_file():
