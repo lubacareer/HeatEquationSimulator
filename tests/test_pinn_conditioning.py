@@ -22,6 +22,7 @@ from magnetic_torus.learning.training import (
     TrainingData,
     TrainingLosses,
     _bounded_lbfgs_step,
+    _recovering_lbfgs_step,
     _optimizer_steps,
     _prepare_data,
     _prepare_training,
@@ -250,7 +251,7 @@ class PINNConditioningTests(unittest.TestCase):
             result.metadata["function_evaluations"]["lbfgs_closures"], 10
         )
         self.assertEqual(result.metadata["parameterization_version"], 2)
-        self.assertEqual(saved["metadata"]["training_method_version"], 2)
+        self.assertEqual(saved["metadata"]["training_method_version"], 3)
         self.assertEqual(saved["source_run_id"], source.run_id)
         self.assertEqual(saved["config_hash"], source.config.config_hash)
 
@@ -264,11 +265,13 @@ class PINNConditioningTests(unittest.TestCase):
             history_size=20,
             line_search_fn="strong_wolfe",
         )
+
         def warmup():
             optimizer.zero_grad(set_to_none=True)
             loss = (parameter - 1).square()
             loss.backward()
             return loss
+
         optimizer.step(warmup)
         original_weight = parameter.detach().clone()
         original_gradient = parameter.grad.clone()
@@ -307,6 +310,188 @@ class PINNConditioningTests(unittest.TestCase):
                         lambda: (_ for _ in ()).throw(error),
                         threading.Event(),
                     )
+
+    def test_repeated_budget_exhaustion_recovers_real_training_descent(self):
+        parameter = torch.nn.Parameter(torch.ones((), dtype=torch.float64))
+        optimizer = torch.optim.LBFGS(
+            [parameter],
+            lr=1.0,
+            max_iter=1,
+            max_eval=8,
+            history_size=20,
+            line_search_fn="strong_wolfe",
+        )
+        for _ in range(3):
+            calls = []
+            old_weight = parameter.detach().clone()
+
+            def objective():
+                calls.append(True)
+                optimizer.zero_grad(set_to_none=True)
+                loss = -parameter
+                loss.backward()
+                return loss
+
+            step = _recovering_lbfgs_step(
+                optimizer, (parameter,), objective, threading.Event()
+            )
+            self.assertTrue(step.limited)
+            self.assertEqual(step.outcome, "armijo_recovered")
+            self.assertEqual(step.evaluations, 8)
+            self.assertEqual(len(calls), 8)
+            self.assertGreater(step.delta_inf, 0.0)
+            self.assertGreater(float(parameter.detach()), float(old_weight))
+            self.assertEqual(float(parameter.grad), -1.0)
+            self.assertFalse(optimizer.state)
+            self.assertEqual(optimizer.param_groups[0]["lr"], 1.0)
+
+    def test_tiny_learning_rate_with_nonzero_gradient_restarts_and_then_progresses(
+        self,
+    ):
+        parameter = torch.nn.Parameter(torch.ones((), dtype=torch.float64))
+        optimizer = torch.optim.LBFGS(
+            [parameter],
+            lr=1e-30,
+            max_iter=1,
+            max_eval=8,
+            history_size=20,
+            line_search_fn="strong_wolfe",
+        )
+
+        def objective():
+            optimizer.zero_grad(set_to_none=True)
+            loss = (parameter - 3).square()
+            loss.backward()
+            return loss
+
+        first = _recovering_lbfgs_step(
+            optimizer, (parameter,), objective, threading.Event()
+        )
+        self.assertEqual(first.outcome, "restarted_nochange")
+        self.assertEqual(first.delta_inf, 0.0)
+        self.assertGreater(first.gradient_max, 1e-7)
+        self.assertEqual(optimizer.param_groups[0]["lr"], 1.0)
+        self.assertFalse(optimizer.state)
+        second = _recovering_lbfgs_step(
+            optimizer, (parameter,), objective, threading.Event()
+        )
+        self.assertGreater(second.delta_inf, 0.0)
+        self.assertLess(float((parameter.detach() - 3).square()), 4.0)
+        self.assertLessEqual(first.evaluations, 8)
+        self.assertLessEqual(second.evaluations, 8)
+
+    def test_true_zero_gradient_is_convergence_instead_of_stall(self):
+        parameter = torch.nn.Parameter(torch.ones((), dtype=torch.float64))
+        optimizer = torch.optim.LBFGS([parameter], max_iter=1, max_eval=8)
+
+        def objective():
+            optimizer.zero_grad(set_to_none=True)
+            loss = (parameter - 1).square()
+            loss.backward()
+            return loss
+
+        step = _recovering_lbfgs_step(
+            optimizer, (parameter,), objective, threading.Event()
+        )
+        self.assertEqual(step.outcome, "converged")
+        self.assertEqual(step.gradient_max, 0.0)
+        self.assertEqual(step.delta_inf, 0.0)
+        self.assertFalse(step.limited)
+
+    def test_rejected_trials_remain_rolled_back_and_backoff_has_a_floor(self):
+        parameter = torch.nn.Parameter(torch.zeros((), dtype=torch.float64))
+        optimizer = torch.optim.LBFGS([parameter], lr=1e-20, max_iter=1, max_eval=8)
+
+        def objective():
+            optimizer.zero_grad(set_to_none=True)
+            loss = (parameter - 1).square()
+            loss.backward()
+            return loss
+
+        def uphill_trials(closure):
+            closure()
+            for index in range(1, 10):
+                with torch.no_grad():
+                    parameter.fill_(-index)
+                closure()
+
+        with patch.object(optimizer, "step", side_effect=uphill_trials):
+            for _ in range(5):
+                step = _recovering_lbfgs_step(
+                    optimizer, (parameter,), objective, threading.Event()
+                )
+                self.assertTrue(step.limited)
+                self.assertEqual(step.outcome, "rolled_back")
+                self.assertEqual(step.evaluations, 8)
+                self.assertEqual(float(parameter.detach()), 0.0)
+                self.assertGreaterEqual(optimizer.param_groups[0]["lr"], 1e-3)
+
+    def test_recovery_never_converts_cancellation_or_nonfinite_values_to_acceptance(
+        self,
+    ):
+        parameter = torch.nn.Parameter(torch.ones((), dtype=torch.float64))
+        optimizer = torch.optim.LBFGS(
+            [parameter], max_iter=1, max_eval=8, line_search_fn="strong_wolfe"
+        )
+        cancel = threading.Event()
+        calls = []
+
+        def cancelled_last_trial():
+            calls.append(True)
+            optimizer.zero_grad(set_to_none=True)
+            loss = -parameter
+            loss.backward()
+            if len(calls) == 8:
+                cancel.set()
+            return loss
+
+        with self.assertRaises(SimulationCancelled):
+            _recovering_lbfgs_step(
+                optimizer, (parameter,), cancelled_last_trial, cancel
+            )
+        self.assertEqual(len(calls), 8)
+        for error in (SimulationCancelled("cancelled"), FloatingPointError("invalid")):
+            with (
+                self.subTest(error=type(error).__name__),
+                self.assertRaises(type(error)),
+            ):
+                _recovering_lbfgs_step(
+                    optimizer,
+                    (parameter,),
+                    lambda: (_ for _ in ()).throw(error),
+                    threading.Event(),
+                )
+        with self.assertRaises(FloatingPointError):
+            _recovering_lbfgs_step(
+                optimizer,
+                (parameter,),
+                lambda: torch.tensor(float("nan")),
+                threading.Event(),
+            )
+
+    def test_training_progress_reports_stage_stale_heldout_epoch_and_real_step_counts(
+        self,
+    ):
+        run = self.prepare(pinn_epochs=50)
+        messages = []
+        _train_model(
+            run, lambda _fraction, text: messages.append(text), run.losses.cancel
+        )
+        self.assertIn("Adam · batch loss", messages[1])
+        self.assertRegex(messages[1], r"held-out [^@]+@1\b")
+        self.assertRegex(messages[9], r"held-out [^@]+@10\b")
+        self.assertIn("L-BFGS · training loss", messages[40])
+        self.assertIn("lr=", messages[40])
+        self.assertEqual(sum(run.metadata["refinement_step_outcomes"].values()), 10)
+        self.assertEqual(
+            run.metadata["refinement_accepted_updates"]
+            + run.metadata["refinement_nochange_steps"],
+            10,
+        )
+        self.assertEqual(run.metadata["heldout_evaluated_epoch"], 50)
+        self.assertGreaterEqual(
+            run.metadata["refinement_last_step"]["learning_rate"], 1e-3
+        )
 
     def test_heldout_monitor_values_do_not_adapt_training_or_model_selection(self):
         runs = [self.prepare(pinn_epochs=50) for _ in range(2)]

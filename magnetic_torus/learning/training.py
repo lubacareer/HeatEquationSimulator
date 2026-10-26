@@ -481,7 +481,7 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
     adam_steps, lbfgs_steps = _optimizer_steps(config.pinn_epochs)
     metadata: dict[str, Any] = {
         "format_version": FORMAT_VERSION, "source_run_id": result.run_id,
-        "parameterization_version": 2, "training_method_version": 2,
+        "parameterization_version": 2, "training_method_version": 3,
         "source_config_hash": config.config_hash, "source_snapshot_times_s": result.times.tolist(),
         "source_physics_hash": config.physics_hash, "training_source_run_id": result.run_id,
         "training_config_hash": config.config_hash, "training_epochs": config.pinn_epochs,
@@ -506,9 +506,13 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
                       "lbfgs": {"steps": lbfgs_steps, "max_iter": 1, "max_eval": 8,
                                 "history_size": 20, "line_search": "strong_wolfe",
                                 "closure_evaluation_cap": 8,
-                                "budget_policy": "rollback weights/gradients/optimizer state; halve next training step learning rate"}},
+                                "budget_policy": "full rollback, then recover an evaluated Armijo-decreasing training trial; restart curvature/LR; rejected-step backoff has a 1e-3 floor"}},
         "optimizer_steps_completed": {"adam": 0, "lbfgs": 0},
         "refinement_budget_limited_steps": 0,
+        "refinement_step_outcomes": {"wolfe": 0, "armijo_recovered": 0, "rolled_back": 0,
+                                     "restarted_nochange": 0, "converged": 0},
+        "refinement_accepted_updates": 0, "refinement_nochange_steps": 0,
+        "refinement_restarts": 0,
         "function_evaluations": {"adam": 0, "lbfgs_closures": 0,
                                  "refinement_objective": 0, "final_objective": 0},
         "hard_constraints": "specified dynamical initial state and FE Dirichlet node masks; pressure is elliptic" if not data.thermal else "specified initial state",
@@ -590,12 +594,82 @@ def _bounded_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Ca
     return evaluations, False
 
 
+@dataclass(frozen=True)
+class _RefinementStep:
+    evaluations: int
+    limited: bool
+    outcome: str
+    gradient_max: float
+    delta_inf: float
+    initial_loss: float
+
+
+def _recovering_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Callable[[], Any],
+                          cancel: threading.Event) -> _RefinementStep:
+    """Recover useful training descent without spending another closure call."""
+    torch = _torch()
+    base = tuple(parameter.detach().clone() for parameter in parameters)
+    initial_loss, initial_gradients, best = None, None, None
+
+    def observed_closure():
+        nonlocal initial_loss, initial_gradients, best
+        loss = closure()
+        value = float(loss.detach())
+        gradients = tuple(torch.zeros_like(parameter) if parameter.grad is None
+                          else parameter.grad.detach().clone() for parameter in parameters)
+        if (not math.isfinite(value)
+                or any(not bool(torch.isfinite(parameter).all()) for parameter in parameters)
+                or any(not bool(torch.isfinite(gradient).all()) for gradient in gradients)):
+            raise FloatingPointError("PINN refinement objective or gradient became non-finite.")
+        if initial_loss is None:
+            initial_loss, initial_gradients = value, gradients
+        else:
+            directional = float(sum((gradient * (parameter.detach() - weight)).sum()
+                                    for gradient, parameter, weight in zip(initial_gradients, parameters, base)))
+            if (directional < 0 and value < initial_loss
+                    and value <= initial_loss + 1e-4 * directional
+                    and (best is None or value < best[0])):
+                # PyTorch restores base weights after this closure returns.
+                best = (value, tuple(parameter.detach().clone() for parameter in parameters), gradients)
+        return loss
+
+    evaluations, limited = _bounded_lbfgs_step(optimizer, parameters, observed_closure, cancel)
+    if initial_loss is None or initial_gradients is None:
+        raise RuntimeError("Refinement did not evaluate its training objective.")
+    gradient_max = max(float(gradient.abs().max()) for gradient in initial_gradients)
+    outcome = "wolfe"
+    if limited:
+        if best is not None:
+            with torch.no_grad():
+                for parameter, weight, gradient in zip(parameters, best[1], best[2]):
+                    parameter.copy_(weight)
+                    parameter.grad = gradient
+            outcome = "armijo_recovered"
+        else:
+            outcome = "rolled_back"
+        optimizer.state.clear()
+        for group in optimizer.param_groups:
+            group["lr"] = 1. if best is not None else max(1e-3, float(group["lr"]) * .5)
+    delta_inf = max(float((parameter.detach() - weight).abs().max())
+                    for parameter, weight in zip(parameters, base))
+    if not limited and delta_inf == 0.:
+        if gradient_max <= 1e-7:
+            outcome = "converged"
+        else:
+            outcome = "restarted_nochange"
+            optimizer.state.clear()
+            for group in optimizer.param_groups:
+                group["lr"] = 1.
+    return _RefinementStep(evaluations, limited, outcome, gradient_max, delta_inf, initial_loss)
+
+
 def _train_model(run: TrainingRun, progress: Progress, cancel: threading.Event) -> float:
     field = run.field
     data = field.data
     config = data.config
     torch = field.torch
     initial_validation = run.losses.validation_loss()
+    heldout_epoch = 0
     adam_steps, _ = _optimizer_steps(config.pinn_epochs)
     physics_indices = np.unique(np.linspace(1, data.snapshot_count - 1,
         min(4, data.snapshot_count - 1), dtype=np.int64))
@@ -635,14 +709,21 @@ def _train_model(run: TrainingRun, progress: Progress, cancel: threading.Event) 
                     raise FloatingPointError("PINN refinement gradient became non-finite.")
                 run.metadata["function_evaluations"]["lbfgs_closures"] += 1
                 return terms["loss"]
-            _, limited = _bounded_lbfgs_step(run.optimizer, tuple(field.model.parameters()), closure, cancel)
-            if limited:
+            step = _recovering_lbfgs_step(run.optimizer, tuple(field.model.parameters()), closure, cancel)
+            if step.limited:
                 run.metadata["refinement_budget_limited_steps"] += 1
-                for group in run.optimizer.param_groups:
-                    group["lr"] *= .5
+            run.metadata["refinement_step_outcomes"][step.outcome] += 1
+            run.metadata["refinement_accepted_updates"] += int(step.delta_inf > 0.)
+            run.metadata["refinement_nochange_steps"] += int(step.delta_inf == 0.)
+            run.metadata["refinement_restarts"] += int(step.limited or step.outcome == "restarted_nochange")
             run.metadata["optimizer_steps_completed"]["lbfgs"] += 1
             objective = _deterministic_objective(run, physics_indices, centers, backward=False)
             run.metadata["function_evaluations"]["refinement_objective"] += 1
+            run.metadata["refinement_last_step"] = {
+                "outcome": step.outcome, "gradient_max": step.gradient_max,
+                "parameter_delta_inf": step.delta_inf,
+                "training_objective_change": float(objective["loss"]) - step.initial_loss,
+                "learning_rate": float(run.optimizer.param_groups[0]["lr"])}
         values = {"epoch": float(epoch + 1), **{
             key: float(value.detach().item()) for key, value in objective.items()}}
         # Evaluate held-out labels regularly, and retain a finite displayed
@@ -650,13 +731,18 @@ def _train_model(run: TrainingRun, progress: Progress, cancel: threading.Event) 
         if epoch == 0 or (epoch + 1) % 10 == 0 or epoch + 1 == config.pinn_epochs:
             field.model.eval()
             current_validation = run.losses.validation_loss()
+            heldout_epoch = epoch + 1
         else:
             current_validation = run.history["validation_loss"][-1]
         values["validation_loss"] = current_validation
+        run.metadata["heldout_evaluated_epoch"] = heldout_epoch
         for key, value in values.items():
             run.history[key].append(value)
+        stage = "Adam" if epoch < adam_steps else "L-BFGS"
+        label = "batch loss" if epoch < adam_steps else "training loss"
+        detail = "" if epoch < adam_steps else f" · {step.outcome} · Δθ∞={step.delta_inf:.3g} · lr={run.optimizer.param_groups[0]['lr']:.3g}"
         progress(.9 * (epoch + 1) / config.pinn_epochs,
-                 f"Epoch {epoch + 1}/{config.pinn_epochs} · loss {values['loss']:.3g} · held-out {current_validation:.3g}")
+                 f"Epoch {epoch + 1}/{config.pinn_epochs} · {stage} · {label} {values['loss']:.6g} · held-out {current_validation:.6g}@{heldout_epoch}{detail}")
         if run.checkpoint_path is not None and ((epoch + 1) % 50 == 0 or epoch + 1 == config.pinn_epochs):
             _checkpoint(run.checkpoint_path, field.model, run.optimizer, epoch + 1, data.result, data.scaling, run.history, run.metadata)
 
