@@ -34,11 +34,15 @@ The pairwise generator has stable tie-breaking. Coverage is checked against the 
 
 Functional transport rows use small samples to exercise interactions and report their actual uncertainty. They do not claim 5% dose precision. The separate water precision gate increases histories up to 262,144 and requires a nonzero score with relative standard error ≤5%; zero hits fail. Anatomical rows test execution/scoring across targets, not independent anatomical dosimetry qualification. Coupled PINN accuracy remains a required scientific gate even if later functional rejection tests pass.
 
+Dependent training and transport require passing source cases: execution must pass, and scientific parents must also pass qualification. A failed or incomplete prerequisite makes its dependents `BLOCKED` before starting work or reusing a cached result. Negative tests construct their rejected inputs from passing prerequisites, so expected rejection coverage remains independent.
+
 Published turbulent MHD Taylor–Green adaptation, full coupled manufactured-solution convergence, exterior-domain refinement, subgrid total-energy validation, certified material data, and independent radiation/anatomical reference qualification remain broader research gates. Passing this matrix does not demonstrate habitat shielding efficacy or a self-sustaining dynamo.
 
 ## Requirements and runtime
 
 Preflight checks the real Qt/VTK render/readback, PyTorch CPU and CUDA kernels, FEniCSx/Gmsh/PETSc imports, Geant4 worker startup/physics datasets, and all official male/female anatomical slice headers. Setup instructions and pinned environments are in [README.md](../README.md).
+
+`MAGNETIC_TORUS_FE_PYTHON` selects the FE interpreter for preflight, solves, and benchmarks; it defaults to `/usr/bin/python3`. On Windows, supply the interpreter's Linux path inside the selected WSL distribution.
 
 Expect several hours, potentially longer on slower hardware or with cold compilation caches; there is no completed full-run timing yet. The scientific cases' declared timeout budget totals about 21.6 hours, before regression/desktop limits and bounded cleanup. Individual limits are visible with `--list`: most small FE cases allow 10 minutes, shipped presets 30 minutes, dynamic PINNs 40 minutes, transport interactions 15 minutes, and water precision 60 minutes. A timeout is an unsuccessful outcome, not a skipped pass.
 
@@ -68,6 +72,8 @@ conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --
 ```
 
 Reuse requires a previous passing execution and qualification, matching inputs/source dependencies/software and worker fingerprints, and intact hashed artifacts inside that run. Failed, interrupted, missing, modified, or stale evidence reruns. Changed numerical sources invalidate downstream analyses. Do not move evidence directories or edit their reports. The report supplies data only; executable commands come from the current catalog.
+
+Unvisited cached records remain in each saved report during resume. Cancellation can still validate and reuse passing cached evidence without starting processes; the interrupted invocation remains unsuccessful even if every recorded case was reused successfully.
 
 Use `--case` together with `--resume` for a targeted retry in the same evidence directory. Its summary explicitly covers only that selection; run a full `--resume` afterward to restore the full report. A passing subset or `--profile fast` never reports full coverage. `--preflight` records capabilities without running cases. `--profile fast` runs shorter isolated development regressions with explicit skips and is not the release gate.
 

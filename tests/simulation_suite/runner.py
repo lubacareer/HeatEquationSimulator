@@ -118,6 +118,9 @@ def case_fingerprint(
             key: {
                 "fingerprint": value.get("fingerprint"),
                 "status": value.get("status"),
+                "execution": value.get("execution"),
+                "qualification": value.get("qualification"),
+                "kind": value.get("kind"),
                 "artifacts": value.get("artifact_hashes", {}),
             }
             for key, value in (dependency_results or {}).items()
@@ -126,16 +129,28 @@ def case_fingerprint(
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _passes_gates(result: dict) -> bool:
+    qualification = result.get("qualification")
+    return (
+        result.get("status") == "PASS"
+        and result.get("execution") == "PASS"
+        and qualification in ("PASS", "NOT_APPLICABLE")
+        and (result.get("kind") != "scientific" or qualification == "PASS")
+    )
+
+
+def _failed_dependencies(case: CaseSpec, parents: dict) -> list[str]:
+    return [
+        f"{name} (status={parent.get('status', 'missing')}, "
+        f"execution={parent.get('execution', 'missing')}, "
+        f"qualification={parent.get('qualification', 'missing')})"
+        for name in case.depends_on
+        if not _passes_gates(parent := parents.get(name, {}))
+    ]
+
+
 def reusable_result(result: dict, expected_fingerprint: str, run_dir: Path) -> bool:
-    if (
-        result.get("status") != "PASS"
-        or result.get("fingerprint") != expected_fingerprint
-        or result.get("execution") != "PASS"
-        or result.get("qualification") == "FAIL"
-        or (
-            result.get("kind") == "scientific" and result.get("qualification") != "PASS"
-        )
-    ):
+    if not _passes_gates(result) or result.get("fingerprint") != expected_fingerprint:
         return False
     try:
         case_dir = _inside(Path(result["case_dir"]), run_dir)
@@ -365,17 +380,12 @@ def run_case(
                 for name in unavailable
             ),
         }
-    blocked = [
-        name
-        for name in case.depends_on
-        if parents.get(name, {}).get("execution") != "PASS"
-    ]
+    blocked = _failed_dependencies(case, parents)
     if blocked:
         return {
             **result,
             "status": "BLOCKED",
-            "reason": "Dependencies did not execute successfully: "
-            + ", ".join(blocked),
+            "reason": "Dependencies did not pass required gates: " + ", ".join(blocked),
         }
     parent_dir = run_dir / "cases" / case.id
     parent_dir.mkdir(parents=True, exist_ok=True)
@@ -559,7 +569,6 @@ def execute(
         for field in ("retained_results", "results")
         for item in (previous or {}).get(field, [])
     }
-    selected_ids = {case.id for case in cases}
     results = []
     by_id = {}
     report = {
@@ -571,9 +580,7 @@ def execute(
         "coverage": coverage,
         "manifest": [case.to_dict() for case in cases],
         "results": results,
-        "retained_results": [
-            item for key, item in old.items() if key not in selected_ids
-        ],
+        "retained_results": list(old.values()),
         "software": software_versions(),
     }
     try:
@@ -599,8 +606,8 @@ def execute(
             capabilities.get(name, {}).get("available") for name in case.capabilities
         )
         if (
-            not stop.is_set()
-            and available
+            available
+            and not _failed_dependencies(case, parents)
             and reusable_result(cached, fingerprint, run_dir)
         ):
             result = {**cached, "reused": True}
@@ -631,6 +638,9 @@ def execute(
                 }
         by_id[case.id] = result
         results.append(result)
+        report["retained_results"] = [
+            item for item in report["retained_results"] if item.get("id") != case.id
+        ]
         print(
             f"  {result['status']} ({result['elapsed_s']:.1f}s) {result.get('reason', '')}",
             flush=True,
@@ -659,6 +669,10 @@ def execute(
     report["summary"] = summarize(
         results, full_coverage=profile == "full" and full_selection and matrix_complete
     )
+    if stop.is_set():
+        report["summary"].update(
+            status="FAIL", selection_passed=False, full_coverage=False
+        )
     write_reports(run_dir, report)
     return report
 

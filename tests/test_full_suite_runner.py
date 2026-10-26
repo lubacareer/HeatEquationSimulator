@@ -427,6 +427,28 @@ class IsolatedRunnerTests(unittest.TestCase):
             },
         )
         self.assertNotEqual(before, after)
+        accepted_parent = {
+            "status": "PASS",
+            "execution": "PASS",
+            "qualification": "PASS",
+            "kind": "scientific",
+            "fingerprint": "one",
+            "artifact_hashes": {},
+        }
+        before = fingerprint(dependent, upstream={"source": accepted_parent})
+        for changed_gate in (
+            {"execution": "FAIL"},
+            {"qualification": "FAIL"},
+            {"kind": "functional"},
+        ):
+            with self.subTest(changed_gate=changed_gate):
+                self.assertNotEqual(
+                    fingerprint(
+                        dependent,
+                        upstream={"source": {**accepted_parent, **changed_gate}},
+                    ),
+                    before,
+                )
 
     def test_descendant_holding_stdout_is_stopped_without_a_pipe_hang(self):
         script = self.root / "spawn descendant.py"
@@ -666,6 +688,244 @@ class IsolatedRunnerTests(unittest.TestCase):
         self.assertTrue(all(item["reused"] for item in resumed["results"]))
         self.assertEqual(resumed["retained_results"], [])
         self.assertTrue(resumed["summary"]["full_coverage"])
+
+    def test_crashed_resume_preserves_unvisited_cache_in_each_durable_report(self):
+        first = self.child_case(
+            result={"status": "PASS", "execution": "PASS", "qualification": "PASS"}
+        )
+        second = replace(first, id="fixture.second")
+        options = dict(
+            root=self.root,
+            run_dir=self.run_dir,
+            capabilities={},
+            coverage={"scientific_matrix": {"complete": True}},
+            profile="full",
+        )
+        original = self.runner.execute([first, second], **options)
+        write_reports = self.runner.write_reports
+        for crash_after_write in (1, 2):
+            with self.subTest(crash_after_write=crash_after_write):
+                writes = 0
+
+                def persist_then_crash(directory, report):
+                    nonlocal writes
+                    write_reports(directory, report)
+                    writes += 1
+                    if writes == crash_after_write:
+                        raise KeyboardInterrupt("simulated abrupt runner exit")
+
+                with (
+                    patch.object(
+                        self.runner, "write_reports", side_effect=persist_then_crash
+                    ),
+                    patch.object(self.runner, "run_case") as launch,
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self.runner.execute([first, second], previous=original, **options)
+                launch.assert_not_called()
+                persisted = json.loads(
+                    (self.run_dir / "report.json").read_text(encoding="utf-8")
+                )
+                retained = [item["id"] for item in persisted["retained_results"]]
+                self.assertEqual(
+                    retained,
+                    [first.id, second.id] if crash_after_write == 1 else [second.id],
+                )
+                self.assertFalse(
+                    persisted.get("summary", {}).get("selection_passed", False)
+                )
+                with patch.object(self.runner, "run_case") as launch:
+                    resumed = self.runner.execute(
+                        [first, second], previous=persisted, **options
+                    )
+                launch.assert_not_called()
+                self.assertTrue(all(item["reused"] for item in resumed["results"]))
+                self.assertTrue(resumed["summary"]["full_coverage"])
+
+    def test_cancelled_resume_reuses_intact_cache_but_never_reports_success(self):
+        first = self.child_case(
+            result={"status": "PASS", "execution": "PASS", "qualification": "PASS"}
+        )
+        second = replace(first, id="fixture.second")
+        options = dict(
+            root=self.root,
+            run_dir=self.run_dir,
+            capabilities={},
+            coverage={"scientific_matrix": {"complete": True}},
+            profile="full",
+        )
+        original = self.runner.execute([first, second], **options)
+        stop = threading.Event()
+        stop.set()
+        with patch.object(self.runner, "run_case") as launch:
+            cancelled = self.runner.execute(
+                [first, second], previous=original, stop_event=stop, **options
+            )
+        launch.assert_not_called()
+        self.assertTrue(cancelled["interrupted"])
+        self.assertTrue(all(item["reused"] for item in cancelled["results"]))
+        self.assertEqual(cancelled["summary"]["counts"], {"PASS": 2})
+        self.assertEqual(cancelled["summary"]["status"], "FAIL")
+        self.assertFalse(cancelled["summary"]["selection_passed"])
+        self.assertFalse(cancelled["summary"]["full_coverage"])
+        persisted = json.loads(
+            (self.run_dir / "report.json").read_text(encoding="utf-8")
+        )
+        with patch.object(self.runner, "run_case") as launch:
+            resumed = self.runner.execute(
+                [first, second], previous=persisted, **options
+            )
+        launch.assert_not_called()
+        self.assertTrue(resumed["summary"]["full_coverage"])
+
+    def test_cancellation_does_not_reuse_stale_damaged_or_unavailable_cache(self):
+        case = self.child_case(
+            result={"status": "PASS", "execution": "PASS", "qualification": "PASS"},
+            capabilities=("fixture_runtime",),
+        )
+        ready = {"fixture_runtime": {"available": True, "versions": {"runtime": "1"}}}
+        accepted = self.runner.run_case(
+            case, root=self.root, run_dir=self.run_dir, capabilities=ready
+        )
+        stop = threading.Event()
+        stop.set()
+        stale = {**accepted, "fingerprint": "outdated"}
+        damaged = {
+            **accepted,
+            "artifact_hashes": {
+                path: "changed" for path in accepted["artifact_hashes"]
+            },
+        }
+        unavailable = {
+            "fixture_runtime": {**ready["fixture_runtime"], "available": False}
+        }
+        for cached, runtime in (
+            (stale, ready),
+            (damaged, ready),
+            (accepted, unavailable),
+        ):
+            with self.subTest(cached=cached["fingerprint"], runtime=runtime):
+                with (
+                    patch.object(
+                        self.runner.subprocess,
+                        "run",
+                        return_value=SimpleNamespace(returncode=0, stdout="test"),
+                    ),
+                    patch.object(self.runner.subprocess, "Popen") as launch,
+                ):
+                    report = self.runner.execute(
+                        [case],
+                        root=self.root,
+                        run_dir=self.run_dir,
+                        capabilities=runtime,
+                        coverage={"scientific_matrix": {"complete": True}},
+                        profile="full",
+                        previous={"results": [cached]},
+                        stop_event=stop,
+                    )
+                launch.assert_not_called()
+                self.assertEqual(report["results"][0]["status"], "INTERRUPTED")
+                self.assertNotIn("reused", report["results"][0])
+                self.assertFalse(report["summary"]["selection_passed"])
+
+    def test_dependencies_require_complete_functional_or_scientific_success(self):
+        case = self.child_case(
+            result={
+                "status": "PASS",
+                "execution": "PASS",
+                "qualification": "NOT_APPLICABLE",
+            },
+            depends_on=("upstream",),
+        )
+        passing = {
+            "status": "PASS",
+            "execution": "PASS",
+            "qualification": "PASS",
+            "kind": "scientific",
+        }
+        failures = [
+            {},
+            {**passing, "status": "FAIL"},
+            {**passing, "execution": "FAIL"},
+            {**passing, "qualification": "FAIL"},
+            {**passing, "qualification": "NOT_APPLICABLE"},
+            {**passing, "qualification": "NOT_RUN"},
+            {**passing, "kind": "functional", "qualification": "FAIL"},
+        ]
+        for upstream in failures:
+            with self.subTest(upstream=upstream):
+                with patch.object(self.runner.subprocess, "Popen") as launch:
+                    result = self.execute(
+                        case, dependency_results={"upstream": upstream}
+                    )
+                launch.assert_not_called()
+                self.assertEqual(result["status"], "BLOCKED")
+                self.assertIn("upstream", result["reason"])
+                for gate in ("status", "execution", "qualification"):
+                    self.assertIn(
+                        f"{gate}={upstream.get(gate, 'missing')}", result["reason"]
+                    )
+        for upstream in (
+            passing,
+            {**passing, "kind": "functional", "qualification": "NOT_APPLICABLE"},
+        ):
+            with self.subTest(upstream=upstream):
+                result = self.execute(case, dependency_results={"upstream": upstream})
+                self.assertEqual(result["status"], "PASS")
+
+    def test_failed_parent_gates_cannot_be_bypassed_by_child_cache(self):
+        child = self.child_case(
+            result={"status": "PASS", "execution": "PASS", "qualification": "PASS"},
+            depends_on=("upstream",),
+        )
+        parent = replace(child, id="upstream", depends_on=(), kind="scientific")
+        passing = {
+            "id": parent.id,
+            "kind": "scientific",
+            "status": "PASS",
+            "execution": "PASS",
+            "qualification": "PASS",
+            "elapsed_s": 0.0,
+            "fingerprint": "upstream-fingerprint",
+        }
+        cached = self.execute(child, dependency_results={parent.id: passing})
+        self.assertTrue(
+            self.runner.reusable_result(cached, cached["fingerprint"], self.run_dir)
+        )
+        failed = {**passing, "qualification": "FAIL"}
+        run_case = self.runner.run_case
+
+        def execute_case(case, **kwargs):
+            return failed if case.id == parent.id else run_case(case, **kwargs)
+
+        # Deliberately preserve the child's fingerprint to prove the dependency
+        # gate is enforced independently of the fingerprint's cache invalidation.
+        with (
+            patch.object(
+                self.runner, "case_fingerprint", return_value=cached["fingerprint"]
+            ),
+            patch.object(self.runner, "run_case", side_effect=execute_case),
+            patch.object(
+                self.runner.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0, stdout="test"),
+            ),
+            patch.object(self.runner.subprocess, "Popen") as launch,
+        ):
+            report = self.runner.execute(
+                [parent, child],
+                root=self.root,
+                run_dir=self.run_dir,
+                capabilities={},
+                coverage={"scientific_matrix": {"complete": True}},
+                profile="full",
+                previous={"results": [cached]},
+            )
+        launch.assert_not_called()
+        self.assertEqual(report["results"][1]["status"], "BLOCKED")
+        self.assertNotIn("reused", report["results"][1])
+        self.assertIn("qualification=FAIL", report["results"][1]["reason"])
+        self.assertFalse(report["summary"]["full_coverage"])
 
     def test_full_selection_requires_complete_matrix_but_subset_remains_partial(self):
         case = self.child_case(
