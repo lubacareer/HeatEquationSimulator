@@ -677,10 +677,22 @@ class TorusWindow(QtWidgets.QMainWindow):
             self._update_actions()
             return
         try:
-            self.session.set_comparison(self.store.load_run(path))
+            comparison = self.store.load_run(path)
+            if self.session.active is not None and max(
+                self.session.active.times[0], comparison.times[0]
+            ) > min(self.session.active.times[-1], comparison.times[-1]):
+                raise ValueError(
+                    "The selected runs have no overlapping physical timeline."
+                )
+            self.session.set_comparison(comparison)
             self.compare_scene.set_result(
                 self.session.comparison, self.quantity.currentText()
             )
+            if (
+                self.session.comparison_difference is None
+                and self.source.currentText() == "Run difference"
+            ):
+                self.source.setCurrentText("Numerical")
             self.compare_scene.plotter.camera = self.scene.plotter.camera
             self._share_color_range()
             self.set_view("Compare")

@@ -65,6 +65,24 @@ class PlaybackController(QtWidgets.QFrame):
             control.setEnabled(has_result and not previewing)
         self.replay.setEnabled(has_trajectories and not previewing)
 
+    def _timeline_start(self):
+        result = self.session.active
+        if result is None:
+            return 0.0
+        start = float(result.times[0])
+        if self.session.view == "Compare" and self.session.comparison is not None:
+            start = max(start, float(self.session.comparison.times[0]))
+        return start
+
+    def _timeline_indices(self):
+        result = self.session.active
+        if result is None:
+            return np.empty(0, dtype=int)
+        return np.flatnonzero(
+            (result.times >= self._timeline_start())
+            & (result.times <= self.session.timeline_end())
+        )
+
     def stop_all(self):
         self.stop_play()
         self.particle_timer.stop()
@@ -77,9 +95,10 @@ class PlaybackController(QtWidgets.QFrame):
         current_time = float(result.times[self.session.current_index])
         self.time_label.setText(f"t = {current_time:.4g} s")
         blocker = QtCore.QSignalBlocker(self.timeline)
-        span = self.session.timeline_end() - result.times[0]
+        start = self._timeline_start()
+        span = self.session.timeline_end() - start
         self.timeline.setValue(
-            int(1000 * (current_time - result.times[0]) / span) if span > 0 else 0
+            int(1000 * (current_time - start) / span) if span > 0 else 0
         )
         del blocker
 
@@ -87,16 +106,18 @@ class PlaybackController(QtWidgets.QFrame):
         if self.session.active is None:
             return
         end = self.session.timeline_end()
-        target = float(self.session.active.times[0]) + value / 1000 * (
-            end - self.session.active.times[0]
-        )
+        start = self._timeline_start()
+        target = start + value / 1000 * (end - start)
         self.seek_time(target)
 
     def seek_time(self, value):
         if self.session.active is None or self.session.previewing:
             return
+        indices = self._timeline_indices()
+        if not len(indices):
+            return
         self.session.current_index = int(
-            np.argmin(np.abs(self.session.active.times - value))
+            indices[np.argmin(np.abs(self.session.active.times[indices] - value))]
         )
         self._play_position = float(
             self.session.active.times[self.session.current_index]
@@ -106,12 +127,12 @@ class PlaybackController(QtWidgets.QFrame):
     def step(self, delta):
         self.stop_play()
         if self.session.active is not None:
+            indices = self._timeline_indices()
+            if not len(indices):
+                return
+            position = int(np.argmin(np.abs(indices - self.session.current_index)))
             self.session.current_index = int(
-                np.clip(
-                    self.session.current_index + delta,
-                    0,
-                    len(self.session.active.times) - 1,
-                )
+                indices[np.clip(position + delta, 0, len(indices) - 1)]
             )
             self._play_position = float(
                 self.session.active.times[self.session.current_index]
@@ -124,6 +145,8 @@ class PlaybackController(QtWidgets.QFrame):
         if self.play_timer.isActive():
             self.stop_play()
             return
+        self.particle_timer.stop()
+        self.replay.setText("Particle replay")
         self._play_position = float(
             self.session.active.times[self.session.current_index]
         )
@@ -146,11 +169,21 @@ class PlaybackController(QtWidgets.QFrame):
         self._last_tick = now
         if self._play_position > self.session.timeline_end():
             if self.loop.isChecked():
-                self._play_position = float(self.session.active.times[0])
+                self._play_position = self._timeline_start()
             else:
+                self._play_position = self.session.timeline_end()
                 self.stop_play()
-                return
-        index = int(np.argmin(np.abs(self.session.active.times - self._play_position)))
+        indices = self._timeline_indices()
+        if not len(indices):
+            self.stop_play()
+            return
+        index = int(
+            indices[
+                np.argmin(
+                    np.abs(self.session.active.times[indices] - self._play_position)
+                )
+            ]
+        )
         if index != self.session.current_index:
             self.session.current_index = index
             self.render_requested.emit()

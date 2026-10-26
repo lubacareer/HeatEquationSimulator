@@ -55,8 +55,12 @@ class ExportController(QtCore.QObject):
             self.parent(), "Export scene", "torus-scene.png", "PNG image (*.png)"
         )
         if path:
-            self.scene.flush_render()
-            self.scene.plotter.screenshot(path, transparent_background=False)
+            try:
+                self.scene.flush_render()
+                self.scene.plotter.screenshot(path, transparent_background=False)
+            except (OSError, ValueError, RuntimeError) as error:
+                self._notify(f"Cannot export scene: {error}", error=True)
+                return
             self._notify(f"Exported scene: {path}")
 
     def export_charts(self):
@@ -64,10 +68,15 @@ class ExportController(QtCore.QObject):
             self.parent(), "Export chart SVGs"
         )
         if directory:
-            for index, card in enumerate(self.chart_panel.cards, 1):
-                card.figure.savefig(
-                    Path(directory) / f"torus-chart-{index}.svg", bbox_inches="tight"
-                )
+            try:
+                for index, card in enumerate(self.chart_panel.cards, 1):
+                    card.figure.savefig(
+                        Path(directory) / f"torus-chart-{index}.svg",
+                        bbox_inches="tight",
+                    )
+            except (OSError, ValueError, RuntimeError) as error:
+                self._notify(f"Cannot export charts: {error}", error=True)
+                return
             self._notify(f"Exported three charts to {directory}")
 
     def export_data(self):
@@ -83,7 +92,11 @@ class ExportController(QtCore.QObject):
         if path:
             import shutil
 
-            shutil.copy2(self.session.active_path, path)
+            try:
+                shutil.copy2(self.session.active_path, path)
+            except OSError as error:
+                self._notify(f"Cannot export scientific results: {error}", error=True)
+                return
             self._notify(f"Exported SI-valued fields and configuration to {path}")
 
     def export_config(self):
@@ -99,9 +112,12 @@ class ExportController(QtCore.QObject):
             "JSON scenario (*.json)",
         )
         if path:
-            Path(path).write_text(
-                json.dumps(config.to_dict(), indent=2), encoding="utf-8"
-            )
+            try:
+                Path(path).write_text(
+                    json.dumps(config.to_dict(), indent=2), encoding="utf-8"
+                )
+            except OSError as error:
+                self._notify(f"Cannot export scenario: {error}", error=True)
 
     def import_config(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(

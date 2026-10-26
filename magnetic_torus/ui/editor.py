@@ -338,7 +338,7 @@ class ScenarioEditor(QtWidgets.QFrame):
             elif isinstance(editor, QtWidgets.QCheckBox):
                 editor.setChecked(bool(value))
             elif isinstance(editor, QtWidgets.QLineEdit):
-                editor.setText(f"{value:g}" if isinstance(value, float) else str(value))
+                editor.setText(str(value))
         self._loading = False
         self.validate()
 
