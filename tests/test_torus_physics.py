@@ -14,7 +14,8 @@ from unittest.mock import patch
 import numpy as np
 
 from magnetic_torus.models import ScenarioConfig, SimulationCancelled, RunResult, DoseResult
-from magnetic_torus.physics import (MU0, _thermal_graph, coil_magnetic_field,
+from magnetic_torus.numerics.thermal import _thermal_graph
+from magnetic_torus.physics import (MU0, coil_magnetic_field,
                                     enthalpy_from_temperature, liquid_fraction,
                                     regularized_enthalpy, run_simulation,
                                     temperature_from_enthalpy)
@@ -61,8 +62,8 @@ class ThermalPhysicsTests(unittest.TestCase):
         ordinary = replace(self.config, resolution=8, time_steps=80)
         enormous = replace(self.config, resolution=128, time_steps=100000)
         self.assertLess(native_memory_estimate(ordinary), 64 * 1024 ** 2)
-        with patch("magnetic_torus.physics.available_memory_bytes", return_value=512 * 1024 ** 2), \
-             patch("magnetic_torus.physics._thermal_graph") as allocation, \
+        with patch("magnetic_torus.numerics.thermal.available_memory_bytes", return_value=512 * 1024 ** 2), \
+             patch("magnetic_torus.numerics.thermal._thermal_graph") as allocation, \
              patch.dict(os.environ, {"MAGNETIC_TORUS_NATIVE_MEMORY_MB": "256"}):
             with self.assertRaisesRegex(ValueError, "Reduce mesh resolution or output snapshots"):
                 run_simulation(enormous)
@@ -88,6 +89,47 @@ class ThermalPhysicsTests(unittest.TestCase):
         self.assertTrue(np.any(np.isclose(r.times, 3.7)))
         expected = c.duration * (.37 * c.heating_power - .63 * c.discharge_power)
         self.assertAlmostEqual(float(r.diagnostics["energy_j"][-1] - r.diagnostics["energy_j"][0]), expected, places=6)
+
+    def test_roundoff_near_charge_transition_does_not_create_tiny_step(self):
+        c = replace(self.config, duration=1., time_steps=10, charge_fraction=.3,
+                    heating_power=20000., discharge_power=5000.)
+        transition = c.duration * c.charge_fraction
+        self.assertNotEqual(np.linspace(0., c.duration, c.time_steps + 1)[3], transition)
+        result = run_simulation(c)
+        self.assertEqual(len(result.times), c.time_steps + 1)
+        self.assertEqual(np.count_nonzero(result.times == transition), 1)
+        self.assertEqual(result.times[0], 0.)
+        self.assertEqual(result.times[-1], c.duration)
+        self.assertGreater(float(np.diff(result.times).min()), .09)
+        expected = c.duration * (c.charge_fraction * c.heating_power
+                                 - (1 - c.charge_fraction) * c.discharge_power)
+        self.assertAlmostEqual(float(result.diagnostics["energy_j"][-1]
+                                     - result.diagnostics["energy_j"][0]), expected, places=6)
+
+    def test_charge_transition_preserves_off_grid_points_and_endpoint_schedules(self):
+        for fraction in (0., .37, 1.):
+            with self.subTest(charge_fraction=fraction):
+                c = replace(self.config, duration=1., time_steps=10,
+                            charge_fraction=fraction, heating_power=20000., discharge_power=5000.)
+                result = run_simulation(c)
+                expected_times = np.unique(np.r_[np.linspace(0., c.duration, c.time_steps + 1),
+                                                 c.duration * fraction])
+                np.testing.assert_array_equal(result.times, expected_times)
+                expected = c.duration * (fraction * c.heating_power - (1 - fraction) * c.discharge_power)
+                self.assertAlmostEqual(float(result.diagnostics["energy_j"][-1]
+                                             - result.diagnostics["energy_j"][0]), expected, places=6)
+
+    def test_charge_transition_roundoff_at_endpoints_preserves_complete_interval(self):
+        for fraction in (np.nextafter(0., 1.), np.nextafter(1., 0.)):
+            with self.subTest(charge_fraction=fraction):
+                c = replace(self.config, duration=1., time_steps=10,
+                            charge_fraction=float(fraction), heating_power=20000., discharge_power=5000.)
+                result = run_simulation(c)
+                np.testing.assert_array_equal(result.times, np.linspace(0., c.duration, c.time_steps + 1))
+                self.assertGreater(float(np.diff(result.times).min()), .09)
+                expected = c.duration * (fraction * c.heating_power - (1 - fraction) * c.discharge_power)
+                self.assertAlmostEqual(float(result.diagnostics["energy_j"][-1]
+                                             - result.diagnostics["energy_j"][0]), expected, places=6)
 
     def test_radiation_cools_surface_and_closes_energy_balance(self):
         c = replace(self.config, heating_power=0., emissivity=.1, duration=1.)
@@ -121,7 +163,7 @@ class ThermalPhysicsTests(unittest.TestCase):
                                   wait=lambda **_kwargs: 1, terminate=lambda: None)
         with tempfile.TemporaryDirectory() as directory, \
              patch.dict(os.environ, {"MAGNETIC_TORUS_RUNS": directory}), \
-             patch("magnetic_torus.physics.subprocess.Popen", return_value=process):
+             patch("magnetic_torus.numerics.fenics.subprocess.Popen", return_value=process):
             with self.assertRaisesRegex(PhysicsBackendUnavailable, "delayed final numerical error"):
                 run_simulation(replace(self.config, solver="fenics"))
             logs = list(Path(directory).glob("*/worker.log"))

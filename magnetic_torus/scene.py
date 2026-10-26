@@ -1,7 +1,6 @@
 """Persistent VTK actors for geometry, computed fields and independent particle replay."""
 from __future__ import annotations
 
-import math
 import textwrap
 from pathlib import Path
 from typing import Any, Callable
@@ -18,6 +17,10 @@ from matplotlib.colors import LinearSegmentedColormap
 from vtkmodules.vtkCommonCore import reference
 
 from .models import DoseResult, RunResult, ScenarioConfig
+from .display import DisplaySelection, SceneOptions
+from .geometry import conductor_mask
+
+_UNCHANGED = object()
 
 
 _TEMPERATURE_CMAP = LinearSegmentedColormap.from_list(
@@ -42,14 +45,6 @@ def scalar_values(result: RunResult, quantity: str, index: int, fields=None) -> 
     if values.ndim == 2:
         values = np.linalg.norm(values, axis=-1)
     return values / 1000.0 if key == "enthalpy" else values
-
-
-def conductor_mask(result: RunResult) -> np.ndarray:
-    supplied = result.metadata.get("conductor_mask")
-    if supplied is not None and np.asarray(supplied).shape == (len(result.points),):
-        return np.asarray(supplied, dtype=bool)
-    radius = np.hypot(result.points[:, 0], result.points[:, 1])
-    return (radius - result.config.major_radius) ** 2 + result.points[:, 2] ** 2 <= result.config.minor_radius ** 2 * 1.001
 
 
 class SceneWidget(QtWidgets.QWidget):
@@ -88,7 +83,6 @@ class SceneWidget(QtWidgets.QWidget):
         self._actor = None
         self._fixed_clim: tuple[float, float] | None = None
         self._field_cache = {}
-        self._flow_cache = {}
         self._display_fields = None
         self._color_fields = None
         self._source_label = None
@@ -100,11 +94,96 @@ class SceneWidget(QtWidgets.QWidget):
         self._mapper_style = None
         self._draft_geometry_key = None
         self._difference = False
+        self._difference_ranges = {}
+        self._has_flow = None
+        self._slice_key = None
+        self._slice_surface = None
+        self._slice_operator = None
+        self._slice_actor = None
+        self._slice_style = None
+        self._closed = False
+        self._render_timer = QtCore.QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self.flush_render)
         self.trajectory_data: dict[str, Any] | None = None
         self.dose: DoseResult | None = None
         self.preview(self.config, reset_camera=True)
         self.plotter.enable_point_picking(callback=self._pick, show_message=False, show_point=False,
                                          left_clicking=False, picker="point")
+
+    @property
+    def display_selection(self) -> DisplaySelection:
+        return DisplaySelection(self._display_fields, self._difference, self._source_label)
+
+    @property
+    def options(self) -> SceneOptions:
+        return SceneOptions(**{name: getattr(self, name) for name in SceneOptions.__dataclass_fields__})
+
+    def set_display(self, selection: DisplaySelection) -> None:
+        if selection.fields is not self._display_fields:
+            self._field_cache.clear()
+            self._tracer_cache.clear()
+            self._quantity_clims.clear()
+            self._difference_ranges.clear()
+            self._has_flow = None
+        self._display_fields = selection.fields
+        self._difference = selection.difference
+        self._source_label = selection.source_label
+
+    def set_quantity(self, quantity: str) -> None:
+        if quantity not in QUANTITIES:
+            raise ValueError(f"Unknown scene quantity: {quantity}")
+        if quantity != self.quantity:
+            self.quantity = quantity
+            self._fixed_clim = None
+            self.rebuild_surface()
+
+    def set_shared_color_range(self, limits: tuple[float, float] | None) -> None:
+        self._fixed_clim = limits
+        if self.result is not None and self._actor is not None and not self._difference:
+            current = limits if limits is not None else self.color_range()
+            self._actor.mapper.scalar_range = current
+            if self._slice_actor is not None:
+                self._slice_actor.mapper.scalar_range = current
+            self.request_render()
+
+    def set_options(self, options: SceneOptions) -> None:
+        previous = self.options
+        if previous == options:
+            return
+        for name in SceneOptions.__dataclass_fields__:
+            setattr(self, name, getattr(options, name))
+        if previous.visual_detail != options.visual_detail:
+            self._field_cache.clear()
+            self._tracer_cache.clear()
+        if previous.opacity != options.opacity:
+            actor = self.plotter.actors.get("reservoir")
+            if actor is not None:
+                actor.prop.opacity = self.opacity
+        if previous.cutaway != options.cutaway:
+            self.rebuild_surface()
+        elif self.result is not None:
+            self.update_index(self.index)
+        else:
+            self.request_render()
+
+    def request_render(self) -> None:
+        """Coalesce control and frame updates into one render per event cycle."""
+        if not self._closed and not self._render_timer.isActive():
+            self._render_timer.start(0)
+
+    def flush_render(self) -> None:
+        """Complete pending graphics before screenshots and synchronous exports."""
+        self._render_timer.stop()
+        if not self._closed:
+            self.plotter.render()
+
+    def _invalidate_slice(self) -> None:
+        self._slice_key = None
+        self._slice_surface = None
+        self._slice_operator = None
+        self._slice_actor = None
+        self._slice_style = None
 
     def _remove(self, name):
         self.plotter.remove_actor(name, reset_camera=False, render=False)
@@ -145,6 +224,7 @@ class SceneWidget(QtWidgets.QWidget):
 
     def _clear_actors(self):
         self.plotter.clear()
+        self._invalidate_slice()
         self._text_actors.clear()
         self._text_values.clear()
         self._mapper_style = None
@@ -177,7 +257,7 @@ class SceneWidget(QtWidgets.QWidget):
                                   name="draft_habitat", render=False, reset_camera=False)
             self._set_text("draft_note", "Draft geometry preview · Run to compute", position="upper_edge",
                            font_size=9, color="#b6f0ef")
-        self.plotter.render()
+        self.request_render()
 
     def preview(self, config: ScenarioConfig, reset_camera=False):
         camera = self.plotter.camera_position
@@ -190,7 +270,6 @@ class SceneWidget(QtWidgets.QWidget):
         self.trajectory_data = None
         self.dose = None
         self._field_cache.clear()
-        self._flow_cache.clear()
         self._tracer_cache.clear()
         self._clear_actors()
         self.plotter.add_axes(color="#cbd9e4")
@@ -199,7 +278,7 @@ class SceneWidget(QtWidgets.QWidget):
         if self.cutaway:
             torus = torus.clip(normal=(0, 1, 0), origin=(0, 0, 0), invert=True)
         self.plotter.add_mesh(torus, color="#65b4c7", smooth_shading=True, specular=0.35,
-                              opacity=self.opacity, name="reservoir")
+                              opacity=self.opacity, name="reservoir", render=False)
         self._habitat(config)
         self._set_text("title", "GEOMETRY PREVIEW", position="upper_left", font_size=12, color="#9ddce8")
         self._set_text("caption", "Edit parameters → Run simulation\nRight-click a computed reservoir point to inspect it",
@@ -209,18 +288,18 @@ class SceneWidget(QtWidgets.QWidget):
             self.plotter.reset_camera()
         else:
             self.plotter.camera_position = camera
-        self.plotter.render()
+        self.request_render()
 
     def _habitat(self, config):
         sphere = pv.Sphere(radius=config.habitat_radius, theta_resolution=32, phi_resolution=24)
         self.plotter.add_mesh(sphere, color="#e2d3b7", opacity=.28, smooth_shading=True,
-                              name="habitat", show_edges=False)
+                              name="habitat", show_edges=False, render=False)
         outline = pv.Circle(radius=config.major_radius, resolution=120)
-        self.plotter.add_mesh(outline, color="#436476", line_width=1, name="centerline")
+        self.plotter.add_mesh(outline, color="#436476", line_width=1, name="centerline", render=False)
         if config.ground_enabled:
             plane = pv.Plane(center=(0, 0, -config.habitat_radius - config.habitat_thickness),
                              direction=(0, 0, 1), i_size=3 * config.major_radius, j_size=3 * config.major_radius)
-            self.plotter.add_mesh(plane, color="#776c60", opacity=.18, name="ground")
+            self.plotter.add_mesh(plane, color="#776c60", opacity=.18, name="ground", render=False)
 
     def set_result(self, result: RunResult, quantity="Temperature", index=0, reset_camera=False):
         camera = self.plotter.camera_position
@@ -239,9 +318,10 @@ class SceneWidget(QtWidgets.QWidget):
         self._mask_indices = np.flatnonzero(self._mask)
         self._tree = KDTree(result.points[self._mask]) if self._mask.any() else None
         self._field_cache.clear()
-        self._flow_cache.clear()
         self._tracer_cache.clear()
         self._quantity_clims.clear()
+        self._difference_ranges.clear()
+        self._has_flow = None
         self._grid_operator = None
         self._surface_operator = None
         cells = np.asarray(result.metadata.get("cells", []), dtype=np.int64)
@@ -286,10 +366,14 @@ class SceneWidget(QtWidgets.QWidget):
                                 # theta is undefined on the tube centreline.
                                 # Average its surrounding first-shell FV cells.
                                 for angular in range(nt):
-                                    rows.append(row); cols.append(angular * nphi + k % nphi); weights.append(1 / nt)
+                                    rows.append(row)
+                                    cols.append(angular * nphi + k % nphi)
+                                    weights.append(1 / nt)
                             else:
                                 source_radial = min(radial - 1, nr - 1)
-                                rows.append(row); cols.append((source_radial * nt + j % nt) * nphi + k % nphi); weights.append(1.)
+                                rows.append(row)
+                                cols.append((source_radial * nt + j % nt) * nphi + k % nphi)
+                                weights.append(1.)
                 self._grid_operator = csr_matrix((weights, (rows, cols)), shape=(grid.n_points, len(result.points)))
         self._clear_actors()
         self.plotter.add_axes(color="#cbd9e4")
@@ -301,7 +385,7 @@ class SceneWidget(QtWidgets.QWidget):
             self.plotter.reset_camera()
         else:
             self.plotter.camera_position = camera
-        self.plotter.render()
+        self.request_render()
 
     def _surface_interpolator(self, surface):
         """Precompute true cell basis weights at clipped surface vertices.
@@ -319,7 +403,9 @@ class SceneWidget(QtWidgets.QWidget):
         unresolved = np.flatnonzero(nearest_distance > tolerance)
         containing = self._grid.find_containing_cell(surface.points[unresolved]) if len(unresolved) else []
         resolved = np.flatnonzero(nearest_distance <= tolerance)
-        rows.extend(resolved.tolist()); cols.extend(nearest[resolved].tolist()); weights.extend(np.ones(len(resolved)))
+        rows.extend(resolved.tolist())
+        cols.extend(nearest[resolved].tolist())
+        weights.extend(np.ones(len(resolved)))
         for row, cell_id in zip(unresolved, np.asarray(containing).ravel()):
             if cell_id < 0:
                 cell_id = int(np.asarray(self._grid.find_closest_cell(surface.points[row], return_closest_point=False)).reshape(-1)[0])
@@ -335,7 +421,9 @@ class SceneWidget(QtWidgets.QWidget):
                 raise ValueError("Cannot interpolate a cutaway point in the accepted simulation mesh.")
             for local_index, weight in enumerate(basis_weights):
                 if abs(weight) > 1.e-14:
-                    rows.append(int(row)); cols.append(cell.GetPointId(local_index)); weights.append(float(weight))
+                    rows.append(int(row))
+                    cols.append(cell.GetPointId(local_index))
+                    weights.append(float(weight))
         local_operator = csr_matrix((weights, (rows, cols)), shape=(surface.n_points, self._grid.n_points))
         return local_operator @ self._grid_operator
 
@@ -360,7 +448,7 @@ class SceneWidget(QtWidgets.QWidget):
         self._surface_operator = self._surface_interpolator(surface)
         self._remove("reservoir")
         try:
-            self.plotter.remove_scalar_bar()
+            self.plotter.remove_scalar_bar(render=False)
         except (ValueError, KeyError, IndexError, StopIteration):
             pass
         values = scalar_values(self.result, self.quantity, self.index, self._display_fields)
@@ -427,17 +515,15 @@ class SceneWidget(QtWidgets.QWidget):
         self._quantity_clims[cache_key] = (low, high)
         return (low, high)
 
-    def update_index(self, index, fields=None, difference=False, source_label=None):
+    def update_index(self, index, fields=_UNCHANGED, difference=_UNCHANGED, source_label=_UNCHANGED):
         if self.result is None or self._mask is None:
             return
         self.index = max(0, min(int(index), len(self.result.times) - 1))
-        if fields is not self._display_fields:
-            self._field_cache.clear()
-            self._tracer_cache.clear()
-            self._quantity_clims.clear()
-        self._display_fields = fields
-        self._difference = difference
-        self._source_label = source_label
+        self.set_display(DisplaySelection(
+            self._display_fields if fields is _UNCHANGED else fields,
+            self._difference if difference is _UNCHANGED else difference,
+            self._source_label if source_label is _UNCHANGED else source_label))
+        fields, difference, source_label = self._display_fields, self._difference, self._source_label
         values = scalar_values(self.result, self.quantity, self.index, fields)
         if values is not None and self._surface is not None and "source_id" in self._surface.point_data:
             ids = np.asarray(self._surface.point_data["source_id"], dtype=int)
@@ -445,13 +531,17 @@ class SceneWidget(QtWidgets.QWidget):
             if self._actor is not None:
                 if difference and fields is not None:
                     key = QUANTITIES[self.quantity][0]
-                    all_values = np.asarray(fields[key])[:, self._mask]
-                    bound = float(np.max(np.abs(all_values))) if all_values.ndim == 2 else float(np.max(np.linalg.norm(all_values, axis=-1)))
-                    if key == "enthalpy":
-                        bound /= 1000
-                    bound = max(bound, 1e-12)
-                    self._actor.mapper.scalar_range = (-bound, bound) if all_values.ndim == 2 else (0, bound)
-                    cmap = "coolwarm" if all_values.ndim == 2 else "magma"
+                    if self.quantity not in self._difference_ranges:
+                        all_values = np.asarray(fields[key])[:, self._mask]
+                        scalar = all_values.ndim == 2
+                        bound = float(np.max(np.abs(all_values))) if scalar else float(np.max(np.linalg.norm(all_values, axis=-1)))
+                        if key == "enthalpy":
+                            bound /= 1000
+                        bound = max(bound, 1e-12)
+                        self._difference_ranges[self.quantity] = ((-bound, bound) if scalar else (0, bound),
+                                                                 "coolwarm" if scalar else "magma")
+                    limits, cmap = self._difference_ranges[self.quantity]
+                    self._actor.mapper.scalar_range = limits
                 else:
                     self._actor.mapper.scalar_range = self.color_range()
                     cmap = QUANTITIES[self.quantity][2]
@@ -479,7 +569,7 @@ class SceneWidget(QtWidgets.QWidget):
         self._update_vectors()
         self._update_tracers()
         self._analysis_visibility()
-        self.plotter.render()
+        self.request_render()
 
     def _analysis_visibility(self):
         if self.result is None:
@@ -510,21 +600,39 @@ class SceneWidget(QtWidgets.QWidget):
             self._remove("frozen_note")
 
     def _update_slice(self):
-        self._remove("slice")
         if not self.slice_enabled or self._grid is None or self.result is None:
+            if self._slice_actor is not None:
+                self._remove("slice")
+                self._slice_actor = None
             return
         values = scalar_values(self.result, self.quantity, self.index, self._display_fields)
         if values is None:
+            self._remove("slice")
+            self._slice_actor = None
             return
-        self._grid.point_data["slice_value"] = self._grid_operator @ values if self._grid_operator is not None else values[
-            np.asarray(self._grid.point_data["source_id"], dtype=int)]
-        surface = self._grid.slice(normal=(1, 0, 0), origin=(self.slice_position, 0, 0))
+        key = (id(self._grid), self.slice_position)
+        if key != self._slice_key:
+            self._remove("slice")
+            self._slice_actor = None
+            self._slice_surface = self._grid.slice(normal=(1, 0, 0), origin=(self.slice_position, 0, 0))
+            self._slice_operator = self._surface_interpolator(self._slice_surface)
+            self._slice_key = key
+        surface = self._slice_surface
         if surface.n_points:
+            surface.point_data["slice_value"] = self._slice_operator @ values if self._slice_operator is not None else values[
+                np.asarray(surface.point_data["source_id"], dtype=int)]
             original = (self._display_fields if self._display_fields is not None else self.result.fields)[QUANTITIES[self.quantity][0]]
             cmap = ("coolwarm" if original.ndim == 2 else "magma") if self._difference else QUANTITIES[self.quantity][2]
             limits = tuple(self._actor.mapper.scalar_range) if self._actor is not None else self.color_range()
-            self.plotter.add_mesh(surface, scalars="slice_value", cmap=cmap,
-                                  clim=limits, show_scalar_bar=False, name="slice", render=False)
+            if self._slice_actor is None:
+                self._slice_actor = self.plotter.add_mesh(surface, scalars="slice_value", cmap=cmap,
+                                      clim=limits, show_scalar_bar=False, name="slice", render=False)
+                self._slice_style = None
+            style = (self.quantity, self._difference)
+            if style != self._slice_style:
+                self._slice_actor.mapper.lookup_table.cmap = cmap
+                self._slice_style = style
+            self._slice_actor.mapper.scalar_range = limits
 
     def _update_phase(self):
         self._remove("phase")
@@ -590,7 +698,9 @@ class SceneWidget(QtWidgets.QWidget):
             return
         fields = self._display_fields if self._display_fields is not None else self.result.fields
         velocity = fields.get("velocity")
-        if velocity is None or not np.any(velocity):
+        if self._has_flow is None:
+            self._has_flow = velocity is not None and bool(np.any(velocity))
+        if not self._has_flow:
             return
         count = {"Low": 24, "Medium": 48, "High": 96}[self.visual_detail]
         if 0 not in self._tracer_cache:
@@ -627,13 +737,20 @@ class SceneWidget(QtWidgets.QWidget):
         self.trajectory_data = data
         self.draw_particles(0.0)
 
+    def clear_analysis(self) -> None:
+        """Drop snapshot-bound layers even when reloading the same run."""
+        self.set_trajectories(None)
+        self.set_dose(None)
+        self._analysis_visibility()
+        self.request_render()
+
     def draw_particles(self, fraction: float):
         for name in ("particles", "particle_paths", "baseline_paths"):
             self._remove(name)
         data = self.trajectory_data
         if data is None or not self.show_particles:
             self._remove("particle_time")
-            self.plotter.render()
+            self.request_render()
             return
         paths = np.asarray(data["paths"])
         baseline = np.asarray(data["baseline_paths"])
@@ -654,9 +771,9 @@ class SceneWidget(QtWidgets.QWidget):
         times = np.asarray(data["times"])
         elapsed = float(np.max(times[:, length - 1]))
         self.plotter.add_text(f"Particle replay · max flight time {elapsed:.3g} s\nOrange: field on   Gray: field off",
-                              position="upper_right", font_size=9, color="#ffddb3", name="particle_time")
+                              position="upper_right", font_size=9, color="#ffddb3", name="particle_time", render=False)
         self._analysis_visibility()
-        self.plotter.render()
+        self.request_render()
 
     def set_dose(self, dose: DoseResult | None):
         self.dose = dose
@@ -677,9 +794,9 @@ class SceneWidget(QtWidgets.QWidget):
                                       name="dose", scalar_bar_args={"title": "Absorbed dose [Gy]", "color": "white"}, render=False)
         elif dose.target == "water" and len(dose.dose_gy):
             self.plotter.add_text(f"Water target mean: {dose.dose_gy[0]:.3g} ± {dose.standard_error_gy[0]:.2g} Gy\nSpatial dose map not provided by this run",
-                                  position="upper_right", font_size=10, color="#ffdbb9", name="dose_caption")
+                                  position="upper_right", font_size=10, color="#ffdbb9", name="dose_caption", render=False)
         self._analysis_visibility()
-        self.plotter.render()
+        self.request_render()
 
     def _pick(self, point):
         if self.result is None or self._tree is None or self._mask_indices is None:
@@ -689,7 +806,7 @@ class SceneWidget(QtWidgets.QWidget):
         self.point_selected.emit(index)
         self.plotter.add_mesh(pv.Sphere(radius=self.config.minor_radius * .035, center=self.result.points[index]),
                               color="#ffffff", name="probe", render=False)
-        self.plotter.render()
+        self.request_render()
 
     def camera_preset(self, kind):
         if kind == "Top":
@@ -702,4 +819,6 @@ class SceneWidget(QtWidgets.QWidget):
         self.plotter.camera.zoom(1.3)
 
     def close_scene(self):
+        self._closed = True
+        self._render_timer.stop()
         self.plotter.close()

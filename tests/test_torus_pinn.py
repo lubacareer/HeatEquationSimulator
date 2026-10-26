@@ -2,6 +2,8 @@
 from dataclasses import replace
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -44,6 +46,20 @@ def uniform_heating_run(**overrides):
     return RunResult("manufactured-uniform-heating", config, times, points,
                      {"enthalpy": h, "temperature": temperature, "liquid_fraction": np.zeros_like(h)},
                      {}, {"pinn_physics": physics, "validation_status": "manufactured analytic solution"})
+
+
+class PINNImportTests(unittest.TestCase):
+    def test_public_api_import_keeps_scientific_runtimes_lazy(self):
+        # The desktop must be able to inspect saved PINNs without initializing
+        # CUDA or the separate SciPy/OpenMP runtime used by numerical workers.
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import sys; import magnetic_torus.pinn; "
+             "assert 'torch' not in sys.modules; assert 'scipy' not in sys.modules"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 @unittest.skipIf(torch is None, "PyTorch is required")
@@ -163,6 +179,40 @@ class TorusPINNTests(unittest.TestCase):
         with patch.dict(os.environ, {"MAGNETIC_TORUS_PINN_DEVICE": "cpu"}):
             with self.assertRaises(SimulationCancelled):
                 train_pinn(run, update, cancel)
+        np.testing.assert_allclose(run.fields["temperature"][0], 490.)
+
+    def test_staged_training_is_seeded_and_preserves_the_callers_torch_rng(self):
+        run = uniform_heating_run(pinn_epochs=2)
+        with torch.random.fork_rng(devices=[]), patch.dict(os.environ, {"MAGNETIC_TORUS_PINN_DEVICE": "cpu"}):
+            torch.manual_seed(431)
+            before_first = torch.random.get_rng_state().clone()
+            first = train_pinn(run, lambda *_: None, threading.Event())
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), before_first))
+            torch.manual_seed(962)
+            before_second = torch.random.get_rng_state().clone()
+            second = train_pinn(run, lambda *_: None, threading.Event())
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), before_second))
+        for key in first.fields:
+            np.testing.assert_array_equal(first.fields[key], second.fields[key])
+        for key in first.history:
+            np.testing.assert_array_equal(first.history[key], second.history[key])
+        self.assertEqual(dict(first.metrics), dict(second.metrics))
+
+    def test_cancellation_during_prediction_does_not_assemble_a_result(self):
+        run = uniform_heating_run(pinn_epochs=1)
+        cancel = threading.Event()
+        updates = []
+
+        def update(fraction, _message):
+            updates.append(fraction)
+            if fraction > .9:
+                cancel.set()
+
+        with patch.dict(os.environ, {"MAGNETIC_TORUS_PINN_DEVICE": "cpu"}):
+            with self.assertRaises(SimulationCancelled):
+                train_pinn(run, update, cancel)
+        self.assertGreater(max(updates), .9)
+        self.assertNotIn(1., updates)
         np.testing.assert_allclose(run.fields["temperature"][0], 490.)
 
     def test_saved_prediction_cannot_attach_to_a_different_run_or_edited_config(self):

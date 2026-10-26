@@ -13,7 +13,9 @@ conda activate torch-gpu
 python interface3.py
 ```
 
-Select **Thermal benchmark**, then **Run simulation** for the quickest computed animation. Edit thermal properties and press **Recalculate scenario** without restarting. Accepted results remain visible while a job runs and survive failures and cancellation. **Iron** and **Lunar habitat** select the full FEniCS worker; their engineering/material values are illustrative.
+Select **Thermal benchmark**, set **Simulation duration [s]** in **Run setup** at the top of the sidebar, then select **Run simulation** for the quickest computed animation. Geometry and thermal properties remain editable in the same window; press **Recalculate scenario** without restarting. After running, right-click the 3D view to inspect a point. Accepted results remain visible while a job runs and survive failures and cancellation. **Iron** and **Lunar habitat** select the full FEniCS worker; their engineering/material values are illustrative.
+
+The thermal energy chart defaults to **Change (ΔE)**; select **Stored total** for absolute values. Stored energy is recoverable heat relative to the configured discharge temperature; it includes heat present before charging. Probe temperatures use the computed temperature range, with an annotation when the melting point is outside that range.
 
 For a new desktop environment:
 
@@ -52,6 +54,7 @@ The tested Windows Python 3.12 package versions are recorded in [requirements-de
 - FEniCS results also show their labelled regularized computational T(E) curve, and their probe markers follow that curve. The sharp reference plateau remains visible; conserved solver enthalpy is not converted for display.
 - Play, step, scrub, loop, or click history plots. The main clock displays accepted thermal/MHD snapshots. Particle replay has its own flight-time clock. Tracers interpolate accepted velocities for display; they are not additional solver states.
 - Thermal charts offer probe/cross-section temperature, liquid fraction, and thermal/pumping power. Dynamo charts show magnetic energy and toroidal/poloidal components. Shielding shows paired first-contact outcomes and field-on/off absorbed dose with standard errors. PINN shows training, held-out metrics, and overlays.
+- A completed PINN fit can fail its accuracy gates. The PINN view names failed checks, shows actual errors and trained epochs, and provides **Adjust training** to reveal the existing epoch/batch settings. Accepted numerical results remain available; failed PINNs remain labelled and cannot supply radiation-analysis fields.
 - Select two saved runs for linked cameras, common color limits, and aligned timelines. **Run difference** is available for matching point geometries; time interpolation is labelled as a display operation. Radiation always references an accepted frozen field snapshot.
 - Expand individual plots with their arrow. Advanced parameters and diagnostics remain collapsible. Export PNG scenes, SVG charts, annotated MP4, JSON scenarios, and SI HDF5 results on request. HDF5 embeds accepted exterior-field and weak-operator artifacts for portability.
 
@@ -106,6 +109,7 @@ With ground enabled, beam primaries sample only the exposed part of the incident
 ```powershell
 python -B scripts/run_checks.py
 python -B scripts/desktop_smoke.py
+python -B scripts/benchmark_desktop.py --output .cache/playback.json
 python -B -m magnetic_torus.physics --benchmark-report .cache/physics_validation.json --include-fenics
 python -B -m magnetic_torus.pinn_validation --native --device cpu --epochs 1000
 ```
@@ -113,6 +117,8 @@ python -B -m magnetic_torus.pinn_validation --native --device cpu --epochs 1000
 Run these in the desktop Python environment with PyTorch installed. The FE benchmark additionally needs the WSL worker; desktop smoke needs a graphical session. The test runner isolates modules to avoid OpenMP conflicts. Desktop smoke exercises real Qt/VTK, repeated edits/runs, probes, comparisons, cancellation, failure/stale isolation, particle replay, saved PINN inspection when available, and decoding every exported MP4 frame. It records scene size and measured FPS. Scientific reports list completed checks and outstanding qualification gates separately. The PINN validation CLI returns exit code **3** for a completed fit that fails validation.
 
 See [docs/VALIDATION.md](docs/VALIDATION.md) for actual benchmark values, the measured 31.8 FPS reference scene, real water/anatomical transport runs, failed coupled PINN fits, and open release gates. The Ubuntu FE package lock and integrity-pinned Geant4 environment are in `env/`.
+
+For component ownership, worker data flow, and before/after playback measurements, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Generated run histories, worker artifacts, datasets, checkpoints, and `.cache/` benchmark reports are kept out of Git. The paths in the validation record describe local evidence; rerun the commands above to generate reports on your machine. The recorded dynamic coupled PINN fits fail their accuracy gates, the small dose samples miss the 5% precision target, and the remaining MHD qualification benchmarks are still open.
 
