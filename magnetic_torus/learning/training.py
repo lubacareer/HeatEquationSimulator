@@ -1,7 +1,8 @@
 """Explicit preparation, loss evaluation, optimization, and prediction stages."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
+from copy import deepcopy
 import json
 import math
 import os
@@ -115,7 +116,9 @@ class NeuralField:
                 raise ValueError("Coupled weak-form PINN predictions require their accepted node/time indices.")
             base = torch.as_tensor(self.coupled_trial[time_ids, point_ids], **self.kw)
             free = torch.as_tensor(self.coupled_free[point_ids], **self.kw)
-            time_factor = inputs[:, 3:4].expand_as(correction).clone()
+            first_step = float(data.result.times[1] - self.start_time)
+            time_factor = torch.clamp(inputs[:, 3:4] * self.time_scale / first_step,
+                                      min=0., max=1.).expand_as(correction).clone()
             # Incompressible pressure is an elliptic Lagrange multiplier, not
             # a dynamical variable with a prescribed zero initial condition.
             time_factor[:, 10] = 1.
@@ -125,17 +128,23 @@ class NeuralField:
             raise ValueError("Thermal graph PINN predictions require their source mesh node indices.")
         t = self.start_time + inputs[:, 3:4] * self.time_scale
         charge_end = config.charge_fraction * config.duration
-        initial_h = float(data.reference[0, 0, 0])
-        mass = config.density * torch.as_tensor(operator.volumes[point_ids, None], **self.kw)
-        source = torch.as_tensor(operator.source_weights[point_ids, None], **self.kw) / mass
-        area = torch.as_tensor(operator.boundary_area[point_ids, None], **self.kw)
+        delta = config.initial_temperature - config.melting_temperature
+        initial_h = (config.heat_capacity_solid * delta if delta <= 0 else
+                     config.latent_heat + config.heat_capacity_liquid * delta)
+        # A local, conduction-free source trial overheats surface nodes and
+        # creates enormous diffusion gradients. The bulk energy particular
+        # solution uses only the prescribed source and geometric measures.
+        mass = config.density * float(operator.volumes.sum())
+        source = 1. / mass
+        area = float(operator.boundary_area.sum())
         initial_radiation = config.emissivity * STEFAN_BOLTZMANN * area * (
             config.initial_temperature ** 4 - config.ambient_temperature ** 4) / mass
         initial_cp = (config.heat_capacity_solid if config.initial_temperature <= config.melting_temperature else
                       config.heat_capacity_liquid)
-        decay = 4 * config.emissivity * STEFAN_BOLTZMANN * area * config.initial_temperature ** 3 / (mass * initial_cp)
-        charging_time = torch.clamp(t, min=0., max=charge_end)
-        discharge_time = torch.clamp(t - charge_end, min=0.)
+        decay = torch.as_tensor(4 * config.emissivity * STEFAN_BOLTZMANN * area *
+                                config.initial_temperature ** 3 / (mass * initial_cp), **self.kw)
+        charging_time = torch.clamp(t - self.start_time, min=0., max=max(charge_end - self.start_time, 0.))
+        discharge_time = torch.clamp(t - max(charge_end, self.start_time), min=0.)
         def response(duration: Any) -> Any:
             return torch.where(decay > 1e-14, -torch.expm1(-decay * duration) / decay.clamp(min=1e-14), duration)
         charging_h = (config.heating_power * source - initial_radiation) * response(charging_time)
@@ -159,32 +168,95 @@ class TrainingLosses:
     field: NeuralField
     field_validity: np.ndarray
     cancel: threading.Event
+    training_pools: tuple[np.ndarray, ...] = dataclass_field(init=False, repr=False)
+    training_counts: np.ndarray = dataclass_field(init=False, repr=False)
 
-    def errors_at(self, ids: np.ndarray) -> tuple[Any, np.ndarray]:
+    def __post_init__(self):
+        ids = self.field.data.train_ids
+        validity = self.validity_at(ids, training=True)
+        pools, counts = [], []
+        column = 0
+        for width in self.field.data.scaling.widths:
+            valid = validity[:, column:column + width]
+            pools.append(ids[valid.any(axis=1)])
+            counts.append(int(valid.sum()))
+            column += width
+        self.training_pools = tuple(pools)
+        self.training_counts = np.asarray(counts, dtype=np.int64)
+
+    def validity_at(self, ids: np.ndarray, *, training: bool = False) -> np.ndarray:
+        ti, pi = np.divmod(ids, self.field.data.point_count)
+        validity = self.field_validity[pi].copy()
+        if not self.field.data.thermal:
+            validity[ti == 0, 10] = False
+        if training:
+            validity &= self.field.coupled_free[pi] != 0
+            validity[ti == 0] = False
+        return validity
+
+    def errors_at(self, ids: np.ndarray, *, training: bool = False) -> tuple[Any, np.ndarray]:
         field = self.field
         data = field.data
         scaling = data.scaling
         ti, pi = np.divmod(ids, data.point_count)
         target = field.torch.as_tensor((data.reference[ti, pi] - scaling.offsets) / scaling.scales, **field.kw)
-        validity = self.field_validity[pi].copy()
-        if not data.thermal:
-            validity[ti == 0, 10] = False
+        validity = self.validity_at(ids, training=training)
         return (field.forward(field.input_at(ti, pi), pi, ti) - target).square(), validity
 
-    def sampled_loss(self, ids: np.ndarray) -> Any:
+    def _label_loss(self, errors: Any, validity: np.ndarray, counts: np.ndarray | None = None) -> Any:
         field = self.field
         torch = field.torch
-        errors, validity = self.errors_at(ids)
         valid_tensor = torch.as_tensor(validity, **field.kw)
         losses = []
         column = 0
-        for field_width in field.data.scaling.widths:
-            count = int(validity[:, column:column + field_width].sum())
+        for index, field_width in enumerate(field.data.scaling.widths):
+            count = int(validity[:, column:column + field_width].sum()) if counts is None else int(counts[index])
             if count:
                 losses.append((errors[:, column:column + field_width] *
                                valid_tensor[:, column:column + field_width]).sum() / count)
             column += field_width
-        return torch.stack(losses).mean()
+        return torch.stack(losses).mean() if losses else errors.sum() * 0.
+
+    def sampled_loss(self, ids: np.ndarray) -> Any:
+        return self._label_loss(*self.errors_at(ids, training=True))
+
+    def sampled_training_loss(self) -> Any:
+        """Sample each unknown field's labels without diluting rare free DOFs."""
+        field, data = self.field, self.field.data
+        eligible = [(index, pool) for index, pool in enumerate(self.training_pools) if len(pool)]
+        if not eligible:
+            return field.model[-1].weight.sum() * 0.
+        order = data.rng.permutation(len(eligible))
+        quota, remainder = divmod(field.maximum_batch, len(eligible))
+        samples, selections = [], []
+        for position, pool_index in enumerate(order):
+            index, pool = eligible[pool_index]
+            count = min(len(pool), quota + (position < remainder))
+            if count:
+                samples.append(data.rng.choice(pool, count, replace=False))
+                selections.append(np.full(count, index, dtype=np.int64))
+        ids, selected_fields = np.concatenate(samples), np.concatenate(selections)
+        errors, validity = self.errors_at(ids, training=True)
+        column = 0
+        for index, width in enumerate(data.scaling.widths):
+            validity[:, column:column + width] &= (selected_fields == index)[:, None]
+            column += width
+        return self._label_loss(errors, validity)
+
+    def stream_training_loss(self, *, backward: bool) -> Any:
+        """Accumulate a full training-label mean while releasing each batch graph."""
+        field, data = self.field, self.field.data
+        total = field.torch.zeros((), **field.kw)
+        for offset in range(0, len(data.train_ids), field.maximum_batch):
+            _cancelled(self.cancel)
+            ids = data.train_ids[offset:offset + field.maximum_batch]
+            loss = self._label_loss(*self.errors_at(ids, training=True), counts=self.training_counts)
+            if not bool(field.torch.isfinite(loss)):
+                raise FloatingPointError("PINN training-label objective became non-finite.")
+            if backward:
+                loss.backward()
+            total += loss.detach()
+        return total
 
     def validation_loss(self) -> float:
         field = self.field
@@ -208,7 +280,7 @@ class TrainingLosses:
         valid_fields = counts > 0
         return float(np.mean(totals[valid_fields] / counts[valid_fields]))
 
-    def thermal_physics(self) -> tuple[Any, Any]:
+    def thermal_physics(self, ti: int | None = None, centers: np.ndarray | None = None) -> tuple[Any, Any]:
         field = self.field
         data = field.data
         config = data.config
@@ -221,9 +293,10 @@ class TrainingLosses:
         # Match the reference's accepted backward-Euler interval exactly. A
         # continuous-time strong residual would conflict with coarse reference
         # snapshots merely because of numerical temporal truncation error.
-        ti = int(data.rng.integers(1, data.snapshot_count))
+        ti = int(data.rng.integers(1, data.snapshot_count)) if ti is None else ti
         physical_time = float((result.times[ti - 1] + result.times[ti]) / 2)
-        centers = data.rng.choice(data.point_count, min(field.maximum_batch, data.point_count), replace=False)
+        centers = (data.rng.choice(data.point_count, min(field.maximum_batch, data.point_count), replace=False)
+                   if centers is None else centers)
         support, positions, edge_indices, edge_values = operator.neighborhood(centers)
         pair_points = np.tile(support, 2)
         pair_times = np.repeat(np.asarray([ti - 1, ti]), len(support))
@@ -254,12 +327,12 @@ class TrainingLosses:
         boundary = ((initial - torch.as_tensor(data.reference[0, centers, 0], **kw)) / scaling.scales[0]).square().mean()
         return residual.square().mean(), boundary
 
-    def coupled_physics(self) -> tuple[Any, Any]:
+    def coupled_physics(self, ti: int | None = None) -> tuple[Any, Any]:
         field = self.field
         data = field.data
         torch = field.torch
         assert data.weak is not None
-        ti = int(data.rng.integers(1, data.snapshot_count))
+        ti = int(data.rng.integers(1, data.snapshot_count)) if ti is None else ti
         tids = np.repeat(np.array([ti - 1, ti], dtype=np.int64), data.point_count)
         pids = np.tile(np.arange(data.point_count, dtype=np.int64), 2)
         values = field.predict(field.input_at(tids, pids), pids, tids)
@@ -292,6 +365,11 @@ class TrainingRun:
     checkpoint_path: Path | None
     metadata: dict[str, Any]
     history: dict[str, list[float]]
+
+
+def _optimizer_steps(epochs: int) -> tuple[int, int]:
+    adam = epochs if epochs < 50 else 4 * epochs // 5
+    return adam, epochs - adam
 
 
 def _prepare_data(result: RunResult, cancel: threading.Event) -> TrainingData:
@@ -343,7 +421,8 @@ def _prepare_training(data: TrainingData, progress: Progress, cancel: threading.
         torch.nn.init.zeros_(model[-1].weight)
         torch.nn.init.zeros_(model[-1].bias)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, config.pinn_epochs), eta_min=1e-5)
+    adam_steps, _ = _optimizer_steps(config.pinn_epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, adam_steps), eta_min=1e-5)
     maximum_batch = min(config.pinn_batch_size, 4096)
     # A full FE pair retains its autograd graph. Bound this explicit, rather
     # than implying that split forward calls alone limit activation memory.
@@ -386,10 +465,12 @@ def _prepare_training(data: TrainingData, progress: Progress, cancel: threading.
                         temporal_frequencies, length_scale, start_time, time_scale,
                         toroidal_thermal_inputs, coupled_trial, coupled_free)
     metadata = _training_metadata(data, field, checkpoint_path)
+    losses = TrainingLosses(field, field_validity, cancel)
+    metadata["training_unknown_components"] = dict(zip(scaling.names, losses.training_counts.tolist()))
     history: dict[str, list[float]] = {key: [] for key in (
         "epoch", "loss", "data_loss", "physics_loss", "boundary_loss", "validation_loss")}
     progress(0.0, f"Preparing {'thermal' if thermal else 'coupled weak-form'} PINN on {device}")
-    return TrainingRun(field, TrainingLosses(field, field_validity, cancel), optimizer,
+    return TrainingRun(field, losses, optimizer,
                        scheduler, run_id, checkpoint_path, metadata, history)
 
 
@@ -397,18 +478,21 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
     config = data.config
     scaling = data.scaling
     result = data.result
+    adam_steps, lbfgs_steps = _optimizer_steps(config.pinn_epochs)
     metadata: dict[str, Any] = {
         "format_version": FORMAT_VERSION, "source_run_id": result.run_id,
+        "parameterization_version": 2, "training_method_version": 2,
         "source_config_hash": config.config_hash, "source_snapshot_times_s": result.times.tolist(),
         "source_physics_hash": config.physics_hash, "training_source_run_id": result.run_id,
         "training_config_hash": config.config_hash, "training_epochs": config.pinn_epochs,
         "physics": result.metadata["pinn_physics"]["kind"] if data.thermal else "coupled_fe_weak_operator",
-        "turbulence": bool(config.turbulence), "device": str(field.device), "torch_version": field.torch.__version__,
+        "turbulence": bool(config.turbulence), "device": str(field.device), "torch_version": str(field.torch.__version__),
         "seed": config.seed, "training_samples": int(len(data.train_ids)),
         "heldout_samples": int(len(data.validation_ids)), "max_forward_batch": field.maximum_batch,
         "heldout_split": "disjoint seeded point-time labels; physics collocation may use the same locations",
         "normalization_fitted_on": "training labels only",
-        "data_loss_aggregation": "mean of per-field valid-component MSE; conductor fields masked; initial pressure is not a dynamical initial condition",
+        "data_loss_aggregation": "mean of per-field free-DOF MSE; stratified training labels; prescribed initial/Dirichlet labels excluded from training only",
+        "heldout_loss_aggregation": "unchanged mean of per-field valid-component MSE; conductor fields masked; initial pressure excluded",
         "excluded_initial_labels": [] if data.thermal else ["pressure"],
         "field_names": list(scaling.names), "field_offsets": scaling.offsets.tolist(),
         "field_scales": scaling.scales.tolist(), "length_scale_m": field.length_scale,
@@ -416,10 +500,20 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
                             "Cartesian and toroidal geometry features plus time" if not data.thermal else "Cartesian coordinates and time"),
         "architecture": {"widths": [4 if data.thermal else 21, 64, 64, 64, data.output_width], "activation": "tanh", "dtype": "float64"},
         "temporal_features": [] if data.thermal else ["sin/cos(2π·2^k·normalized_time), k=0,…,5"],
-        "optimizer": {"name": "Adam", "initial_learning_rate": .001,
-                      "schedule": "cosine", "final_learning_rate": 1e-5, "gradient_norm_limit": 10.},
+        "optimizer": {"name": "Adam + L-BFGS" if lbfgs_steps else "Adam",
+                      "adam": {"steps": adam_steps, "initial_learning_rate": .001,
+                               "schedule": "cosine", "final_learning_rate": 1e-5, "gradient_norm_limit": 10.},
+                      "lbfgs": {"steps": lbfgs_steps, "max_iter": 1, "max_eval": 8,
+                                "history_size": 20, "line_search": "strong_wolfe",
+                                "closure_evaluation_cap": 8,
+                                "budget_policy": "rollback weights/gradients/optimizer state; halve next training step learning rate"}},
+        "optimizer_steps_completed": {"adam": 0, "lbfgs": 0},
+        "refinement_budget_limited_steps": 0,
+        "function_evaluations": {"adam": 0, "lbfgs_closures": 0,
+                                 "refinement_objective": 0, "final_objective": 0},
         "hard_constraints": "specified dynamical initial state and FE Dirichlet node masks; pressure is elliptic" if not data.thermal else "specified initial state",
-        "particular_solution": ("local prescribed heating/discharge with initial-state linearized radiation; neural correction enforces exact nonlinear radiation and conduction" if data.thermal else
+        "correction_time_envelope": "normalized physical time" if data.thermal else "accepted-first-step ramp; pressure remains elliptic",
+        "particular_solution": ("uniform bulk prescribed heating/discharge with total-mass/area initial-state linearized radiation; neural correction enforces exact nonlinear radiation and conduction" if data.thermal else
                                 "prescribed initial enthalpy, integrated input and imposed coil/seed FE field; neural correction learns coupled response"),
         "time_scale_s": field.time_scale,
         "time_discretization": "source worker's accepted backward-Euler intervals and source schedule",
@@ -440,29 +534,117 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
     return metadata
 
 
+def _deterministic_objective(run: TrainingRun, indices: np.ndarray, centers: np.ndarray,
+                             *, backward: bool) -> dict[str, Any]:
+    """A fixed training objective, streamed without retaining all batch graphs."""
+    losses, field = run.losses, run.field
+    data_loss = losses.stream_training_loss(backward=backward)
+    physics_loss = field.torch.zeros((), **field.kw)
+    boundary_loss = field.torch.zeros((), **field.kw)
+    for index in indices:
+        _cancelled(losses.cancel)
+        physics, boundary = (losses.thermal_physics(int(index), centers) if field.data.thermal
+                             else losses.coupled_physics(int(index)))
+        loss = (physics + boundary) / len(indices)
+        if not bool(field.torch.isfinite(loss)):
+            raise FloatingPointError("PINN physics objective became non-finite.")
+        if backward:
+            loss.backward()
+        physics_loss += physics.detach() / len(indices)
+        boundary_loss += boundary.detach() / len(indices)
+    return {"data_loss": data_loss, "physics_loss": physics_loss,
+            "boundary_loss": boundary_loss, "loss": data_loss + physics_loss + boundary_loss}
+
+
+class _RefinementEvaluationBudget(RuntimeError):
+    """An attempted line search exhausted its actual closure-call allowance."""
+
+
+def _bounded_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Callable[[], Any],
+                       cancel: threading.Event, limit: int = 8) -> tuple[int, bool]:
+    """Bound actual closure calls and roll back a discarded line-search trial."""
+    torch = _torch()
+    weights = [parameter.detach().clone() for parameter in parameters]
+    gradients = [None if parameter.grad is None else parameter.grad.detach().clone()
+                 for parameter in parameters]
+    state = deepcopy(optimizer.state_dict())
+    evaluations = 0
+
+    def counted_closure():
+        nonlocal evaluations
+        _cancelled(cancel)
+        if evaluations >= limit:
+            raise _RefinementEvaluationBudget()
+        evaluations += 1
+        return closure()
+
+    try:
+        optimizer.step(counted_closure)
+    except _RefinementEvaluationBudget:
+        with torch.no_grad():
+            for parameter, weight, gradient in zip(parameters, weights, gradients):
+                parameter.copy_(weight)
+                parameter.grad = gradient
+        optimizer.load_state_dict(state)
+        return evaluations, True
+    return evaluations, False
+
+
 def _train_model(run: TrainingRun, progress: Progress, cancel: threading.Event) -> float:
     field = run.field
     data = field.data
     config = data.config
     torch = field.torch
     initial_validation = run.losses.validation_loss()
+    adam_steps, _ = _optimizer_steps(config.pinn_epochs)
+    physics_indices = np.unique(np.linspace(1, data.snapshot_count - 1,
+        min(4, data.snapshot_count - 1), dtype=np.int64))
+    centers = np.unique(np.linspace(0, data.point_count - 1,
+        min(field.maximum_batch, data.point_count), dtype=np.int64))
+    run.metadata["refinement_physics_snapshot_indices"] = physics_indices.tolist()
+    run.metadata["refinement_center_ids"] = centers.tolist()
+    run.metadata["refinement_labels"] = "all training labels, streamed; held-out labels never used by the optimizer"
     for epoch in range(config.pinn_epochs):
         _cancelled(cancel)
         field.model.train()
-        run.optimizer.zero_grad(set_to_none=True)
-        chosen = data.rng.choice(data.train_ids, min(field.maximum_batch, len(data.train_ids)), replace=False)
-        data_loss = run.losses.sampled_loss(chosen)
-        physics_loss, boundary_loss = run.losses.thermal_physics() if data.thermal else run.losses.coupled_physics()
-        loss = data_loss + physics_loss + boundary_loss
-        if not bool(torch.isfinite(loss)):
-            raise FloatingPointError("PINN loss became non-finite; previous numerical results are unchanged. Reduce the learning scale or rerun a smaller benchmark.")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(field.model.parameters(), 10.0, error_if_nonfinite=True)
-        run.optimizer.step()
-        run.scheduler.step()
-        values = {"epoch": float(epoch + 1), "loss": float(loss.item()),
-                  "data_loss": float(data_loss.item()), "physics_loss": float(physics_loss.item()),
-                  "boundary_loss": float(boundary_loss.item())}
+        if epoch < adam_steps:
+            run.optimizer.zero_grad(set_to_none=True)
+            data_loss = run.losses.sampled_training_loss()
+            physics_loss, boundary_loss = run.losses.thermal_physics() if data.thermal else run.losses.coupled_physics()
+            loss = data_loss + physics_loss + boundary_loss
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError("PINN loss became non-finite; previous numerical results are unchanged.")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(field.model.parameters(), 10.0, error_if_nonfinite=True)
+            run.optimizer.step()
+            run.scheduler.step()
+            run.metadata["optimizer_steps_completed"]["adam"] += 1
+            run.metadata["function_evaluations"]["adam"] += 1
+            objective = {"loss": loss, "data_loss": data_loss, "physics_loss": physics_loss,
+                         "boundary_loss": boundary_loss}
+        else:
+            if epoch == adam_steps:
+                run.optimizer = torch.optim.LBFGS(field.model.parameters(), lr=1., max_iter=1,
+                    max_eval=8, history_size=20, line_search_fn="strong_wolfe")
+            def closure():
+                _cancelled(cancel)
+                run.optimizer.zero_grad(set_to_none=True)
+                terms = _deterministic_objective(run, physics_indices, centers, backward=True)
+                if any(parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())
+                       for parameter in field.model.parameters()):
+                    raise FloatingPointError("PINN refinement gradient became non-finite.")
+                run.metadata["function_evaluations"]["lbfgs_closures"] += 1
+                return terms["loss"]
+            _, limited = _bounded_lbfgs_step(run.optimizer, tuple(field.model.parameters()), closure, cancel)
+            if limited:
+                run.metadata["refinement_budget_limited_steps"] += 1
+                for group in run.optimizer.param_groups:
+                    group["lr"] *= .5
+            run.metadata["optimizer_steps_completed"]["lbfgs"] += 1
+            objective = _deterministic_objective(run, physics_indices, centers, backward=False)
+            run.metadata["function_evaluations"]["refinement_objective"] += 1
+        values = {"epoch": float(epoch + 1), **{
+            key: float(value.detach().item()) for key, value in objective.items()}}
         # Evaluate held-out labels regularly, and retain a finite displayed
         # value between evaluations rather than NaN history placeholders.
         if epoch == 0 or (epoch + 1) % 10 == 0 or epoch + 1 == config.pinn_epochs:
@@ -478,6 +660,13 @@ def _train_model(run: TrainingRun, progress: Progress, cancel: threading.Event) 
         if run.checkpoint_path is not None and ((epoch + 1) % 50 == 0 or epoch + 1 == config.pinn_epochs):
             _checkpoint(run.checkpoint_path, field.model, run.optimizer, epoch + 1, data.result, data.scaling, run.history, run.metadata)
 
+    # Qualification must refer to the final weights, not a pre-update random
+    # Adam batch or a trial point from an L-BFGS line search. Keep raw scales.
+    objective = _deterministic_objective(run, physics_indices, centers, backward=False)
+    run.metadata["function_evaluations"]["final_objective"] += 1
+    run.metadata["final_loss_evaluation"] = "final weights; all training labels and fixed accepted-interval physics panels; original raw residual scales"
+    for key, value in objective.items():
+        run.history[key][-1] = float(value.detach().item())
     return initial_validation
 
 

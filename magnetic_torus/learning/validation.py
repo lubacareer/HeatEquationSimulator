@@ -171,6 +171,6 @@ def validate_prediction(run: TrainingRun, predicted: dict[str, np.ndarray], init
            "each independently checked FE normalized residual RMS ≤ 0.1"))
     run.metadata["validation_notes"] = ("Agreement with this source run is assessed; this does not establish "
                                     "physical validity or mesh convergence of the source simulation.")
-    run.metadata["software_versions"] = {"torch": field.torch.__version__, "numpy": np.__version__,
+    run.metadata["software_versions"] = {"torch": str(field.torch.__version__), "numpy": np.__version__,
                                      "python": platform.python_version(), "simulator": __version__}
     return metrics
