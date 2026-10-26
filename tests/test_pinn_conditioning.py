@@ -251,7 +251,7 @@ class PINNConditioningTests(unittest.TestCase):
             result.metadata["function_evaluations"]["lbfgs_closures"], 10
         )
         self.assertEqual(result.metadata["parameterization_version"], 2)
-        self.assertEqual(saved["metadata"]["training_method_version"], 3)
+        self.assertEqual(saved["metadata"]["training_method_version"], 4)
         self.assertEqual(saved["source_run_id"], source.run_id)
         self.assertEqual(saved["config_hash"], source.config.config_hash)
 

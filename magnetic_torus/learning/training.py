@@ -202,10 +202,12 @@ class NeuralField:
         base = initial_h + charging_h * torch.exp(-decay * discharge_time) + discharge_h
         return (base - self.offsets) / self.scales + inputs[:, 3:4] * correction
 
-    def predict(self, inputs: Any, point_ids: np.ndarray | None = None, time_ids: np.ndarray | None = None) -> dict[str, Any]:
+    def predict(self, inputs: Any, point_ids: np.ndarray | None = None, time_ids: np.ndarray | None = None,
+                *, forward_batch_size: int | None = None) -> dict[str, Any]:
         data = self.data
         config = data.config
-        fields = data.scaling.split(self.forward(inputs, point_ids, time_ids) * self.scales + self.offsets)
+        fields = data.scaling.split(self.forward(inputs, point_ids, time_ids,
+            forward_batch_size=forward_batch_size) * self.scales + self.offsets)
         temperature, fraction = (enthalpy_to_state_torch(fields["enthalpy"], config) if data.thermal else
                                  regularized_enthalpy_to_state_torch(fields["enthalpy"], config))
         fields["temperature"], fields["liquid_fraction"] = temperature, fraction
@@ -279,12 +281,13 @@ class TrainingLosses:
     def sampled_loss(self, ids: np.ndarray) -> Any:
         return self._label_loss(*self.errors_at(ids, training=True))
 
-    def sampled_training_loss(self) -> Any:
+    def sampled_training_loss(self, *, active_fields: tuple[str, ...] | None = None) -> Any:
         """Sample each unknown field's labels without diluting rare free DOFs."""
         field, data = self.field, self.field.data
-        eligible = [(index, pool) for index, pool in enumerate(self.training_pools) if len(pool)]
+        eligible = [(index, pool) for index, pool in enumerate(self.training_pools) if len(pool)
+                    and (active_fields is None or data.scaling.names[index] in active_fields)]
         if not eligible:
-            return field.model[-1].weight.sum() * 0.
+            return next(parameter for parameter in field.model.parameters() if parameter.requires_grad).sum() * 0.
         order = data.rng.permutation(len(eligible))
         quota, remainder = divmod(field.maximum_batch, len(eligible))
         samples, selections = [], []
@@ -391,15 +394,15 @@ class TrainingLosses:
         boundary = ((initial - torch.as_tensor(data.reference[0, centers, 0], **kw)) / scaling.scales[0]).square().mean()
         return residual.square().mean(), boundary
 
-    def coupled_physics(self, ti: int | None = None) -> tuple[Any, Any]:
+    def coupled_components(self, ti: int) -> Mapping[str, Any]:
         field = self.field
         data = field.data
         torch = field.torch
         assert data.weak is not None
-        ti = int(data.rng.integers(1, data.snapshot_count)) if ti is None else ti
         tids = np.repeat(np.array([ti - 1, ti], dtype=np.int64), data.point_count)
         pids = np.tile(np.arange(data.point_count, dtype=np.int64), 2)
-        values = field.predict(field.input_at(tids, pids), pids, tids)
+        values = field.predict(field.input_at(tids, pids), pids, tids,
+                               forward_batch_size=_FULL_LABEL_BATCH_SIZE)
         fields = {key: value.reshape((2, data.point_count) + value.shape[1:]) for key, value in values.items()}
         components = data.weak(data.config, data.result, fields, np.asarray([ti - 1, ti], dtype=np.int64))
         if not isinstance(components, Mapping) or not components:
@@ -408,14 +411,20 @@ class TrainingLosses:
         if not required.issubset(components):
             raise UnsupportedPINNConfiguration("The coupled FE weak adapter omits required conservation/gauge equations: "
                                                + ", ".join(sorted(required - set(components))))
-        # Adapter residuals are nondimensionalized by the exact worker scales.
-        physics_terms, boundary_terms = [], []
         for key, value in components.items():
             if not isinstance(value, torch.Tensor) or not value.requires_grad or not bool(torch.isfinite(value).all()):
                 raise ValueError(f"The FE PINN residual {key} is non-finite or detached from the neural fields.")
+        return components
+
+    def coupled_physics(self, ti: int | None = None) -> tuple[Any, Any]:
+        data, torch = self.field.data, self.field.torch
+        ti = int(data.rng.integers(1, data.snapshot_count)) if ti is None else ti
+        # Adapter residuals are nondimensionalized by the exact worker scales.
+        physics_terms, boundary_terms = [], []
+        for key, value in self.coupled_components(ti).items():
             (boundary_terms if key.startswith("boundary") else physics_terms).append(value.square().mean())
         return torch.stack(physics_terms).mean(), (torch.stack(boundary_terms).mean() if boundary_terms else
-                                                   torch.zeros((), **field.kw))
+                                                   torch.zeros((), **self.field.kw))
 
 
 @dataclass
@@ -434,6 +443,85 @@ class TrainingRun:
 def _optimizer_steps(epochs: int) -> tuple[int, int]:
     adam = epochs if epochs < 50 else 4 * epochs // 5
     return adam, epochs - adam
+
+
+def _physics_weight(epoch: int, epochs: int, *, thermal: bool) -> float:
+    """Fixed native data warmup, followed by a fixed residual ramp."""
+    adam, _ = _optimizer_steps(epochs)
+    warmup = min(100, adam // 8) if thermal and epochs >= 50 else 0
+    if epoch < warmup:
+        return 0.
+    if warmup and epoch < 2 * warmup:
+        return (epoch - warmup + 1) / warmup
+    return 1.
+
+
+def _audit_intervals(data: TrainingData) -> np.ndarray:
+    indices = np.unique(np.linspace(1, data.snapshot_count - 1,
+        min(10, data.snapshot_count - 1), dtype=np.int64))
+    if data.thermal:
+        transition = data.config.charge_fraction * data.config.duration
+        nearest = int(np.searchsorted(data.result.times, transition))
+        indices = np.union1d(indices, [index for index in (nearest - 1, nearest, nearest + 1)
+                                     if 1 <= index < data.snapshot_count])
+    return indices.astype(np.int64)
+
+
+def _training_diagnostics(run: TrainingRun, indices: np.ndarray) -> dict[str, dict[str, float]]:
+    """Training labels and equation-only panels; held-out labels are never read."""
+    field, losses = run.field, run.losses
+    data, torch = field.data, field.torch
+    sums = torch.zeros(len(data.scaling.names), **field.kw)
+    with torch.no_grad():
+        for offset in range(0, len(data.train_ids), field.full_label_batch_size):
+            _cancelled(losses.cancel)
+            errors, valid = losses.errors_at(data.train_ids[offset:offset + field.full_label_batch_size],
+                training=True, forward_batch_size=field.full_label_batch_size)
+            column = 0
+            for index, width in enumerate(data.scaling.widths):
+                sums[index] += (errors[:, column:column + width] *
+                    torch.as_tensor(valid[:, column:column + width], **field.kw)).sum()
+                column += width
+    host = sums.cpu().numpy()
+    fields = {name: math.sqrt(float(total) / int(count))
+              for name, total, count in zip(data.scaling.names, host, losses.training_counts) if count}
+    residual_sums, residual_counts = {}, {}
+    for ti in indices:
+        _cancelled(losses.cancel)
+        if data.thermal:
+            for offset in range(0, data.point_count, field.maximum_batch):
+                centers = np.arange(offset, min(offset + field.maximum_batch, data.point_count))
+                value, _ = losses.thermal_physics(int(ti), centers)
+                residual_sums["enthalpy"] = residual_sums.get("enthalpy", 0.) + float(value.detach()) * len(centers)
+                residual_counts["enthalpy"] = residual_counts.get("enthalpy", 0) + len(centers)
+        else:
+            for key, value in losses.coupled_components(int(ti)).items():
+                residual_sums[key] = residual_sums.get(key, 0.) + float(value.detach().square().sum())
+                residual_counts[key] = residual_counts.get(key, 0) + value.numel()
+    residuals = {key: math.sqrt(value / residual_counts[key]) for key, value in residual_sums.items()}
+    if not all(math.isfinite(value) for value in (*fields.values(), *residuals.values())):
+        raise FloatingPointError("PINN training activation diagnostics became non-finite.")
+    return {"fields": fields, "residuals": residuals}
+
+
+def _correction_groups(data: TrainingData, diagnostics: Mapping[str, Mapping[str, float]]) -> tuple[str, ...]:
+    fields, residuals = diagnostics["fields"], diagnostics["residuals"]
+    def above(field_names: tuple[str, ...], equations: tuple[str, ...]) -> bool:
+        return any(fields.get(name, 0.) > .05 for name in field_names) or any(
+            residuals.get(name, 0.) > .05 for name in equations)
+    if data.thermal:
+        return ("thermal",) if above(("enthalpy",), ("enthalpy",)) else ()
+    groups = []
+    if above(("pressure", "electric_potential"), ("momentum", "charge")):
+        groups.append("elliptic")
+    if above(("enthalpy", "velocity"), ("continuity", "enthalpy")):
+        groups.append("thermofluid")
+    return tuple(groups)
+
+
+def _validate_correction_memory(data: TrainingData, groups: tuple[str, ...]) -> None:
+    if 2 * data.point_count * data.output_width * (1 + len(groups)) > 2_000_000:
+        raise UnsupportedPINNConfiguration("The active correction architecture exceeds the bounded FE-pair training memory budget; use a smaller mesh.")
 
 
 def _prepare_data(result: RunResult, cancel: threading.Event) -> TrainingData:
@@ -546,7 +634,7 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
     adam_steps, lbfgs_steps = _optimizer_steps(config.pinn_epochs)
     metadata: dict[str, Any] = {
         "format_version": FORMAT_VERSION, "source_run_id": result.run_id,
-        "parameterization_version": 2, "training_method_version": 3,
+        "parameterization_version": 2, "training_method_version": 4,
         "source_config_hash": config.config_hash, "source_snapshot_times_s": result.times.tolist(),
         "source_physics_hash": config.physics_hash, "training_source_run_id": result.run_id,
         "training_config_hash": config.config_hash, "training_epochs": config.pinn_epochs,
@@ -579,6 +667,14 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
                                 "closure_evaluation_cap": 8,
                                 "budget_policy": "full rollback, then recover an evaluated Armijo-decreasing training trial; restart curvature/LR; rejected-step backoff has a 1e-3 floor"}},
         "optimizer_steps_completed": {"adam": 0, "lbfgs": 0},
+        "requested_training_steps": config.pinn_epochs, "actual_training_steps": 0,
+        "additional_optimizer_steps_completed": {"adam": 0, "lbfgs": 0},
+        "conditioning_policy": {"activation_target": .05, "activation_source": "training free-DOF normalized RMSE and equation-only raw residual RMS",
+            "additional_adam_limit": min(2000, 2 * config.pinn_epochs),
+            "additional_lbfgs_limit": min(50, config.pinn_epochs // 20),
+            "native_warmup_steps": min(100, adam_steps // 8) if data.thermal and config.pinn_epochs >= 50 else 0,
+            "native_ramp_steps": min(100, adam_steps // 8) if data.thermal and config.pinn_epochs >= 50 else 0},
+        "training_stages": [],
         "refinement_budget_limited_steps": 0,
         "refinement_step_outcomes": {"wolfe": 0, "armijo_recovered": 0, "rolled_back": 0,
                                      "restarted_nochange": 0, "converged": 0},
@@ -734,96 +830,189 @@ def _recovering_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure:
     return _RefinementStep(evaluations, limited, outcome, gradient_max, delta_inf, initial_loss)
 
 
-def _train_model(run: TrainingRun, progress: Progress, cancel: threading.Event) -> float:
-    field = run.field
-    data = field.data
+def _refinement_iteration(run: TrainingRun, indices: np.ndarray, centers: np.ndarray,
+                          parameters: tuple[Any, ...]) -> tuple[dict[str, Any], _RefinementStep]:
+    torch = run.field.torch
+    def closure():
+        _cancelled(run.losses.cancel)
+        run.optimizer.zero_grad(set_to_none=True)
+        terms = _deterministic_objective(run, indices, centers, backward=True)
+        if any(parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())
+               for parameter in parameters):
+            raise FloatingPointError("PINN refinement gradient became non-finite.")
+        run.metadata["function_evaluations"]["lbfgs_closures"] += 1
+        return terms["loss"]
+    step = _recovering_lbfgs_step(run.optimizer, parameters, closure, run.losses.cancel)
+    run.metadata["refinement_budget_limited_steps"] += int(step.limited)
+    run.metadata["refinement_step_outcomes"][step.outcome] += 1
+    run.metadata["refinement_accepted_updates"] += int(step.delta_inf > 0.)
+    run.metadata["refinement_nochange_steps"] += int(step.delta_inf == 0.)
+    run.metadata["refinement_restarts"] += int(step.limited or step.outcome == "restarted_nochange")
+    objective = _deterministic_objective(run, indices, centers, backward=False)
+    run.metadata["function_evaluations"]["refinement_objective"] += 1
+    run.metadata["refinement_last_step"] = {
+        "outcome": step.outcome, "gradient_max": step.gradient_max,
+        "parameter_delta_inf": step.delta_inf,
+        "training_objective_change": float(objective["loss"]) - step.initial_loss,
+        "learning_rate": float(run.optimizer.param_groups[0]["lr"])}
+    return objective, step
+
+
+def _train_corrections(run: TrainingRun, audit_indices: np.ndarray, centers: np.ndarray,
+                       record: Callable[..., None], cancel: threading.Event) -> tuple[str, ...]:
+    """Activate from training diagnostics and execute fixed correction stages."""
+    field, data, torch = run.field, run.field.data, run.field.torch
     config = data.config
-    torch = field.torch
+    run.metadata.setdefault("last_physics_evaluated_epoch", int(run.history["epoch"][-1]))
+    run.metadata["correction_physics_snapshot_indices"] = audit_indices.tolist()
+    groups = ()
+    if config.pinn_epochs >= 50:
+        diagnostics = _training_diagnostics(run, audit_indices)
+        groups = _correction_groups(data, diagnostics)
+        run.metadata["conditioning_activation"] = {"diagnostics": diagnostics,
+            "active_groups": list(groups), "target": .05, "source": "training labels and raw equations only"}
+        run.metadata["function_evaluations"]["activation_diagnostics"] = 1
+    if groups:
+        if data.thermal:
+            parameters = tuple(field.model.parameters())
+            active_fields = ("enthalpy",)
+        else:
+            # Each added 64x3 trunk retains another full accepted FE pair.
+            _validate_correction_memory(data, groups)
+            from .corrections import create_correction_model
+            field.model = create_correction_model(field.model, groups, torch=torch)
+            parameters = tuple(field.model.branch_parameters())
+            run.metadata.update(architecture=field.model.architecture_metadata(), parameterization_version=3)
+            active_fields = tuple(name for name in data.scaling.names if
+                ("elliptic" in groups and name in {"pressure", "electric_potential"})
+                or ("thermofluid" in groups and name in {"enthalpy", "velocity"}))
+        run.optimizer = torch.optim.Adam(parameters, lr=1e-3)
+        additional_adam, additional_lbfgs = min(2000, 2 * config.pinn_epochs), min(50, config.pinn_epochs // 20)
+        run.metadata["conditioning_label_only_history"] = "Raw physics/boundary monitors are carried forward during label-only steps, then re-evaluated at every joint step and the final audit."
+        for index in range(additional_adam):
+            _cancelled(cancel)
+            field.model.train()
+            run.optimizer.zero_grad(set_to_none=True)
+            loss = run.losses.sampled_training_loss(active_fields=active_fields)
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError("PINN correction label loss became non-finite.")
+            _cancelled(cancel)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(parameters, 10., error_if_nonfinite=True)
+            _cancelled(cancel)
+            run.optimizer.step()
+            run.metadata["additional_optimizer_steps_completed"]["adam"] += 1
+            run.metadata["function_evaluations"]["adam"] += 1
+            objective = {"loss": loss, "data_loss": loss,
+                "physics_loss": torch.as_tensor(run.history["physics_loss"][-1], **field.kw),
+                "boundary_loss": torch.as_tensor(run.history["boundary_loss"][-1], **field.kw)}
+            record(objective, "Correction Adam", stage_end=index + 1 == additional_adam,
+                   detail=f" · training labels only · physics@{run.metadata['last_physics_evaluated_epoch']}")
+        run.optimizer = torch.optim.LBFGS(parameters, lr=1., max_iter=1, max_eval=8,
+            history_size=20, line_search_fn="strong_wolfe")
+        for index in range(additional_lbfgs):
+            _cancelled(cancel)
+            objective, step = _refinement_iteration(run, audit_indices, centers, parameters)
+            run.metadata["additional_optimizer_steps_completed"]["lbfgs"] += 1
+            record(objective, "Correction L-BFGS", stage_end=index + 1 == additional_lbfgs,
+                detail=f" · {step.outcome} · delta_inf={step.delta_inf:.3g} · lr={run.optimizer.param_groups[0]['lr']:.3g}")
+    run.metadata["conditioning_completed"] = bool(groups)
+    return groups
+
+
+def _train_model(run: TrainingRun, progress: Progress, cancel: threading.Event) -> float:
+    field, data, torch = run.field, run.field.data, run.field.torch
+    config = data.config
     initial_validation = run.losses.validation_loss()
     heldout_epoch = 0
     adam_steps, _ = _optimizer_steps(config.pinn_epochs)
-    physics_indices = np.unique(np.linspace(1, data.snapshot_count - 1,
+    primary_indices = np.unique(np.linspace(1, data.snapshot_count - 1,
         min(4, data.snapshot_count - 1), dtype=np.int64))
+    audit_indices = _audit_intervals(data)
     centers = np.unique(np.linspace(0, data.point_count - 1,
         min(field.maximum_batch, data.point_count), dtype=np.int64))
-    run.metadata["refinement_physics_snapshot_indices"] = physics_indices.tolist()
+    run.metadata["refinement_physics_snapshot_indices"] = primary_indices.tolist()
+    run.metadata["final_physics_snapshot_indices"] = audit_indices.tolist()
     run.metadata["refinement_center_ids"] = centers.tolist()
     run.metadata["refinement_labels"] = "all training labels, streamed; held-out labels never used by the optimizer"
+    maximum_steps = config.pinn_epochs + (min(2000, 2 * config.pinn_epochs)
+        + min(50, config.pinn_epochs // 20) if config.pinn_epochs >= 50 else 0)
+
+    def record(objective, stage, *, stage_end=False, detail=""):
+        nonlocal heldout_epoch
+        epoch = len(run.history["epoch"]) + 1
+        values = {"epoch": float(epoch), **{
+            key: float(value.detach()) for key, value in objective.items()}}
+        if epoch == 1 or epoch % 10 == 0 or stage_end:
+            field.model.eval()
+            current_validation = run.losses.validation_loss()
+            heldout_epoch = epoch
+        else:
+            current_validation = run.history["validation_loss"][-1]
+        values["validation_loss"] = current_validation
+        if stage != "Correction Adam":
+            run.metadata["last_physics_evaluated_epoch"] = epoch
+        run.metadata.update(heldout_evaluated_epoch=heldout_epoch, actual_training_steps=epoch,
+                            training_epochs=epoch)
+        for key, value in values.items():
+            run.history[key].append(value)
+        stages = run.metadata["training_stages"]
+        if not stages or stages[-1]["stage"] != stage:
+            stages.append({"stage": stage, "first_step": epoch, "last_step": epoch, "steps": 1})
+        else:
+            stages[-1].update(last_step=epoch, steps=stages[-1]["steps"] + 1)
+        sampled = "Adam" in stage
+        label = "batch loss" if sampled else "training loss"
+        display = "Adam" if stage.startswith("Adam") else stage
+        progress(.9 * epoch / maximum_steps,
+            f"Epoch {epoch} (budget ≤{maximum_steps}) · {display} · {label} {values['loss']:.6g} · held-out {current_validation:.6g}@{heldout_epoch}{detail}")
+        if run.checkpoint_path is not None and (epoch % 50 == 0 or stage_end):
+            _checkpoint(run.checkpoint_path, field.model, run.optimizer, epoch,
+                        data.result, data.scaling, run.history, run.metadata)
+
     for epoch in range(config.pinn_epochs):
         _cancelled(cancel)
         field.model.train()
         if epoch < adam_steps:
             run.optimizer.zero_grad(set_to_none=True)
             data_loss = run.losses.sampled_training_loss()
+            # Evaluate even during warmup so the original primary RNG draws
+            # and raw equation diagnostics are preserved exactly.
             physics_loss, boundary_loss = run.losses.thermal_physics() if data.thermal else run.losses.coupled_physics()
-            loss = data_loss + physics_loss + boundary_loss
+            weight = _physics_weight(epoch, config.pinn_epochs, thermal=data.thermal)
+            loss = data_loss + weight * (physics_loss + boundary_loss)
             if not bool(torch.isfinite(loss)):
                 raise FloatingPointError("PINN loss became non-finite; previous numerical results are unchanged.")
+            _cancelled(cancel)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(field.model.parameters(), 10.0, error_if_nonfinite=True)
+            torch.nn.utils.clip_grad_norm_(field.model.parameters(), 10., error_if_nonfinite=True)
+            _cancelled(cancel)
             run.optimizer.step()
             run.scheduler.step()
             run.metadata["optimizer_steps_completed"]["adam"] += 1
             run.metadata["function_evaluations"]["adam"] += 1
             objective = {"loss": loss, "data_loss": data_loss, "physics_loss": physics_loss,
                          "boundary_loss": boundary_loss}
+            stage = "Adam data warmup" if weight == 0. else "Adam physics ramp" if weight < 1. else "Adam"
+            detail = f" · physics weight={weight:.3g}" if weight < 1. else ""
         else:
             if epoch == adam_steps:
                 run.optimizer = torch.optim.LBFGS(field.model.parameters(), lr=1., max_iter=1,
                     max_eval=8, history_size=20, line_search_fn="strong_wolfe")
-            def closure():
-                _cancelled(cancel)
-                run.optimizer.zero_grad(set_to_none=True)
-                terms = _deterministic_objective(run, physics_indices, centers, backward=True)
-                if any(parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())
-                       for parameter in field.model.parameters()):
-                    raise FloatingPointError("PINN refinement gradient became non-finite.")
-                run.metadata["function_evaluations"]["lbfgs_closures"] += 1
-                return terms["loss"]
-            step = _recovering_lbfgs_step(run.optimizer, tuple(field.model.parameters()), closure, cancel)
-            if step.limited:
-                run.metadata["refinement_budget_limited_steps"] += 1
-            run.metadata["refinement_step_outcomes"][step.outcome] += 1
-            run.metadata["refinement_accepted_updates"] += int(step.delta_inf > 0.)
-            run.metadata["refinement_nochange_steps"] += int(step.delta_inf == 0.)
-            run.metadata["refinement_restarts"] += int(step.limited or step.outcome == "restarted_nochange")
+            objective, step = _refinement_iteration(run, primary_indices, centers, tuple(field.model.parameters()))
             run.metadata["optimizer_steps_completed"]["lbfgs"] += 1
-            objective = _deterministic_objective(run, physics_indices, centers, backward=False)
-            run.metadata["function_evaluations"]["refinement_objective"] += 1
-            run.metadata["refinement_last_step"] = {
-                "outcome": step.outcome, "gradient_max": step.gradient_max,
-                "parameter_delta_inf": step.delta_inf,
-                "training_objective_change": float(objective["loss"]) - step.initial_loss,
-                "learning_rate": float(run.optimizer.param_groups[0]["lr"])}
-        values = {"epoch": float(epoch + 1), **{
-            key: float(value.detach().item()) for key, value in objective.items()}}
-        # Evaluate held-out labels regularly, and retain a finite displayed
-        # value between evaluations rather than NaN history placeholders.
-        if epoch == 0 or (epoch + 1) % 10 == 0 or epoch + 1 == config.pinn_epochs:
-            field.model.eval()
-            current_validation = run.losses.validation_loss()
-            heldout_epoch = epoch + 1
-        else:
-            current_validation = run.history["validation_loss"][-1]
-        values["validation_loss"] = current_validation
-        run.metadata["heldout_evaluated_epoch"] = heldout_epoch
-        for key, value in values.items():
-            run.history[key].append(value)
-        stage = "Adam" if epoch < adam_steps else "L-BFGS"
-        label = "batch loss" if epoch < adam_steps else "training loss"
-        detail = "" if epoch < adam_steps else f" · {step.outcome} · Δθ∞={step.delta_inf:.3g} · lr={run.optimizer.param_groups[0]['lr']:.3g}"
-        progress(.9 * (epoch + 1) / config.pinn_epochs,
-                 f"Epoch {epoch + 1}/{config.pinn_epochs} · {stage} · {label} {values['loss']:.6g} · held-out {current_validation:.6g}@{heldout_epoch}{detail}")
-        if run.checkpoint_path is not None and ((epoch + 1) % 50 == 0 or epoch + 1 == config.pinn_epochs):
-            _checkpoint(run.checkpoint_path, field.model, run.optimizer, epoch + 1, data.result, data.scaling, run.history, run.metadata)
+            stage = "L-BFGS"
+            detail = f" · {step.outcome} · delta_inf={step.delta_inf:.3g} · lr={run.optimizer.param_groups[0]['lr']:.3g}"
+        record(objective, stage, stage_end=epoch + 1 == config.pinn_epochs, detail=detail)
 
-    # Qualification must refer to the final weights, not a pre-update random
-    # Adam batch or a trial point from an L-BFGS line search. Keep raw scales.
-    objective = _deterministic_objective(run, physics_indices, centers, backward=False)
+    _train_corrections(run, audit_indices, centers, record, cancel)
+    # Qualification always uses final weights and raw unweighted equations.
+    objective = _deterministic_objective(run, audit_indices, centers, backward=False)
     run.metadata["function_evaluations"]["final_objective"] += 1
-    run.metadata["final_loss_evaluation"] = "final weights; all training labels and fixed accepted-interval physics panels; original raw residual scales"
+    run.metadata["last_physics_evaluated_epoch"] = int(run.history["epoch"][-1])
+    run.metadata["final_loss_evaluation"] = "final weights; all training labels and up to ten uniformly selected accepted-interval physics panels plus native charge-transition neighbors; original raw residual scales"
     for key, value in objective.items():
-        run.history[key][-1] = float(value.detach().item())
+        run.history[key][-1] = float(value.detach())
     return initial_validation
 
 
@@ -883,7 +1072,7 @@ def _assemble_result(run: TrainingRun, predicted: dict[str, np.ndarray], metrics
     config = data.config
     result = data.result
     if run.checkpoint_path is not None:
-        _checkpoint(run.checkpoint_path, field.model, run.optimizer, config.pinn_epochs, result, data.scaling, run.history, run.metadata)
+        _checkpoint(run.checkpoint_path, field.model, run.optimizer, int(run.history["epoch"][-1]), result, data.scaling, run.history, run.metadata)
         (run.checkpoint_path.parent / "metadata.json").write_text(json.dumps(run.metadata, indent=2), encoding="utf-8")
     _cancelled(cancel)
     output = PINNResult(run_id=run.run_id, source_run_id=result.run_id, config_hash=config.config_hash,
