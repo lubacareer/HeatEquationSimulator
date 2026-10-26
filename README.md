@@ -106,6 +106,18 @@ With ground enabled, beam primaries sample only the exposed part of the incident
 
 ## Reproduce checks
 
+Run the complete modern-workspace suite from the repository root:
+
+```powershell
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py
+```
+
+This command includes isolated regressions, real desktop interactions and exports, numerical/PINN accuracy gates, the finite simulation interaction matrix, Geant4 water/anatomical transport, and playback performance. It checks CUDA and installed WSL workers/datasets automatically. Missing dependencies, skipped required tests, timeouts, interruption, and failed scientific gates prevent an overall pass. Allow several hours; the first complete run is **pending**. Normal application history stays separate from test artifacts.
+
+Live progress and per-case evidence are saved under `.cache/test-suite/<run>/`; open `report.html` for the readable summary or share `report.json` with its case logs. See [the coverage matrix and rerun workflow](docs/TEST_MATRIX.md) for scope, runtime limits, targeted reruns, and safe resume. Broader research qualification remains separate from this finite matrix.
+
+For shorter development checks and individual benchmark tools:
+
 ```powershell
 python -B scripts/run_checks.py
 python -B scripts/desktop_smoke.py
@@ -114,7 +126,7 @@ python -B -m magnetic_torus.physics --benchmark-report .cache/physics_validation
 python -B -m magnetic_torus.pinn_validation --native --device cpu --epochs 1000
 ```
 
-Run these in the desktop Python environment with PyTorch installed. The FE benchmark additionally needs the WSL worker; desktop smoke needs a graphical session. The test runner isolates modules to avoid OpenMP conflicts. Desktop smoke exercises real Qt/VTK, repeated edits/runs, probes, comparisons, cancellation, failure/stale isolation, particle replay, saved PINN inspection when available, and decoding every exported MP4 frame. It records scene size and measured FPS. Scientific reports list completed checks and outstanding qualification gates separately. The PINN validation CLI returns exit code **3** for a completed fit that fails validation.
+Run these in the desktop Python environment with PyTorch installed. The FE benchmark additionally needs the WSL worker; desktop smoke needs a graphical session. The test runner isolates modules to avoid OpenMP conflicts. Desktop smoke exercises real Qt/VTK, repeated edits/runs, probes, comparisons, cancellation, failure/stale isolation, separate particle replay, an explicitly synthetic PINN display fixture, and decoding every exported MP4 frame. Actual PINN training and qualification run separately in the full suite. It records scene size and measured FPS. Scientific reports list completed checks and outstanding qualification gates separately. The PINN validation CLI returns exit code **3** for a completed fit that fails validation.
 
 See [docs/VALIDATION.md](docs/VALIDATION.md) for actual benchmark values, the measured 31.8 FPS reference scene, real water/anatomical transport runs, failed coupled PINN fits, and open release gates. The Ubuntu FE package lock and integrity-pinned Geant4 environment are in `env/`.
 
