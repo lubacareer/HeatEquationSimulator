@@ -1,4 +1,4 @@
-# Full test suite
+# Representative and exhaustive test suites
 
 Run from the repository root in a graphical Windows session:
 
@@ -6,16 +6,54 @@ Run from the repository root in a graphical Windows session:
 conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py
 ```
 
-No enabling flags or extra environment switches are required. The default `full` profile runs every case serially, including installed WSL workers and CPU/CUDA training. It does not install dependencies. Missing capabilities are explicit `UNAVAILABLE` outcomes and prevent success. Keep the graphical session available for real Qt/VTK rendering, exports, and playback measurement.
+The default `features` profile runs one fixed configuration per major feature, plus short regressions. No enabling flags or extra environment switches are required. It checks installed workers/datasets but never installs dependencies. Required missing capabilities and skips prevent success. Keep the graphical session available for Qt/VTK, exports, and playback measurement.
+
+| Profile | Purpose | Runtime policy |
+| --- | --- | --- |
+| `features` (fresh-run default) | Representative end-to-end feature coverage with strict accuracy gates | 55-minute work deadline including preflight, five-minute cleanup reserve, one-hour supervisor backstop |
+| `full` | Original exhaustive finite matrix and broader qualification cases | Multi-hour explicit opt-in |
+| `fast` | Development regressions with declared integration skips | No scientific coverage claim |
+
+## Representative feature coverage
+
+| Feature | One selected configuration |
+| --- | --- |
+| Configuration, persistence, failures | Short regression modules; duplicate expensive worker scenarios are excluded from this profile rather than skip-passed |
+| Thermal | Iron, resolution 4, 8 s / 32 steps, 11 MW charge/discharge at fraction 0.5, emissivity 0.1, initial temperature 1 K below melting; assert melting, freezing, radiation and energy balance |
+| Driven MHD | Small liquid driven/laminar case, resolution 3, 0.05 s / 3 steps |
+| Dynamo/VMS | Small mushy dynamo/VMS case with accepted seed-removal event |
+| Native PINN | CPU, short solid-heating source, resolution 4, 2 s / 12 steps, 1,000 training steps |
+| Coupled PINN | CUDA, stationary accepted zero-field source, 250 training steps; this validates static equilibrium only |
+| Trajectories | Proton, 100 MeV/nucleon, paired field-on/off and independent relativistic oracle |
+| Water dose | Shared accepted zero-field map, 100 MeV proton beam, exactly 524,288 histories once, nonzero dose and measured relative standard error ≤5% |
+| Anatomical dose | Male ICRP110 target, mixed proton/alpha/iron spectrum, nonzero field, ground enabled, 128 histories, Shielding + EM option 4; actual organ uncertainties are reported |
+| Desktop/export/performance | One real desktop journey including decoded MP4 resize/export; unchanged resolution-8 five × 60-frame benchmark and 30 FPS gate |
+
+All selected scenarios use seed 42. The stationary zero-field source is shared by coupled training and water dose; the driven source is shared by trajectories and anatomical dose. Analytic reference and rejection checks remain. Every required feature must have its declared provider in the executable manifest. A passing subset cannot claim complete representative coverage.
+
+The feature profile is not the full pairwise matrix. It does not qualify every preset, female anatomy, all option combinations, phase-changing PINNs, or dynamic coupled PINNs. Those cases and known failures remain in `full`; no acceptance limit is weakened for a retained scientific case. Expected representative time is approximately 25–40 minutes on the reference workstation, pending a complete measured run. Reaching the water history count alone does not pass its precision gate.
+
+Full-label PINN refinement uses bounded 4,096-row forward/loss batches independently of Adam's unchanged sampling batches. Training-only normalized labels and coordinate transforms may use a capped 64 MiB host cache, with streaming fallback; held-out labels never fit this cache. Validation totals accumulate on the device before transfer. These optimizations preserve float64, masks, equations, random draws, optimizer safeguards, and all accuracy/conservation checks.
+
+The deadline starts before catalog/preflight preparation. At 55 minutes no new work is started, the active job is cancelled, and completed/unvisited evidence is retained. The supervisor enforces owned-process cleanup within the remaining five minutes. Budget exhaustion is explicitly unsuccessful (`124`), with pending case IDs separate from cached evidence; Ctrl+C remains `130`. A future resume gets a fresh budget. No unrelated process is terminated.
+
+Run the exhaustive matrix, or list it without workers, explicitly:
+
+```powershell
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --list
+```
+
+`--resume` without `--profile` inherits the report's recorded profile. Old `full` reports therefore remain exhaustive and multi-hour; they are never rewritten as representative reports. An explicit mismatched profile is rejected. Start a fresh default invocation to use the one-hour feature profile.
 
 The initial 125-case run completed on 2026-10-26 with 94 passes, 16 failures, five errors, one timeout, and nine blocked cases. Its JSON/HTML reports and case logs remain under `.cache/test-suite/20261026T065717.373686Z/`. Fixes require validation reruns; completion does not establish that the matrix passes. Scientific results and open qualification gates are documented in [VALIDATION.md](VALIDATION.md).
 
-## Declared finite coverage
+## Exhaustive finite coverage (`full`)
 
 The catalog contains 96 scientific/simulation cases plus isolated regression modules, two isolated FE regression methods, a desktop journey, and a performance benchmark. Counts update automatically as regression modules are added. Inspect the executable catalog without starting workers:
 
 ```powershell
-conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --list
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --list
 ```
 
 | Area | Cases and oracles |
@@ -48,9 +86,9 @@ Preflight checks the real Qt/VTK render/readback, PyTorch CPU and CUDA kernels, 
 
 `MAGNETIC_TORUS_FE_PYTHON` selects the FE interpreter for preflight, solves, and benchmarks; it defaults to `/usr/bin/python3`. On Windows, supply the interpreter's Linux path inside the selected WSL distribution.
 
-Expect several hours, potentially longer on slower hardware or with cold compilation caches. The unsuccessful initial run took about 93 minutes; changed training and transport methods require fresh timing. The scientific cases' declared timeout budget totals about 22.1 hours, before regression/desktop limits and bounded cleanup. Individual limits are visible with `--list`: most small FE cases allow 10 minutes, shipped presets 30 minutes except Lunar habitat at 60 minutes, dynamic PINNs 40 minutes, transport interactions 15 minutes, and water precision 60 minutes. Scenario duration, geometry, and scientific acceptance limits are unchanged. A timeout is an unsuccessful outcome, not a skipped pass.
+The exhaustive `full` profile requires several hours, potentially longer on slower hardware or with cold compilation caches. The unsuccessful initial run took about 93 minutes; changed training and transport methods require fresh timing. Its scientific cases' declared timeout budget totals about 22.1 hours, before regression/desktop limits and bounded cleanup. Individual limits are visible with `--profile full --list`: most small FE cases allow 10 minutes, shipped presets 30 minutes except Lunar habitat at 60 minutes, dynamic PINNs 40 minutes, transport interactions 15 minutes, and water precision 60 minutes. The full scenarios' duration, geometry, and scientific acceptance limits are unchanged. A timeout is an unsuccessful outcome, not a skipped pass.
 
-Only one heavy job runs at a time. SciPy and PyTorch stay in separate native processes where required; mixed FE/PyTorch regression methods have their own invocations. CUDA batches remain bounded by each scenario's training configuration. The runner never sets `KMP_DUPLICATE_LIB_OK`.
+Only one heavy job runs at a time. SciPy and PyTorch stay in separate native processes where required; mixed FE/PyTorch regression methods have their own invocations. Stochastic batches retain the scenario's configured limit (capped at 4,096); deterministic full-label refinement uses its independent 4,096-row cap. The runner never sets `KMP_DUPLICATE_LIB_OK`.
 
 PINN parameterization version 2 uses a geometry/source-derived bulk-energy trial for native thermal fields, accepted-first-step correction ramps for coupled fields, and training-only free-DOF label conditioning. Fewer than 50 requested steps retain Adam; larger budgets allocate 80% to Adam and the remainder to deterministic L-BFGS refinement. Training labels are streamed in bounded batches and fixed physics panels remain independent of held-out labels. Method version 3 retains the strict eight-closure limit, but can recover an already-evaluated, finite Armijo-decreasing training trial after budget exhaustion and restart L-BFGS curvature. Rejected searches restore the previous state, and bounded recovery prevents indefinite learning-rate halving. No held-out labels select recovery steps. Checkpoints record attempts, actual updates, retries, evaluations, and method versions. Validation masks, training-only normalization, raw residual scales, and all qualification limits are unchanged; old saved prediction fields remain inspectable.
 
@@ -73,8 +111,8 @@ Non-finite scientific evidence is recorded as the explicit strings `NaN`, `Infin
 The terminal prints the exact report directory and resume command. To rerun only selected cases (including their prerequisites):
 
 ```powershell
-conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --case "pinn.*"
-conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --case "dose.pair.01"
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --case "pinn.*"
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --case "dose.pair.01"
 ```
 
 To resume the full run after interruption or fixes:
@@ -87,9 +125,9 @@ Reuse requires a previous passing execution and qualification, matching inputs/s
 
 Unvisited cached records remain in each saved report during resume. Cancellation can still validate and reuse passing cached evidence without starting processes; the interrupted invocation remains unsuccessful even if every recorded case was reused successfully.
 
-Use `--case` together with `--resume` for a targeted retry in the same evidence directory. Its summary explicitly covers only that selection; run a full `--resume` afterward to restore the full report. A passing subset or `--profile fast` never reports full coverage. `--preflight` records capabilities without running cases. `--profile fast` runs shorter isolated development regressions with explicit skips and is not the release gate.
+Use `--case` together with `--resume` for a targeted retry in the same evidence directory. Its summary covers only that selection; resume without a filter afterward to restore the profile's complete report. `feature_coverage` requires the entire representative manifest and passing required gates; `full_coverage` is reserved for the complete exhaustive matrix. A passing subset or `fast` never claims either. `--preflight` records required capabilities without running cases.
 
-Exit code 0 means all selected required cases and gates passed; exit 1 means a failure, missing capability, timeout, or coverage deficit; exit 130 means interruption. Test history, temporary files, and workers are directed into the private run directory. Normal saved simulations and application history are untouched. Artifacts are retained for diagnosis; exports happen only inside test evidence.
+Exit code 0 means all selected required cases and gates passed; exit 1 means a failure, missing capability, timeout, or coverage deficit; exit 124 means invocation budget exhaustion; exit 130 means interruption. Test history, temporary files, and workers are directed into the private run directory. Normal saved simulations and application history are untouched. Artifacts are retained for diagnosis; exports happen only inside test evidence.
 
 After a full run, share `report.json` and the logs for non-passing cases. Scientific accuracy failures will be investigated without weakening thresholds, followed by focused reruns and a complete resume.
 

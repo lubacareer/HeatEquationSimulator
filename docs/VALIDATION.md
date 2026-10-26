@@ -4,6 +4,18 @@ Reference workstation: Windows, Python 3.12 `torch-gpu`, Radeon 780M rendering, 
 
 Reproduce with `python -B scripts/run_checks.py`, `python -B scripts/desktop_smoke.py`, and `python -B -m magnetic_torus.physics --benchmark-report .cache/physics_validation.json --include-fenics`.
 
+## Representative suite and batching optimization (2026-10-26)
+
+Fresh `scripts/run_all_tests.py` invocations now select `features`: 52 cases, including 33 short regression modules and one fixed scientific configuration per major feature. The preserved `full` profile has 133 cases. Both executable coverage proofs pass independently. Representative coverage excludes all-preset/option-pair qualification, female anatomy, and phase-changing/dynamic coupled PINN qualification. All retained scientific gates, including measured water precision ≤5%, are unchanged.
+
+There are 135 passing focused checks: eight batching/cache, 17 conditioning, 16 existing PINN, four normalization, seven PINN diagnostics, eight CLI/profile, nine representative catalog, 12 exhaustive matrix, 11 invocation budget, 24 existing runner, eight artifact security, seven atomic publication, and four FE-launch checks. Focused Ruff and whitespace checks pass. Tests exercise the 55-minute work cutoff/five-minute cleanup reserve with short/fake deadlines, including an actual 1.2-second supervisor run that terminates its own grandchild, returns 124, and preserves cached evidence. Required work left unfinished is never a passing result.
+
+A bounded synthetic CPU benchmark measured only the full-label gradient calculation: 5,200 training labels, float64, one CPU thread, five repetitions. Median time decreased from 57.315 ms (uncached 256-row batches, 21 neural calls) to 29.918 ms (cached 4,096-row batches, two calls), a 1.916× speedup. Loss was identical, maximum absolute gradient difference was 9.72e-17, and the host cache occupied 124,840 bytes. Evidence is `.cache/pinn-stall-worktree/.cache/pinn-batching-benchmark.json`. This is not a measured speedup for an entire PINN fit or scientific qualification.
+
+The exact conda entrypoint passed a real three-case selection (CLI regressions, melting/freezing/radiating thermal cycle, and short native source) with all six installed capabilities verified, followed by a successful inferred-profile targeted resume. Both correctly reported incomplete overall feature/full coverage; the resume retained unvisited evidence. Reports are in `.cache/pinn-stall-worktree/.cache/representative-cli-smoke-20261026/`. The complete 52-case representative run, its wall time, new representative PINN accuracy, anatomical transport, and fixed 524,288-history water precision remain pending for the user's run. The estimated 25–40 minutes is not a completed measurement.
+
+Development and these checks used an isolated checkout; the already-running full suite and its history were left untouched. Update the main working directory after it finishes, then start a fresh default command for the one-hour representative profile. Resuming an old `full` report intentionally retains exhaustive, multi-hour behavior.
+
 ## Full-suite failure investigation (2026-10-26)
 
 The initial full run at `.cache/test-suite/20261026T065717.373686Z/` completed 125 cases in about 93 minutes: 94 PASS, 16 FAIL, five ERROR, one TIMEOUT, and nine BLOCKED. Original reports and all 116 recorded case logs are preserved. All isolated regression modules passed. A nonzero conda exit reflected failed test gates, rather than a failure to save the results.

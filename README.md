@@ -106,15 +106,23 @@ With ground enabled, beam primaries sample only the exposed part of the incident
 
 ## Reproduce checks
 
-Run the complete modern-workspace suite from the repository root:
+Run the representative modern-workspace feature suite from the repository root:
 
 ```powershell
 conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py
 ```
 
-This command includes isolated regressions, real desktop interactions and exports, numerical/PINN accuracy gates, the finite simulation interaction matrix, Geant4 water/anatomical transport, and playback performance. It checks CUDA and installed WSL workers/datasets automatically. Missing dependencies, skipped required tests, timeouts, interruption, and failed scientific gates prevent an overall pass. Allow several hours; the initial full run completed with failed gates, and fixes require validation reruns. Normal application history stays separate from test artifacts.
+The default `features` profile tests one fixed scenario per major feature, including real desktop interactions/exports, thermal/MHD solvers, CPU/CUDA PINNs, particles, water/anatomical dose, and playback performance. It retains short regressions and the existing scientific accuracy limits, including measured water-dose uncertainty ≤5%. The command allows 55 minutes of work plus five minutes for cleanup/reporting, with a one-hour supervisor backstop. An unfinished case or failed accuracy gate cannot pass. The complete profile timing remains to be measured; 25–40 minutes on the reference workstation is an estimate. Normal application history stays separate.
 
-Live progress and per-case evidence are saved under `.cache/test-suite/<run>/`; open `report.html` for the readable summary or share `report.json` with its case logs. See [the coverage matrix and rerun workflow](docs/TEST_MATRIX.md) for scope, runtime limits, targeted reruns, and safe resume. Broader research qualification remains separate from this finite matrix.
+The exhaustive multi-hour matrix remains available explicitly:
+
+```powershell
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full
+```
+
+A representative pass does not qualify all presets, option combinations, female anatomy, or dynamic/phase-changing PINNs. Existing full-suite scientific failures remain documented. A resumed report keeps its recorded profile; resuming an old `full` report still runs the exhaustive profile.
+
+Live progress and per-case evidence are saved under `.cache/test-suite/<run>/`; open `report.html` or share `report.json` with its case logs. Reports distinguish representative feature coverage from exhaustive matrix coverage. Budget exhaustion returns exit code 124 and retains evidence for resume. See [the coverage and rerun workflow](docs/TEST_MATRIX.md) for selected scenarios, limits, and commands.
 
 For shorter development checks and individual benchmark tools:
 
@@ -126,7 +134,7 @@ python -B -m magnetic_torus.physics --benchmark-report .cache/physics_validation
 python -B -m magnetic_torus.pinn_validation --native --device cpu --epochs 1000
 ```
 
-Run these in the desktop Python environment with PyTorch installed. The FE benchmark additionally needs the WSL worker; desktop smoke needs a graphical session. The test runner isolates modules to avoid OpenMP conflicts. Desktop smoke exercises real Qt/VTK, repeated edits/runs, probes, comparisons, cancellation, failure/stale isolation, separate particle replay, an explicitly synthetic PINN display fixture, and decoding every exported MP4 frame. Actual PINN training and qualification run separately in the full suite. It records scene size and measured FPS. Scientific reports list completed checks and outstanding qualification gates separately. The PINN validation CLI returns exit code **3** for a completed fit that fails validation.
+Run these in the desktop Python environment with PyTorch installed. The FE benchmark additionally needs the WSL worker; desktop smoke needs a graphical session. The test runner isolates modules to avoid OpenMP conflicts. Desktop smoke exercises real Qt/VTK, repeated edits/runs, probes, comparisons, cancellation, failure/stale isolation, separate particle replay, an explicitly synthetic PINN display fixture, and decoding every exported MP4 frame. Actual PINN training and qualification run in separate cases: selected representatives in `features`, and the larger matrix in `full`. Reports record scene size, measured FPS, completed checks, and outstanding qualification gates separately. The PINN validation CLI returns exit code **3** for a completed fit that fails validation.
 
 See [docs/VALIDATION.md](docs/VALIDATION.md) for actual benchmark values, the measured 31.8 FPS reference scene, real water/anatomical transport runs, failed coupled PINN fits, and open release gates. The Ubuntu FE package lock and integrity-pinned Geant4 environment are in `env/`.
 
