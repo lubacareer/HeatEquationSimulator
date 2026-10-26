@@ -4,6 +4,8 @@ from __future__ import annotations
 from functools import lru_cache
 from io import BytesIO
 import math
+from collections.abc import Mapping
+from numbers import Real
 from typing import Any
 import numpy as np
 from ..models import RunResult, ScenarioConfig
@@ -19,7 +21,8 @@ def _load_weak_artifact(payload: bytes) -> dict[str, np.ndarray]:
 
 def evaluate_weak_residual_torch(config: ScenarioConfig, reference_result: RunResult,
                                  predicted_fields: dict[str, Any], time_indices: Any,
-                                 point_indices: Any = None) -> dict[str, Any]:
+                                 point_indices: Any = None, *,
+                                 normalization_scales: Mapping[str, float] | None = None) -> dict[str, Any]:
     """Differentiable, matching P1 FE weak residuals for one accepted time pair.
 
     This uses the worker's tetrahedral quadrature, geometry, boundary conditions,
@@ -27,8 +30,23 @@ def evaluate_weak_residual_torch(config: ScenarioConfig, reference_result: RunRe
     would remove coupled test functions and is intentionally disallowed.
     ``vector_potential`` denotes total A; imposed A is subtracted only from the
     conductor–vacuum curlcurl/gauge terms, exactly as in the numerical solve.
+    Explicit ``normalization_scales`` are for research-training isolation only;
+    omitting them retains the original full-reference qualification oracle.
     """
     import torch
+    scales = None
+    if normalization_scales is not None:
+        names = {"velocity", "magnetic_field", "vector_potential"}
+        if not isinstance(normalization_scales, Mapping) or set(normalization_scales) != names:
+            raise ValueError("Weak normalization overrides require exactly velocity, magnetic_field, and vector_potential.")
+        if any(isinstance(value, bool) or not isinstance(value, Real)
+               or not math.isfinite(value) or value <= 0 for value in normalization_scales.values()):
+            raise ValueError("Weak normalization overrides must be positive finite real values.")
+        scales = {name: float(value) for name, value in normalization_scales.items()}
+        velocity_floor = max(math.sqrt(abs(config.pump_force) * config.minor_radius / config.density), 1.e-4)
+        if (scales["velocity"] < velocity_floor or scales["magnetic_field"] < 1.e-6
+                or scales["vector_potential"] < scales["magnetic_field"] * config.minor_radius):
+            raise ValueError("Weak normalization overrides must retain the configured velocity, magnetic, and potential floors.")
     if point_indices is not None:
         raise ValueError("FE weak physics requires all mesh nodes; batch accepted time pairs instead.")
     info = reference_result.metadata.get("pinn_physics", {})
@@ -166,9 +184,12 @@ def evaluate_weak_residual_torch(config: ScenarioConfig, reference_result: RunRe
         keep[constrained] = False
         return keep
     length = config.minor_radius
-    velocity_scale = max(float(np.max(np.linalg.norm(reference_result.fields["velocity"], axis=-1))), math.sqrt(abs(config.pump_force) * length / rho), 1.e-4)
-    bscale = max(float(np.max(np.linalg.norm(reference_result.fields["magnetic_field"], axis=-1))), 1.e-6)
-    ascale = max(float(np.max(np.linalg.norm(reference_result.fields["vector_potential"], axis=-1))), bscale * length)
+    if scales is None:
+        velocity_scale = max(float(np.max(np.linalg.norm(reference_result.fields["velocity"], axis=-1))), math.sqrt(abs(config.pump_force) * length / rho), 1.e-4)
+        bscale = max(float(np.max(np.linalg.norm(reference_result.fields["magnetic_field"], axis=-1))), 1.e-6)
+        ascale = max(float(np.max(np.linalg.norm(reference_result.fields["vector_potential"], axis=-1))), bscale * length)
+    else:
+        velocity_scale, bscale, ascale = (scales[name] for name in ("velocity", "magnetic_field", "vector_potential"))
     tscale = max(config.duration, dt)
     hscale = max(config.latent_heat, config.heat_capacity_solid * 100., 1.)
     pscale = max(rho * velocity_scale ** 2, 1.)
