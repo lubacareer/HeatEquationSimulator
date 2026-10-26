@@ -112,7 +112,7 @@ Run the complete modern-workspace suite from the repository root:
 conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py
 ```
 
-This command includes isolated regressions, real desktop interactions and exports, numerical/PINN accuracy gates, the finite simulation interaction matrix, Geant4 water/anatomical transport, and playback performance. It checks CUDA and installed WSL workers/datasets automatically. Missing dependencies, skipped required tests, timeouts, interruption, and failed scientific gates prevent an overall pass. Allow several hours; the first complete run is **pending**. Normal application history stays separate from test artifacts.
+This command includes isolated regressions, real desktop interactions and exports, numerical/PINN accuracy gates, the finite simulation interaction matrix, Geant4 water/anatomical transport, and playback performance. It checks CUDA and installed WSL workers/datasets automatically. Missing dependencies, skipped required tests, timeouts, interruption, and failed scientific gates prevent an overall pass. Allow several hours; the initial full run completed with failed gates, and fixes require validation reruns. Normal application history stays separate from test artifacts.
 
 Live progress and per-case evidence are saved under `.cache/test-suite/<run>/`; open `report.html` for the readable summary or share `report.json` with its case logs. See [the coverage matrix and rerun workflow](docs/TEST_MATRIX.md) for scope, runtime limits, targeted reruns, and safe resume. Broader research qualification remains separate from this finite matrix.
 

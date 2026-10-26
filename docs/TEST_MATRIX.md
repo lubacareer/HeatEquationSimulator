@@ -8,7 +8,7 @@ conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py
 
 No enabling flags or extra environment switches are required. The default `full` profile runs every case serially, including installed WSL workers and CPU/CUDA training. It does not install dependencies. Missing capabilities are explicit `UNAVAILABLE` outcomes and prevent success. Keep the graphical session available for real Qt/VTK rendering, exports, and playback measurement.
 
-The complete run is pending. Short implementation checks verify orchestration, coverage proofs, desktop behavior, native thermal invariants, and analytic trajectories; they do not establish that the full matrix passes. Existing failed dynamic coupled PINN fits and open physics qualification gates remain documented in [VALIDATION.md](VALIDATION.md).
+The initial 125-case run completed on 2026-10-26 with 94 passes, 16 failures, five errors, one timeout, and nine blocked cases. Its JSON/HTML reports and case logs remain under `.cache/test-suite/20261026T065717.373686Z/`. Fixes require validation reruns; completion does not establish that the matrix passes. Scientific results and open qualification gates are documented in [VALIDATION.md](VALIDATION.md).
 
 ## Declared finite coverage
 
@@ -34,7 +34,9 @@ The pairwise generator has stable tie-breaking. Coverage is checked against the 
 
 Comparison selection and result reactivation require accepted snapshots from both runs in the shared time interval. Loading a new active run revalidates the retained comparison, clears it when invalid, and clamps playback before display. The MP4 smoke check records the resize frame count and requires a later encoded frame whose raw screenshot dimensions differ from both the initial capture and the encoder dimensions, proving that resampling was exercised. It also decodes every frame at the expected fixed dimensions.
 
-Functional transport rows use small samples to exercise interactions and report their actual uncertainty. They do not claim 5% dose precision. The separate water precision gate increases histories up to 262,144 and requires a nonzero score with relative standard error ≤5%; zero hits fail. Anatomical rows test execution/scoring across targets, not independent anatomical dosimetry qualification. Coupled PINN accuracy remains a required scientific gate even if later functional rejection tests pass.
+Functional transport rows use small samples to exercise interactions and report their actual uncertainty. They do not claim 5% dose precision. The separate water precision gate increases histories through 262,144 to a maximum of 524,288 and requires a nonzero score with relative standard error ≤5%; zero hits and insufficient precision remain failures. Anatomical rows test execution/scoring across targets, not independent anatomical dosimetry qualification. Coupled PINN accuracy remains a required scientific gate even if later functional rejection tests pass.
+
+FE equation agreement retains the `1e-7` maximum residual gate for assembled equations, boundary conditions, and magnetic consistency. The Coulomb divergence diagnostic is measured separately using the existing normalized RMS limit of `0.1`; its maximum is also recorded. The div-div penalty is already included in the induction equation. Treating this diagnostic as an independently assembled zero residual was an incorrect test oracle; the numerical formulation is unchanged.
 
 Dependent training and transport require passing source cases: execution must pass, and scientific parents must also pass qualification. A failed or incomplete prerequisite makes its dependents `BLOCKED` before starting work or reusing a cached result. Negative tests construct their rejected inputs from passing prerequisites, so expected rejection coverage remains independent.
 
@@ -46,9 +48,13 @@ Preflight checks the real Qt/VTK render/readback, PyTorch CPU and CUDA kernels, 
 
 `MAGNETIC_TORUS_FE_PYTHON` selects the FE interpreter for preflight, solves, and benchmarks; it defaults to `/usr/bin/python3`. On Windows, supply the interpreter's Linux path inside the selected WSL distribution.
 
-Expect several hours, potentially longer on slower hardware or with cold compilation caches; there is no completed full-run timing yet. The scientific cases' declared timeout budget totals about 21.6 hours, before regression/desktop limits and bounded cleanup. Individual limits are visible with `--list`: most small FE cases allow 10 minutes, shipped presets 30 minutes, dynamic PINNs 40 minutes, transport interactions 15 minutes, and water precision 60 minutes. A timeout is an unsuccessful outcome, not a skipped pass.
+Expect several hours, potentially longer on slower hardware or with cold compilation caches. The unsuccessful initial run took about 93 minutes; changed training and transport methods require fresh timing. The scientific cases' declared timeout budget totals about 22.1 hours, before regression/desktop limits and bounded cleanup. Individual limits are visible with `--list`: most small FE cases allow 10 minutes, shipped presets 30 minutes except Lunar habitat at 60 minutes, dynamic PINNs 40 minutes, transport interactions 15 minutes, and water precision 60 minutes. Scenario duration, geometry, and scientific acceptance limits are unchanged. A timeout is an unsuccessful outcome, not a skipped pass.
 
 Only one heavy job runs at a time. SciPy and PyTorch stay in separate native processes where required; mixed FE/PyTorch regression methods have their own invocations. CUDA batches remain bounded by each scenario's training configuration. The runner never sets `KMP_DUPLICATE_LIB_OK`.
+
+PINN method version 2 uses a geometry/source-derived bulk-energy trial for native thermal fields, accepted-first-step correction ramps for coupled fields, and training-only free-DOF label conditioning. Fewer than 50 requested steps retain Adam; larger budgets allocate 80% to Adam and the remainder to deterministic L-BFGS refinement. Training labels are streamed in bounded batches, fixed physics panels remain independent of held-out labels, and each L-BFGS step has a strict eight-closure limit with rollback on exhaustion. Checkpoints record actual steps, evaluations, and method versions. Validation masks, training-only normalization, raw residual scales, and all qualification limits are unchanged; old saved prediction fields remain inspectable.
+
+Finite-map radiation transport validates physical-world and primary containment before enabling its field path. Nonzero fields use a propagation-step cap derived from actual accepted-mesh clearance; out-of-map queries remain fatal and report their coordinates. Exactly zero maps use ordinary transportation for both paired ensembles after the same validation, with no approximate-zero threshold. Dose metadata records the map clearance, integration mode, step limit, and actual field-query diagnostics.
 
 Press Ctrl+C to request cancellation and preserve evidence. The runner writes cooperative cancellation files, allows bounded worker cleanup, then stops its owned processes. Windows Job Objects contain native descendants; WSL fallback targets only same-user commands carrying that case's private path. No broad process-name killing is used.
 
@@ -84,3 +90,25 @@ Use `--case` together with `--resume` for a targeted retry in the same evidence 
 Exit code 0 means all selected required cases and gates passed; exit 1 means a failure, missing capability, timeout, or coverage deficit; exit 130 means interruption. Test history, temporary files, and workers are directed into the private run directory. Normal saved simulations and application history are untouched. Artifacts are retained for diagnosis; exports happen only inside test evidence.
 
 After a full run, share `report.json` and the logs for non-passing cases. Scientific accuracy failures will be investigated without weakening thresholds, followed by focused reruns and a complete resume.
+
+## Rerun the 2026-10-26 failure groups
+
+The saved run above already contains the required JSON and per-case text logs. These commands use the same evidence directory; accepted cached results are reused only if current code, inputs, runtime identity, and artifacts still match. Changed fingerprints can require previously passing cases to execute again. Each targeted report is partial; the full resume at the end restores coverage of the complete catalog.
+
+Start with the corrected dynamo checks, trajectories, transport interactions, and display benchmark:
+
+```powershell
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --resume ".cache/test-suite/20261026T065717.373686Z" --case "fe.*dynamo*" --case "boris.*" --case "dose.pair.*" --case "dose.mixed-spectrum" --case "dose.fluence-linearity" --case "desktop.performance"
+```
+
+Run the canonical PINN cases, lunar source, and full water-precision gate when the longer runtime is available. This includes the unchanged accuracy/conservation limits; the short native pilot remains unqualified and is not substituted for these cases:
+
+```powershell
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --resume ".cache/test-suite/20261026T065717.373686Z" --case "pinn.*" --case "preset.lunar-habitat" --case "dose.water-precision"
+```
+
+Finally, resume every required case and gate:
+
+```powershell
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --resume ".cache/test-suite/20261026T065717.373686Z"
+```

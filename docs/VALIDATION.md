@@ -4,6 +4,27 @@ Reference workstation: Windows, Python 3.12 `torch-gpu`, Radeon 780M rendering, 
 
 Reproduce with `python -B scripts/run_checks.py`, `python -B scripts/desktop_smoke.py`, and `python -B -m magnetic_torus.physics --benchmark-report .cache/physics_validation.json --include-fenics`.
 
+## Full-suite failure investigation (2026-10-26)
+
+The initial full run at `.cache/test-suite/20261026T065717.373686Z/` completed 125 cases in about 93 minutes: 94 PASS, 16 FAIL, five ERROR, one TIMEOUT, and nine BLOCKED. Original reports and all 116 recorded case logs are preserved. All isolated regression modules passed. A nonzero conda exit reflected failed test gates, rather than a failure to save the results.
+
+- Eight dynamo FE cases failed only because the test applied the assembled-equation `1e-7` tolerance to the separate Coulomb divergence diagnostic. The solver uses a div-div penalty whose weak contribution is already checked in induction. Rechecking all eight saved accepted sources with the corrected oracle passes every equation, boundary, gradient, and gauge check: diagnostic RMS ranges from 0.00337025 to 0.00416658, below the existing physical RMS limit of 0.1; raw maxima of 0.0418273–0.0545488 remain reported. No FE equation or accepted field was changed. Regression tests still reject assembled defects above `1e-7` and excessive/nonfinite gauge diagnostics.
+- Lunar habitat reached accepted time 53.43/60 s before its 1,800 s timeout. Only its execution deadline increases to 3,600 s; geometry, timesteps, material properties, duration, and physical checks remain unchanged. Completion still needs a real rerun.
+- The water precision reference reached relative standard error 0.0674898 at 262,144 histories and honestly failed the 0.05 gate. The history sequence now permits 524,288 with the original 3,600 s deadline. Actual measured precision must pass; a larger history count alone is not qualification.
+- Six PINN accuracy cases failed despite successful execution; stationary and zero-field CPU/CUDA cases passed. The baseline showed thermal trial-field overheating and diluted/suppressed coupled corrections. New training methods must be judged against unchanged held-out and conservation checks, with actual outcomes recorded below.
+- Five high-energy transport cases terminated with `OutsideAcceptedMap`; the complete saved logs retain the fatal diagnostic even though the former generic error message showed only unrelated trailing initialization output. The physical world lies inside the accepted mesh, so bounded field-integration trials and exact-zero field handling require real transport checks.
+- The original five-repeat desktop benchmark measured 16.016 FPS and emitted a Qt `DISPLAY1` warning. A later short diagnostic measured 37.13 FPS on the Radeon 780M and physical 1280 × 800 screen, suggesting a display-state contribution. This short diagnostic does not replace the five-repeat 30 FPS acceptance gate.
+
+The unchanged resolution-8, five × 60-frame desktop benchmark subsequently passed at **42.046 FPS** (repeat medians 39.30, 41.11, 42.66, 48.22, and 42.05 FPS), including Qt event processing. Evidence is `.cache/playback-reproducibility/300dd8b51a94417d9502a3fec85195d3/benchmark.json`. It records an AMD Radeon 780M, OpenGL 3.2/driver 24.10.38, physical TL134ADXP01-0 screen at 165 Hz/DPR 2, raw scene 2012 × 668 pixels, and an active visible window. No application rendering optimization was needed. Benchmark and desktop capability fingerprints now record graphics/display identity; transient per-window visibility is evidence rather than a fingerprint input. The original failed run remains unchanged.
+
+PINN method version 2 has 31 passing targeted checks (11 conditioning, 16 existing PINN, four training-only-normalization tests), including a version-independent eight-closure limit that rolls back weights, gradients, and optimizer state on exhaustion. The bounded native CPU pilot used 100 steps (80 Adam, 20 L-BFGS), completed in 130.25 s, and remains **unqualified**. Its temperature normalized RMSE is 0.163 versus 0.509 in the original 1,000-step run; enthalpy normalized RMSE is 0.667 versus 0.959; independent enthalpy residual RMS is 2.842 versus 29.16. Held-out loss is still 0.445 and liquid-fraction RMSE 0.295, so the unchanged accuracy and conservation gates correctly fail. It recorded 70 L-BFGS closures, three budget-limited rollbacks, and all evaluation counts. Evidence is `.cache/pinn-conditioning-native-100/summary.json`. These differently sized runs demonstrate conditioning improvements, not a qualified CPU/CUDA or coupled model; canonical training reruns remain required.
+
+A real stationary coupled FE source passed a separate 50-step CPU pilot (40 Adam, 10 L-BFGS; 54.58 s total). Held-out loss was 6.60e-9, raw physics loss 1.11e-6, maximum field NRMSE 1.62e-4, and maximum independent conservation RMS 0.008325. Source/model/checkpoint associations were verified with a fresh training alias. Evidence is `.cache/pinn-conditioning-stationary-50/summary.json`. This qualifies that stationary pilot against the existing source-based gates, not the dynamic coupled matrix or the physical model independently.
+
+The rebuilt Geant4 worker passes nine new actual-binary/diagnostic tests and 16 existing radiation regressions. All five previously failing requests (`dose.pair.03`, `.06`, `.11`, `.16`, and `dose.mixed-spectrum`) now complete successfully, using immutable original field and primary files with redirected private outputs. Every original request, field, and primary hash is unchanged. Nonzero-field case 16 queried at most radius 6.48980 m inside certified support radius 6.84973 m, with step cap 0.0924321 m. Exactly zero maps use no magnetic field lookups and preserve bitwise-equal paired doses and standard errors. Evidence is `.cache/qualification-fixes/transport/guards-20261026-v1/report.json`; installed worker SHA-256 is `14e4a2f4082564208f34286a4ce8de8c21c268d38e22a666ae59c2d6a6f549f0`.
+
+An 8,192-history zero-field water pilot completed in 16.657 s; its RSE 0.40809 is **not** a passing precision result. Halving the nonzero-field step cap changed the sampled dose by 0.986 combined standard errors and retained the same primary habitat/hardware counts. With only 128 histories and RSEs 0.508/0.699, dose convergence is statistically unresolved. The 524,288-history precision case and the full matrix must still pass their measured gates; neither timing projections nor successful execution qualify them.
+
 ## Structure and playback refactor (2026-10-25)
 
 - Before/after comparisons preserve all 30 captured native thermal, diagnostic,
@@ -42,10 +63,11 @@ python -B scripts/benchmark_desktop.py --output .cache/playback-before.json
 python -B scripts/benchmark_desktop.py --output .cache/playback-after.json --baseline .cache/playback-before.json
 ```
 
-Run the first command before changes and the second after them. To compare the
-historical pre-refactor checkout, copy the benchmark script onto that checkout;
-the harness supports both workspace interfaces. It rejects mismatched fixture
-sizes/counts and a slowdown greater than 10%.
+Run the first command before changes and the second after them. Historical
+checkouts require their matching benchmark harness and dependencies; copying the
+current script alone is insufficient. Legacy baseline JSON remains readable but
+is marked as lacking verified graphics-environment identity. The current harness
+rejects mismatched fixture sizes/counts and a slowdown greater than 10%.
 
 ## Coupled Iron PINN follow-up (2026-10-25)
 
