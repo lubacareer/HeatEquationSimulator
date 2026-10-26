@@ -160,6 +160,9 @@ def restore_model_from_checkpoint(
         _operator_fingerprint,
         _torch,
     )
+    from .modulation import FILM_ARCHITECTURE, FILM_VERSION, create_film_model
+    from .gauge import (TEMPORAL_GAUGE_ARCHITECTURE, TEMPORAL_GAUGE_VERSION,
+                        create_temporal_gauge_model)
     import numpy as np
 
     torch = _torch()
@@ -224,14 +227,35 @@ def restore_model_from_checkpoint(
     ):
         raise ValueError("Unsupported PINN checkpoint network architecture.")
     kind = architecture.get("kind", "sequential_tanh")
-    if kind not in {"sequential_tanh", CORRECTION_ARCHITECTURE}:
+    if kind not in {"sequential_tanh", CORRECTION_ARCHITECTURE, FILM_ARCHITECTURE,
+                    TEMPORAL_GAUGE_ARCHITECTURE}:
         raise ValueError("Unsupported PINN checkpoint network architecture.")
     # Creating a known architecture must not change the caller's random stream.
     with torch.random.fork_rng(devices=[]):
-        model = _make_network(torch, widths[-1], widths[0]).to(
-            device=device, dtype=torch.float64
-        )
-    if kind == CORRECTION_ARCHITECTURE:
+        if kind == FILM_ARCHITECTURE:
+            if thermal or architecture.get("version") != FILM_VERSION:
+                raise ValueError("Unsupported PINN FiLM architecture version.")
+            model = create_film_model(torch=torch).to(device=device)
+        else:
+            model = _make_network(torch, widths[-1], widths[0]).to(
+                device=device, dtype=torch.float64
+            )
+    if kind == FILM_ARCHITECTURE:
+        if dict(architecture) != model.architecture_metadata():
+            raise ValueError("Unsupported PINN FiLM architecture metadata.")
+    elif kind == TEMPORAL_GAUGE_ARCHITECTURE:
+        if thermal or architecture.get("version") != TEMPORAL_GAUGE_VERSION:
+            raise ValueError("Unsupported temporal phi architecture version.")
+        times = np.asarray(source.times)
+        if len(times) < 2 or not np.isfinite(times).all() or not np.all(np.diff(times) > 0):
+            raise ValueError("Temporal phi needs strictly increasing accepted source times.")
+        expected_times = (times - times[0]) / (times[-1] - times[0])
+        if not np.array_equal(architecture.get("normalized_times"), expected_times):
+            raise ValueError("Temporal phi knots do not match the source accepted times.")
+        model = create_temporal_gauge_model(model, expected_times, torch=torch)
+        if dict(architecture) != model.architecture_metadata():
+            raise ValueError("Unsupported temporal phi architecture metadata.")
+    elif kind == CORRECTION_ARCHITECTURE:
         if thermal or architecture.get("version") != CORRECTION_VERSION:
             raise ValueError("Unsupported PINN correction architecture version.")
         groups = architecture.get("active_groups")
@@ -253,6 +277,11 @@ def restore_model_from_checkpoint(
         for name, value in state.items()
     ):
         raise ValueError("Checkpoint network weights are invalid or non-finite.")
+    if kind == TEMPORAL_GAUGE_ARCHITECTURE:
+        knots = state.get("normalized_times")
+        if (not torch.is_tensor(knots) or knots.dtype != torch.float64
+                or not torch.equal(knots.to(device=device), model.normalized_times)):
+            raise ValueError("Temporal phi state knots do not match the source accepted times.")
     try:
         model.load_state_dict(state, strict=True)
     except (RuntimeError, TypeError) as error:
