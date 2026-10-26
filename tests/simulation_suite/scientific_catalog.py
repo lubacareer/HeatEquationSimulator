@@ -34,6 +34,59 @@ DOSE_FACTORS = {
     "physics_list": ("Shielding", "QGSP_BIC_HP"),
 }
 
+_CORE_DEPENDENCIES = (
+    "tests/simulation_suite/scientific.py",  # executable checks and result publication
+    "magnetic_torus/__init__.py",
+    "magnetic_torus/models.py",
+    "magnetic_torus/store.py",
+    "magnetic_torus/artifacts.py",
+    "magnetic_torus/backend_environment.py",
+    "magnetic_torus/geometry.py",
+    "requirements-desktop.lock.txt",
+)
+_NUMERICAL_DEPENDENCIES = (
+    "magnetic_torus/physics.py",
+    "magnetic_torus/numerics/**/*.py",
+    "magnetic_torus/workers/**/*.py",
+    "magnetic_torus/learning/diagnostics.py",
+    "env/physics-ubuntu.lock.txt",
+    "scripts/setup_wsl_physics.sh",
+)
+_LEARNING_DEPENDENCIES = (
+    "magnetic_torus/pinn.py",
+    "magnetic_torus/learning/**/*.py",
+    "magnetic_torus/physics.py",
+    "magnetic_torus/numerics/**/*.py",
+)
+_TRANSPORT_DEPENDENCIES = (
+    "tests/simulation_suite/scientific_catalog.py",  # runtime source-ID resolution
+    "magnetic_torus/radiation.py",
+    "magnetic_torus/transport/**/*.py",
+    "magnetic_torus/geant4/**/*",
+    "magnetic_torus/numerics/coils.py",
+    "magnetic_torus/numerics/constants.py",
+    "env/geant4*",
+    "scripts/setup_geant4.sh",
+)
+
+
+def scientific_dependencies(action: str, parameters: dict[str, Any]) -> tuple[str, ...]:
+    """Hash actual domain dependencies without invalidating FE on display/training edits."""
+    if action in {"solve", "references", "fe_references"}:
+        domains = _NUMERICAL_DEPENDENCIES
+    elif action == "pinn":
+        domains = _LEARNING_DEPENDENCIES
+    elif action == "invalid":
+        domains = (
+            *_LEARNING_DEPENDENCIES,
+            *_TRANSPORT_DEPENDENCIES,
+            "magnetic_torus/worker.py",
+            "magnetic_torus/publication.py",
+        )
+    else:
+        domains = _TRANSPORT_DEPENDENCIES
+    return tuple(dict.fromkeys((*_CORE_DEPENDENCIES, *domains)))
+
 
 def _pairs(row: dict[str, Any]) -> set[tuple[str, Any, str, Any]]:
     return {(a, row[a], b, row[b]) for a, b in combinations(row, 2)}
@@ -102,12 +155,7 @@ def _case(
         tuple(depends),
         {"action": action, **parameters},
         "scientific" if scientific else "functional",
-        (
-            "tests/simulation_suite/scientific.py",
-            "tests/simulation_suite/scientific_catalog.py",
-            "magnetic_torus/**/*.py",
-            "magnetic_torus/geant4/**/*",
-        ),
+        scientific_dependencies(action, parameters),
     )
 
 

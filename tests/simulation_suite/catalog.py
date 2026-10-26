@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import math
 from pathlib import Path
 import re
@@ -12,6 +13,12 @@ from .spec import CaseSpec
 _ISOLATED_FE_METHODS = (
     "test_torus_physics.ThermalPhysicsTests.test_full_fe_stationary_closed_system_and_weak_operator",
     "test_torus_physics.ThermalPhysicsTests.test_full_fe_driven_vms_matches_differentiable_equations",
+)
+_GEANT4_INTEGRATION_METHODS = (
+    "test_torus_radiation.Geant4IntegrationTests.test_water_paired_zero_field_transport",
+    "test_torus_radiation.Geant4IntegrationTests.test_ground_water_transport_uses_above_ground_incident_source",
+    "test_torus_radiation.Geant4IntegrationTests.test_male_icrp110_transport",
+    "test_torus_radiation.Geant4IntegrationTests.test_female_icrp110_transport",
 )
 
 
@@ -37,7 +44,9 @@ def _module_capabilities(path: Path) -> tuple[str, ...]:
     return ()
 
 
-def unit_cases(root: Path, *, full: bool) -> list[CaseSpec]:
+def unit_cases(
+    root: Path, *, full: bool, include_integrations: bool = True
+) -> list[CaseSpec]:
     cases = []
     for path in sorted((root / "tests").glob("test_*.py")):
         caps = _module_capabilities(path)
@@ -76,7 +85,7 @@ def unit_cases(root: Path, *, full: bool) -> list[CaseSpec]:
                 ),
             )
         )
-    if full:
+    if full and include_integrations:
         for identifier in _ISOLATED_FE_METHODS:
             cases.append(
                 CaseSpec(
@@ -104,9 +113,63 @@ def unit_cases(root: Path, *, full: bool) -> list[CaseSpec]:
     return cases
 
 
-def all_cases(root: Path, *, profile: str = "full") -> tuple[list[CaseSpec], dict]:
+def _desktop_cases(*, representative: bool = False) -> list[CaseSpec]:
+    return [
+        CaseSpec(
+            "desktop.journey",
+            "desktop",
+            "Real repeated-run, source, probe, export and cancellation journey",
+            ("{python}", "-B", "{root}/scripts/desktop_smoke.py"),
+            180 if representative else 900,
+            ("desktop",),
+            dependencies=(
+                "magnetic_torus/**/*.py",
+                "interface3.py",
+                "scripts/desktop_smoke.py",
+            ),
+        ),
+        CaseSpec(
+            "desktop.performance",
+            "performance",
+            "Five-repeat resolution-8 playback including Qt events",
+            (
+                "{python}",
+                "-B",
+                "{root}/scripts/benchmark_desktop.py",
+                "--output",
+                "{case_dir}/benchmark.json",
+            ),
+            120 if representative else 600,
+            ("desktop",),
+            parameters={"minimum_fps": 30.0},
+            dependencies=(
+                "magnetic_torus/**/*.py",
+                "interface3.py",
+                "scripts/benchmark_desktop.py",
+            ),
+        ),
+    ]
+
+
+def all_cases(root: Path, *, profile: str = "features") -> tuple[list[CaseSpec], dict]:
+    if profile not in {"features", "full", "fast"}:
+        raise ValueError(f"Unknown test profile: {profile}")
     full = profile == "full"
-    cases = unit_cases(root, full=full)
+    cases = unit_cases(root, full=profile != "fast", include_integrations=full)
+    if profile == "features":
+        cases = [
+            replace(
+                case,
+                capabilities=(),
+                parameters={
+                    **case.parameters,
+                    "exclude_ids": list(_GEANT4_INTEGRATION_METHODS),
+                },
+            )
+            if case.id == "unit.test_torus_radiation"
+            else case
+            for case in cases
+        ]
     coverage = {
         "profile": profile,
         "modern_workspace": True,
@@ -121,38 +184,20 @@ def all_cases(root: Path, *, profile: str = "full") -> tuple[list[CaseSpec], dic
         scientific = scientific_cases()
         cases.extend(scientific)
         coverage["scientific_matrix"] = matrix_coverage(scientific)
+        cases.extend(_desktop_cases())
+    elif profile == "features":
+        from .feature_catalog import feature_cases, feature_coverage
+
+        # Keep the long precision ensemble after the visual checks.
+        representatives = feature_cases()
         cases.extend(
-            [
-                CaseSpec(
-                    "desktop.journey",
-                    "desktop",
-                    "Real repeated-run, source, probe, export and cancellation journey",
-                    ("{python}", "-B", "{root}/scripts/desktop_smoke.py"),
-                    900,
-                    ("desktop",),
-                    dependencies=("magnetic_torus/**/*.py", "scripts/desktop_smoke.py"),
-                ),
-                CaseSpec(
-                    "desktop.performance",
-                    "performance",
-                    "Five-repeat resolution-8 playback including Qt events",
-                    (
-                        "{python}",
-                        "-B",
-                        "{root}/scripts/benchmark_desktop.py",
-                        "--output",
-                        "{case_dir}/benchmark.json",
-                    ),
-                    600,
-                    ("desktop",),
-                    parameters={"minimum_fps": 30.0},
-                    dependencies=(
-                        "magnetic_torus/**/*.py",
-                        "scripts/benchmark_desktop.py",
-                    ),
-                ),
-            ]
+            case for case in representatives if case.id != "feature.dose_water"
         )
+        cases.extend(_desktop_cases(representative=True))
+        cases.extend(
+            case for case in representatives if case.id == "feature.dose_water"
+        )
+        coverage["feature_matrix"] = feature_coverage(cases, root=root)
     validate_cases(cases)
     return cases, coverage
 

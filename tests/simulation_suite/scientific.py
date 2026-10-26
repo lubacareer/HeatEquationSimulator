@@ -53,6 +53,20 @@ def _config(parameters):
     base = preset(parameters.get("preset", "Iron"))
     if recipe == "preset":
         return base
+    if recipe.startswith("feature_fe_"):
+        config = replace(ScenarioConfig(), major_radius=1.6, minor_radius=.2, habitat_radius=1.,
+                         duration=.05, time_steps=3, resolution=3, seed_duration=.02,
+                         heating_power=100000., initial_temperature=1820., coil_current=1000.,
+                         pump_force=1., turbulence=False, ground_enabled=recipe == "feature_fe_driven")
+        if recipe == "feature_fe_dynamo":
+            config = replace(config, initial_temperature=config.melting_temperature + .2,
+                             mode="dynamo", coil_current=0., pump_force=10., turbulence=True)
+        elif recipe == "feature_fe_zero":
+            config = replace(config, duration=.02, time_steps=2, heating_power=0., coil_current=0.,
+                             pump_force=0., gravity=0., seed_duration=.01)
+        elif recipe != "feature_fe_driven":
+            raise ValueError("Unknown representative FE recipe: " + recipe)
+        return config.validate()
     if recipe.startswith("fe_") or recipe == "transport":
         config = replace(ScenarioConfig(), duration=.05, time_steps=3, resolution=3,
                          heating_power=100000., initial_temperature=1820., coil_current=1000.,
@@ -85,7 +99,7 @@ def _config(parameters):
                      discharge_power=0., charge_fraction=1., emissivity=0., coil_current=0.)
     changes = {
         "solid_closed": {"heating_power": 0.},
-        "solid_heating": {},
+        "solid_heating": {}, "feature_native_source": {"resolution": 4},
         "liquid_cooling": {"initial_temperature": base.melting_temperature + 20., "heating_power": 0., "discharge_power": 20000., "charge_fraction": 0.},
         "melting": {"initial_temperature": base.melting_temperature - 1., "heating_power": 1.1e7, "duration": 4., "time_steps": 16},
         "freezing": {"initial_temperature": base.melting_temperature + 1., "heating_power": 0., "discharge_power": 1.1e7, "charge_fraction": 0., "duration": 4., "time_steps": 16},
@@ -95,6 +109,10 @@ def _config(parameters):
         "charge_one": {"heating_power": 1000., "discharge_power": 500., "charge_fraction": 1.},
         "charge_roundoff": {"duration": 1., "time_steps": 10, "charge_fraction": .3, "heating_power": 1000., "discharge_power": 500.},
         "efficiency_zero": {"efficiency": 0.}, "efficiency_one": {"efficiency": 1.}, "material": {},
+        "feature_thermal_cycle": {"resolution": 4, "duration": 8., "time_steps": 32,
+                                  "initial_temperature": base.melting_temperature - 1.,
+                                  "heating_power": 1.1e7, "discharge_power": 1.1e7,
+                                  "charge_fraction": .5, "emissivity": .1},
     }
     return replace(config, **changes[recipe]).validate()
 
@@ -141,7 +159,7 @@ def _solve(request, checks, progress, cancel):
             checks.add("closed_state_constant", np.max(np.abs(temperature - config.initial_temperature)) < 1e-8)
         if recipe in {"liquid_cooling", "radiating"}:
             checks.add("cooling_direction", float(temperature[-1].mean()) < float(temperature[0].mean()))
-        if recipe == "solid_heating":
+        if recipe in {"solid_heating", "feature_native_source"}:
             checks.add("heating_direction", float(temperature[-1].mean()) > float(temperature[0].mean()))
     else:
         # FE energy is assembled with the worker's nonlinear quadrature, not a
@@ -160,20 +178,28 @@ def _solve(request, checks, progress, cancel):
             checks.add("imposed_seed_removed", abs(float(imposed[-1])) < 1e-12, final_imposed_energy_j=float(imposed[-1]))
         elif config.mode == "driven":
             checks.add("constant_independent_imposed_coil", np.allclose(imposed, imposed[0], rtol=1e-12, atol=1e-12))
-        if recipe == "fe_matrix":
+        if recipe == "fe_matrix" or recipe in {"feature_fe_driven", "feature_fe_dynamo"}:
             initial_fraction = float(fraction[0].mean())
-            phase = parameters["phase"]
+            phase = parameters.get("phase", "mushy" if recipe == "feature_fe_dynamo" else "liquid")
             checks.add("requested_initial_phase", (initial_fraction < 1e-12 if phase == "solid" else
                        initial_fraction > 1 - 1e-12 if phase == "liquid" else 0 < initial_fraction < 1),
                        phase=phase, initial_liquid_fraction=initial_fraction)
         _weak_checks(result, checks, progress)
-        if recipe == "fe_stationary":
+        if recipe in {"fe_stationary", "feature_fe_zero"}:
             checks.add("stationary_temperature", float(np.max(np.abs(temperature - config.initial_temperature))) < 1e-6)
             checks.add("stationary_velocity", float(np.max(np.abs(result.fields["velocity"]))) < 1e-9)
     if recipe in {"melting", "fe_melting"}:
         checks.add("melting_front_evolves", float(fraction[-1].mean()) > float(fraction[0].mean()) + 1e-6)
     if recipe in {"freezing", "fe_freezing"}:
         checks.add("freezing_front_evolves", float(fraction[-1].mean()) < float(fraction[0].mean()) - 1e-6)
+    if recipe == "feature_thermal_cycle":
+        mean_fraction = fraction.mean(axis=1)
+        checks.add("melting_front_evolves", float(mean_fraction.max()) > float(mean_fraction[0]) + 1e-6)
+        checks.add("freezing_front_evolves", float(mean_fraction[-1]) < float(mean_fraction.max()) - 1e-6)
+        checks.add("solid_mushy_liquid_states", bool(np.any(result.fields["enthalpy"] < 0)
+                   and np.any((result.fields["enthalpy"] > 0) & (result.fields["enthalpy"] < config.latent_heat))
+                   and np.any(result.fields["enthalpy"] > config.latent_heat)))
+        checks.add("positive_radiation_loss", float(result.diagnostics["radiated_energy_j"][-1]) > 0.)
     return {"source_path": str(path)}, {"configuration": config.to_dict(), "configuration_hash": config.config_hash,
                                             "physics_hash": config.physics_hash, "seed": config.seed,
                                             "snapshots": len(result.times), "points": len(result.points),
@@ -317,9 +343,9 @@ def _radiation_source(request, parameters, directory):
         source = RunResult("analytic-" + uuid.uuid4().hex, config, np.array([0.]), np.zeros((1, 3)), {}, {},
                            {"backend": "Analytic imposed-coil trajectory fixture; not an MHD solution"})
         return replace(source, config=_particle_config(source, parameters, directory))
-    source_id = transport_source("zero" if field == "pinn" else field, parameters["ground"])
+    source_id = parameters.get("source_case", transport_source("zero" if field == "pinn" else field, parameters["ground"]))
     if field == "pinn":
-        model_id = f"pinn.transport.zero.{'ground' if parameters['ground'] else 'vacuum'}"
+        model_id = parameters.get("model_case", f"pinn.transport.zero.{'ground' if parameters['ground'] else 'vacuum'}")
         # The PINN source records its actual training settings, not the earlier
         # numerical configuration used before training.
         source = _load_dependency(request, model_id)
@@ -443,7 +469,7 @@ def _dose_reference(request, checks, progress, cancel):
          "source": "beam", "target": "water", "physics_list": "Shielding"}
     source = _radiation_source(request, p, directory)
     attempts = []
-    counts = [p["histories"]] if p["action"] == "dose_linearity" else [
+    counts = [p["histories"]] if p["action"] in {"dose_linearity", "dose_fixed_precision"} else [
         count for count in (512, 2048, 8192, 32768, 131072, 262144, p["maximum_histories"])
         if count <= p["maximum_histories"]
     ]
@@ -460,7 +486,7 @@ def _dose_reference(request, checks, progress, cancel):
             break
     _dose_checks(dose, source, checks)
     checks.add("nonzero_water_reference", bool(dose.dose_gy[0] > 0))
-    if p["action"] == "dose_precision":
+    if p["action"] in {"dose_precision", "dose_fixed_precision"}:
         checks.add("water_precision_5_percent", relative is not None and relative <= .05, relative_standard_error=relative, histories=dose.histories, limit=.05)
     else:
         doubled = replace(source, run_id="observation-" + uuid.uuid4().hex,
@@ -544,7 +570,8 @@ def _invalid(request, checks, progress, cancel):
 
 
 HANDLERS = {"solve": _solve, "references": _references, "fe_references": _fe_references, "pinn": _pinn,
-            "boris": _boris, "dose": _dose, "dose_precision": _dose_reference, "dose_linearity": _dose_reference, "invalid": _invalid}
+            "boris": _boris, "dose": _dose, "dose_precision": _dose_reference, "dose_fixed_precision": _dose_reference,
+            "dose_linearity": _dose_reference, "invalid": _invalid}
 
 
 def _json_safe(value):
