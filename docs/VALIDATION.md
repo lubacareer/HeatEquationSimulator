@@ -85,8 +85,9 @@ python -B scripts/benchmark_desktop.py --output .cache/playback-after.json --bas
 
 Run the first command before changes and the second after them. Historical
 checkouts require their matching benchmark harness and dependencies; copying the
-current script alone is insufficient. Legacy baseline JSON remains readable but
-is marked as lacking verified graphics-environment identity. The current harness
+current script alone is insufficient. Legacy baseline JSON remains unchanged;
+the new comparison report marks it with `baseline_environment_verified: false`
+when its graphics-environment identity is absent. The current harness
 rejects mismatched fixture sizes/counts and a slowdown greater than 10%.
 
 ## Coupled Iron PINN follow-up (2026-10-25)
@@ -144,6 +145,96 @@ Runtime artifacts and machine-readable numerical reports live under `.cache/`. T
 - Nontrivial molten seed-removal mixed-VMS source, 1000 CUDA epochs: failed. Magnetic field, pressure, and potential normalized RMSE were 0.255, 0.139, and 0.325. Report: `.cache/pinn_dynamo_1000/report.json`.
 
 Failed models remain inspectable and are labelled failed in the scene and validation charts. They cannot supply radiation fields. The general coupled PINN accuracy gate remains open.
+
+## Full-suite follow-up (2026-10-26)
+
+The completed report at `.cache/test-suite/20261026T133138.135583Z/`, revision
+`47c87d7`, contains 129 cases: 120 PASS, seven FAIL, and two TIMEOUT after
+4 h 30 min 28 s. All numerical solves, functional transport cases, and desktop
+checks passed. The five-repeat desktop benchmark measured 48.13 FPS. Its eight
+unsuccessful PINN cases and water precision failure remain recorded unchanged.
+The final 524,288-history water ensemble measured 5.08554% relative standard
+error, correctly failing the 5% gate.
+
+Both current profiles now use one fixed 1,048,576-history ensemble with the
+same seed, source, geometry, normalization, and physics list. Its projected
+uncertainty is approximately 3.6% and paired runtime approximately 19 minutes,
+based on the last ensemble's measured statistics and time. These are projections;
+the actual new nonzero score must satisfy the unchanged measured uncertainty
+gate. Earlier correlated attempts are not pooled, and zero-field pairing does
+not supply twice as many independent histories.
+
+Training method 5 adds a fixed native data warmup/physics ramp and training-only
+correction activation. Coupled corrections freeze the original core and use
+cloned thermofluid and/or pressure/potential branches with fixed spatial Fourier
+features. The primary request remains separate from the additional bounded Adam
+and joint L-BFGS budgets. Metadata and checkpoints record actual completed
+steps, stages, evaluations, and architecture versions. Final validation still
+uses the original held-out field, loss, conservation, and source-identity gates.
+Cancelled or failed line searches now restore the pre-step weights, gradients,
+and optimizer state before propagating the error.
+
+The eight unsuccessful full-profile PINN cases have 3,600 s execution limits;
+feature case limits and the one-hour representative supervisor remain unchanged.
+Longer execution does not qualify an inaccurate model. New canonical fits and
+the enlarged water run remain pending. See [TEST_MATRIX.md](TEST_MATRIX.md#rerun-the-nine-outstanding-canonical-cases)
+for one targeted resume command and the separate one-hour default.
+
+Private checkpoint pilots preserved the original source, checkpoint, and report
+hashes. They diagnose conditioning rather than replaying primary training:
+
+| Source | Diagnostic stages | Time | Outcome |
+| --- | --- | ---: | --- |
+| Iron, old completed epoch-1000 checkpoint | Prototype method 4: 2,000 label-only Adam + 50 joint L-BFGS | 217.4 s | Per-source gates passed: pressure normalized RMSE 0.06561, potential 0.04689, held-out MSE 0.001088. This prototype is not the shipped method. |
+| Lunar, old partial epoch-900 checkpoint | Prototype method 4: 2,000 label-only Adam + 50 joint L-BFGS | 335.2 s | Failed: enthalpy 0.3239, pressure 0.1197, potential 0.5487 normalized RMSE; continuity/charge also failed badly. |
+| Native phase-changing source, old completed epoch-1000 checkpoint, CUDA pilot | Method 5: 2,000 original-joint-objective Adam + 50 joint L-BFGS | 184.3 s | Failed: enthalpy 0.8174, temperature 0.1554, liquid fraction 0.3639 normalized RMSE; enthalpy residual RMS 2.0097. |
+
+The label-only correction policy was rejected after the Lunar pilot: fitting
+pointwise labels without equation losses damaged continuity and charge.
+Method 5 retains the original full-field sampled data, physics, and boundary
+objective on every correction Adam step. Regression checks cover its nonzero
+physics/boundary gradients, cancellation rollback, and held-out independence.
+The first interrupted prototype attempts are also retained, but their
+post-interruption trial weights are not qualification evidence. Current pilots
+and notes are under `.cache/conditioning-pilots-20261026/`. Original checkpoints
+did not contain NumPy generator state; these diagnostic stages start a fresh
+seeded preparation stream and are not uninterrupted canonical fits.
+
+Following the requested scope reduction, normal desktop training now excludes
+phase-changing native thermal and time-varying coupled MHD scenarios. Pure-phase
+native thermal and stationary coupled training remain available. A disabled
+training button explains the limitation; numerical simulation and saved model
+inspection remain available. These family checks do not guarantee that every
+enabled custom fit will qualify. Failed models still fail the original gates
+and cannot supply radiation fields. The full research cases remain executable
+and unsuccessful outcomes are preserved; no failed qualification was converted
+into a passing test to reduce the supported desktop scope.
+
+Current method-5 checks confirm both retained training paths:
+
+- The representative single-phase native source and its fresh 1,000-step CPU
+  fit both passed through the normal suite runner. Fit time was 62.58 s;
+  held-out MSE was `4.55e-8`, temperature RMSE `0.0002132 K`, normalized enthalpy
+  residual RMS `0.0006017`, and relative interval energy defect `5.58e-5`.
+  Evidence: `.cache/conditioning-feature-native-20261026/report.json`. This
+  two-case selection correctly claims neither complete feature nor full coverage.
+- A fresh 250-step CUDA fit on the saved accepted stationary FE source passed
+  in 105.19 s: held-out MSE `1.49e-10`, maximum field normalized RMSE `2.77e-5`,
+  maximum independently checked residual RMS `0.0005857`. Source binding and
+  saved-result roundtrips passed. Evidence:
+  `.cache/conditioning-stationary-20261026/report.json`.
+
+The focused regression selection passed 196 tests, including 15 real Qt/VTK
+desktop tests with desktop checks enabled, source eligibility, immutable-source
+caching, unavailable-action guards, and saved passed/failed model inspection.
+The real desktop smoke journey also passed with four runs, particle replay,
+saved-model inspection, and all 60 MP4 frames decoded. Its raw renderer size
+changed from 1938×400 to 1714×478 during export; smoke playback measured
+35.64 FPS. This is the 256-point smoke fixture, not a replacement for the
+resolution-8 five-repeat benchmark. Evidence:
+`.cache/conditioning-desktop-20261026/output.log`.
+The complete one-hour representative invocation and enlarged water ensemble
+remain pending; these short checks do not replace them.
 
 ## Release gates still open
 

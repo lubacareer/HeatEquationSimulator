@@ -84,7 +84,11 @@ Imposed, induced, and mutual magnetic stored-energy contributions and integrated
 
 ### PINNs
 
+The desktop enables training for single-phase native thermal sources and stationary coupled sources. Phase-changing thermal and time-varying coupled MHD training are disabled, with an explanation beside **Train PINN**, because those modes remain unqualified. This does not disable their numerical simulations, plots, or radiation analysis using accepted numerical fields. Existing PINNs remain inspectable; only passed, source-matched models can provide radiation fields. The research backend and full diagnostic cases remain available for investigation and still enforce their original gates.
+
 Per-scenario PyTorch models use nondimensional variables and sparse numerical samples. Full coupled models enforce the same exported differentiable FE weak operator, including closure, conductor/exterior interfaces, gauges, and boundary conditions. Native models enforce the corresponding discrete conservative enthalpy balance and supply only the thermal fields they train. Batches are bounded; checkpoints, cancellation, held-out field errors, conservation defects, and histories are recorded.
+
+Training method version 5 adds a fixed native physics warmup and, when training-only field/equation diagnostics require it, bounded correction stages. Coupled corrections use parameterization version 3 with independent thermofluid/elliptic branches and a frozen base network; the base parameterization remains version 2. The correction budget adds at most `min(2000, 2 × requested steps)` joint Adam steps and `min(50, requested steps / 20 rounded down)` joint L-BFGS steps, retaining data, physics, and boundary losses. Checkpoints record the architecture, requested and actual steps, stages, and source identity. Held-out labels do not select or fit the corrections, and qualification limits are unchanged. This is not qualification of the disabled research modes.
 
 Training can fail its validation gates. Failed models remain inspectable and labelled failed. **PINN-sourced** radiation requires a passed model with the originating scenario and full global A prediction. Numerical FE fields can supply radiation analyses without training a PINN. Agreement with a numerical source does not independently qualify that source's physics.
 
@@ -112,7 +116,7 @@ Run the representative modern-workspace feature suite from the repository root:
 conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py
 ```
 
-The default `features` profile tests one fixed scenario per major feature, including real desktop interactions/exports, thermal/MHD solvers, CPU/CUDA PINNs, particles, water/anatomical dose, and playback performance. It retains short regressions and the existing scientific accuracy limits, including measured water-dose uncertainty ≤5%. The command allows 55 minutes of work plus five minutes for cleanup/reporting, with a one-hour supervisor backstop. An unfinished case or failed accuracy gate cannot pass. The complete profile timing remains to be measured; 25–40 minutes on the reference workstation is an estimate. Normal application history stays separate.
+The default `features` profile tests one fixed scenario per major feature, including real desktop interactions/exports, thermal/MHD solvers, CPU/CUDA PINNs, particles, water/anatomical dose, and playback performance. It retains short regressions and the existing scientific accuracy limits. Both profiles now run one fixed **1,048,576-history** water ensemble and require nonzero dose with measured relative standard error ≤5%; neither old attempts nor paired field-on/off history counts are pooled. The command allows 55 minutes of work plus five minutes for cleanup/reporting, with a one-hour supervisor backstop. Feature PINNs retain 10-minute case limits and water retains 30 minutes. An unfinished case or failed accuracy gate cannot pass. Complete timing of the revised feature profile remains unmeasured. Normal application history stays separate.
 
 The exhaustive multi-hour matrix remains available explicitly:
 
@@ -121,6 +125,8 @@ conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --
 ```
 
 A representative pass does not qualify all presets, option combinations, female anatomy, or dynamic/phase-changing PINNs. Existing full-suite scientific failures remain documented. A resumed report keeps its recorded profile; resuming an old `full` report still runs the exhaustive profile.
+
+The completed full run at revision `47c87d7` (`.cache/test-suite/20261026T133138.135583Z/`) tested 129 cases in **4 h 30 min 28 s**: **120 passed, seven failed, and two timed out**. Its desktop benchmark passed at **48.13 FPS**; the last 524,288-history water ensemble measured **5.08554%** relative standard error and correctly failed the 5% gate. The remaining eight unsuccessful cases were PINNs. That report has not been rewritten as a pass. Their full-profile deadlines are now one hour each, with source scenarios and accuracy limits unchanged; canonical reruns of those eight PINNs and the larger water ensemble remain pending. See [the targeted resume command](docs/TEST_MATRIX.md#rerun-the-nine-outstanding-canonical-cases).
 
 Live progress and per-case evidence are saved under `.cache/test-suite/<run>/`; open `report.html` or share `report.json` with its case logs. Reports distinguish representative feature coverage from exhaustive matrix coverage. Budget exhaustion returns exit code 124 and retains evidence for resume. See [the coverage and rerun workflow](docs/TEST_MATRIX.md) for selected scenarios, limits, and commands.
 
