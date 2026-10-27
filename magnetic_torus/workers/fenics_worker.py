@@ -156,7 +156,7 @@ def build_mesh(config: ScenarioConfig):
     return data.mesh, data.cell_tags, radius
 
 
-def run(config: ScenarioConfig, directory: Path) -> None:
+def run(config: ScenarioConfig, directory: Path, operator_probe: Path | None = None) -> None:
     import basix.ufl
     import dolfinx
     from dolfinx import fem, mesh
@@ -310,6 +310,55 @@ def run(config: ScenarioConfig, directory: Path) -> None:
     F += (rho * (H - Hp) * s / dt - rho * H * ufl.dot(u, ufl.grad(s)) + heat_k * ufl.dot(ufl.grad(T), ufl.grad(s))
           - (heating + ufl.dot(J, J) / sigma + 2 * mu * ufl.inner(ufl.sym(ufl.grad(u)), ufl.sym(ufl.grad(u))) + damping * ufl.dot(u, u)) * s) * dx(1)
     F += coefficients.emissivity * STEFAN_BOLTZMANN * (ufl.avg(T) ** 4 - coefficients.ambient_temperature ** 4) * ufl.avg(s) * dS(1)
+    if operator_probe is not None:
+        # Assemble the *same* form used by the solver on a source-bound pair.
+        # Do not solve or publish a simulation result from this diagnostic.
+        with np.load(operator_probe, allow_pickle=False) as payload:
+            data = {key: payload[key] for key in payload.files}
+        if (data["points"].shape != points.shape
+                or not np.allclose(data["points"], points, rtol=0., atol=1.e-12)
+                or data["cells"].shape != cells.shape
+                or not np.array_equal(np.sort(data["cells"], axis=1), np.sort(cells, axis=1))
+                or not np.array_equal(data["cell_labels"], cell_labels)):
+            raise ValueError("Saved source and FE probe mesh do not match.")
+        for index, indices in bc_node_indices.items():
+            nodes = np.unique(orders[index][indices // 3] if index in (0, 2) else orders[index][indices])
+            if not np.array_equal(nodes, np.sort(data[f"bc_{index}"])):
+                raise ValueError(f"Saved source and FE probe boundary mask {index} do not match.")
+        names = ("velocity", "pressure", "vector_potential", "electric_potential", "temperature")
+        imposed = data["imposed"]
+        for index, name in enumerate(names):
+            values = data[name]
+            if index == 2:
+                values = values - imposed
+            current.x.array[maps[index]] = values[1, orders[index]].ravel()
+            previous.x.array[maps[index]] = values[0, orders[index]].ravel()
+        external_a.x.array[:] = imposed[1, ext_order].ravel()
+        external_previous.x.array[:] = imposed[0, ext_order].ravel()
+        dt.value = float(data["times"][1] - data["times"][0])
+        if float(dt.value) <= 0:
+            raise ValueError("Probe times must be a strictly increasing accepted pair.")
+        heating.value = source_power(config, float(np.mean(data["times"]))) / actual_volume
+        direction = fem.Function(W)
+        for index, name in enumerate(names):
+            direction.x.array[maps[index]] = data[f"direction_{name}"][orders[index]].ravel()
+        current.x.scatter_forward()
+        previous.x.scatter_forward()
+        direction.x.scatter_forward()
+        residual_vector = fem.petsc.assemble_vector(fem.form(F))
+        derivative_vector = fem.petsc.assemble_vector(fem.form(ufl.derivative(F, current, direction)))
+        for vector_ in (residual_vector, derivative_vector):
+            vector_.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        output = {}
+        for prefix, vector_ in (("residual", residual_vector), ("jacobian", derivative_vector)):
+            for index, name in enumerate(names):
+                width = 3 if index in (0, 2) else 1
+                values = vector_.array[maps[index]].reshape(-1, width)
+                reordered = np.zeros((nc, width))
+                reordered[orders[index]] = values
+                output[f"{prefix}_{name}"] = reordered if width == 3 else reordered[:, 0]
+        np.savez_compressed(directory / "operator_probe.npz", **output)
+        return
     report(.04, f"Compiling coupled forms · {nc} nodes / {ncells} tetrahedra")
     # Direct factors can exceed the mesh storage by orders of magnitude. Bound
     # MUMPS itself instead of letting the OS kill a desktop/transport worker.
@@ -468,6 +517,7 @@ if __name__ == "__main__":
             run_special_case_benchmarks(Path(sys.argv[2]))
             sys.exit(0)
         request, output = Path(sys.argv[1]), Path(sys.argv[2])
+        probe = Path(sys.argv[4]) if len(sys.argv) == 5 and sys.argv[3] == "--operator-probe" else None
         output.mkdir(parents=True, exist_ok=True)
         try:
             os.setsid()
@@ -484,7 +534,7 @@ if __name__ == "__main__":
                         os.kill(os.getpid(), signal.SIGTERM)
                 time.sleep(.1)
         threading.Thread(target=cancellation_watchdog, daemon=True).start()
-        run(ScenarioConfig.from_dict(json.loads(request.read_text(encoding="utf-8"))), output)
+        run(ScenarioConfig.from_dict(json.loads(request.read_text(encoding="utf-8"))), output, probe)
     except Exception:
         traceback.print_exc()
         sys.exit(1)

@@ -22,7 +22,8 @@ def _load_weak_artifact(payload: bytes) -> dict[str, np.ndarray]:
 def evaluate_weak_residual_torch(config: ScenarioConfig, reference_result: RunResult,
                                  predicted_fields: dict[str, Any], time_indices: Any,
                                  point_indices: Any = None, *,
-                                 normalization_scales: Mapping[str, float] | None = None) -> dict[str, Any]:
+                                 normalization_scales: Mapping[str, float] | None = None,
+                                 include_raw_components: bool = False) -> dict[str, Any]:
     """Differentiable, matching P1 FE weak residuals for one accepted time pair.
 
     This uses the worker's tetrahedral quadrature, geometry, boundary conditions,
@@ -206,6 +207,8 @@ def evaluate_weak_residual_torch(config: ScenarioConfig, reference_result: RunRe
         mask = free_nodes(index, index != 2)
         denom = torch.clamp(vol[mask], min=1.e-30) * scale
         result[name] = residual[mask] / (denom[:, None] if residual.ndim == 2 else denom)
+        if include_raw_components:
+            result[f"raw_{name}"] = residual[mask]
     # Gauge is already enforced in the induction weak equation; expose separately
     # to monitor divergence, rather than claim identically zero Coulomb error.
     result["gauge"] = divAi * length / ascale
