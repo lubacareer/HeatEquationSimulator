@@ -255,7 +255,7 @@ L-BFGS. No thresholds or physics objectives changed.
 | Iron | `training-0f29303d2efd4826a2b4816f2b6e8000` | Elliptic (pressure 0.2039, electric potential 0.2413) and thermofluid (velocity 0.0830); maximum activation residual 0.04202 (charge) | 0.0011653 / 0.0002213 / 3.31e-37 | 0.06801 (pressure) | 0.04202 (charge) | 1000.61 s | **PASS** |
 | Regolith composite | `training-7c874db6c9b74a8fb754ea17924f5998` | Elliptic (pressure 0.1280, electric potential 0.06710); maximum activation residual 0.0008660 (charge) | 0.0009555 / 1.39e-7 / 8.84e-38 | 0.05955 (pressure) | 0.0008660 (charge) | 1039.98 s | **PASS** |
 | Mushy Driven VMS | `training-6481dcff0aac45308dc25f33f5dce3e1` | Elliptic (pressure 0.1603, electric potential 0.1396) and thermofluid (velocity 0.06520); maximum activation residual 0.007600 (charge) | 0.0025108 / 8.91e-6 / 1.32e-37 | **0.11633 (pressure)** | 0.007600 (charge) | 862.98 s | **FAIL** |
-| Liquid Dynamo VMS | No finalized PINN metadata | No correction activation recorded; primary L-BFGS reached epoch 862 before a CUDA out-of-memory error during rollback | Intermediate held-out MSE 0.010006 at epoch 860; no final loss audit | Not available | Not available | 3659.95 s | **TIMEOUT** |
+| Liquid Dynamo VMS | No finalized PINN metadata | No correction activation recorded; primary L-BFGS reached epoch 862 before CUDA out-of-memory errors in backpropagation and rollback | Intermediate held-out MSE 0.010006 at epoch 860; no final loss audit | Not available | Not available | 3659.95 s | **TIMEOUT** |
 | Freezing | `training-f7a7eac9a1ae454db67eecb95b45e7b5` | Elliptic (pressure 0.1138); maximum activation residual 0.08493 (momentum) | 0.00005525 / 0.0007200 / 2.41e-64 | 0.01773 (pressure) | 0.07298 (momentum) | 723.36 s | **PASS** |
 
 The full training-only field and equation diagnostics, activation decisions,
@@ -271,12 +271,15 @@ the unchanged 0.1 per-field limit. This is the measured reason its combined
 `heldout_and_conservation_gates` check failed; the other fields and residuals
 do not override that pressure failure.
 
-Liquid Dynamo VMS failed before a final audit. Its worker log shows CUDA out of
-memory while restoring weights during a bounded L-BFGS recovery at about 218 s,
-after progress reached primary epoch 862. The worker did not publish completed
-training metadata; the full-profile supervisor ultimately recorded TIMEOUT at
-3,659.95 s and qualification `NOT_RUN`. The intermediate loss is not a passing
-result. The retained attempt and diagnostics are under
+Liquid Dynamo VMS failed before a final audit. After progress reached primary
+epoch 862, its worker log shows CUDA out of memory during backpropagation in an
+L-BFGS closure, followed by another CUDA out-of-memory error while restoring
+weights. At about 218 s the worker wrote an `ERROR` result, but its process did
+not exit before the deadline. The runner waits for process exit and ultimately
+recorded TIMEOUT at 3,659.95 s and qualification `NOT_RUN`; the reason the
+process remained alive is not established. No completed training metadata was
+published, and the intermediate loss is not a passing result. The retained
+attempt and diagnostics are under
 `.cache/test-suite/20261026T133138.135583Z/cases/pinn.fe.liquid.dynamo.vms/attempt-0002/`.
 
 The current report records the targeted selection as 10 cases: eight PASS
