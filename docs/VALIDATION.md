@@ -12,7 +12,7 @@ There are 135 passing focused checks: eight batching/cache, 17 conditioning, 16 
 
 A bounded synthetic CPU benchmark measured only the full-label gradient calculation: 5,200 training labels, float64, one CPU thread, five repetitions. Median time decreased from 57.315 ms (uncached 256-row batches, 21 neural calls) to 29.918 ms (cached 4,096-row batches, two calls), a 1.916× speedup. Loss was identical, maximum absolute gradient difference was 9.72e-17, and the host cache occupied 124,840 bytes. Evidence is `.cache/pinn-stall-worktree/.cache/pinn-batching-benchmark.json`. This is not a measured speedup for an entire PINN fit or scientific qualification.
 
-The exact conda entrypoint passed a real three-case selection (CLI regressions, melting/freezing/radiating thermal cycle, and short native source) with all six installed capabilities verified, followed by a successful inferred-profile targeted resume. Both correctly reported incomplete overall feature/full coverage; the resume retained unvisited evidence. Reports are in `.cache/pinn-stall-worktree/.cache/representative-cli-smoke-20261026/`. A complete representative run, its wall time, anatomical transport, and the current 1,048,576-history water precision case remain pending. The estimated 25–40 minutes is not a completed measurement.
+The exact conda entrypoint passed a real three-case selection (CLI regressions, melting/freezing/radiating thermal cycle, and short native source) with all six installed capabilities verified, followed by a successful inferred-profile targeted resume. Both correctly reported incomplete overall feature/full coverage; the resume retained unvisited evidence. Reports are in `.cache/pinn-stall-worktree/.cache/representative-cli-smoke-20261026/`. A complete representative run, its wall time, and anatomical transport remain pending. A later targeted 1,048,576-history water precision run passed as recorded below. The estimated 25–40 minutes is not a completed representative-profile measurement.
 
 Development and these checks used an isolated checkout; the already-running full suite and its history were left untouched. Update the main working directory after it finishes, then start a fresh default command for the one-hour representative profile. Resuming an old `full` report intentionally retains exhaustive, multi-hour behavior.
 
@@ -178,8 +178,9 @@ and optimizer state before propagating the error.
 The eight unsuccessful full-profile PINN cases had 3,600 s execution limits;
 feature case limits and the one-hour representative supervisor remain unchanged.
 Longer execution does not qualify an inaccurate model. The targeted five-case
-method-5 outcomes are recorded above; the failed and timed-out cases remain
-unqualified, as do the other unsuccessful PINNs and enlarged water run. See
+method-5 outcomes are recorded below; Mushy and the other unsuccessful PINNs
+remain unqualified. Later targeted Liquid Dynamo and enlarged water runs passed
+their existing gates, without qualifying the complete profiles. See
 [TEST_MATRIX.md](TEST_MATRIX.md#rerun-the-outstanding-pinn-and-water-precision-cases)
 for the current targeted resume command and separate one-hour default.
 
@@ -236,8 +237,9 @@ changed from 1938×400 to 1714×478 during export; smoke playback measured
 35.64 FPS. This is the 256-point smoke fixture, not a replacement for the
 resolution-8 five-repeat benchmark. Evidence:
 `.cache/conditioning-desktop-20261026/output.log`.
-The complete one-hour representative invocation and enlarged water ensemble
-remain pending; these short checks do not replace them.
+At the time of these checks, the complete one-hour representative invocation and
+enlarged water ensemble had not been run. The later targeted water run passed as
+recorded below; these short checks do not replace a complete invocation.
 
 ## Canonical method-5 coupled PINN replay (2026-10-27)
 
@@ -282,18 +284,19 @@ published, and the intermediate loss is not a passing result. The retained
 attempt and diagnostics are under
 `.cache/test-suite/20261026T133138.135583Z/cases/pinn.fe.liquid.dynamo.vms/attempt-0002/`.
 
-The current report records the targeted selection as 10 cases: eight PASS
+The report for that targeted selection recorded 10 cases: eight PASS
 (five sources and three PINNs), one FAIL, and one TIMEOUT. Its 119 unselected
-results remain retained, and full coverage remains false. The exact replay
+results were retained, and full coverage remained false. The exact replay
 command was:
 
 ```powershell
 conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --resume ".cache/test-suite/20261026T133138.135583Z" --case "pinn.preset.iron" --case "pinn.preset.regolith-composite" --case "pinn.fe.freezing" --case "pinn.fe.liquid.dynamo.vms" --case "pinn.fe.mushy.driven.vms"
 ```
 
-These results do not enable additional desktop PINN modes or qualify the wider
-coupled family. The failed pressure case, Liquid Dynamo timeout, other previously
-unsuccessful PINNs, water precision, and complete profiles remain open.
+These replay results did not enable additional desktop PINN modes or qualify the
+wider coupled family. The failed pressure case, other unsuccessful PINNs, and
+complete profiles remain open; later targeted Liquid Dynamo and water precision
+runs passed their existing gates.
 
 ## Pressure and CUDA follow-up (2026-10-27)
 
@@ -310,6 +313,12 @@ record one during this rerun. Original case evidence remains under
 `.cache/test-suite/20261026T133138.135583Z/cases/pinn.fe.liquid.dynamo.vms/attempt-0003/`.
 The later review fixes can invalidate this attempt's fingerprint on resume;
 they do not change the historical result. The enlarged water case is separate.
+
+The later fixed 1,048,576-history water-precision case also passed, with
+relative standard error 3.5828% against the unchanged 5% gate. Both the water
+case and its prerequisite passed; the targeted selection does not qualify the
+complete feature or full profile. Evidence:
+`.cache/test-suite/20261026T133138.135583Z/cases/dose.water-precision/attempt-0002/result.json`.
 
 The research-workflow review fixes were verified with eight focused suite cases
 (94 tests), including real desktop, publication, temporal checkpoint, and
@@ -384,8 +393,8 @@ Remove-Item Env:MAGNETIC_TORUS_PINN_MEMORY_LOG
 ```
 
 The log is opt-in, append-only and PID-tagged. The runner reuses prerequisites
-only when their fingerprints and artifacts remain valid. The Liquid rerun above
-has since passed; the enlarged water calculation remains separate.
+only when their fingerprints and artifacts remain valid. The Liquid and water
+reruns above have since passed as separate targeted selections.
 
 Exploratory signed and absolute pressure maps, per-snapshot statistics, radial
 sample counts, and the accepted-field Lorentz-force reconstruction are saved in
