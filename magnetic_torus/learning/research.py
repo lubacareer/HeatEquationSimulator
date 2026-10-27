@@ -42,6 +42,7 @@ class ResearchOptions:
     balance_labels: bool = False
     causal_epsilon: float = 1.
     causal_floor: float = .05
+    pressure_huber: bool = False
 
     def validate(self) -> ResearchOptions:
         if self.strategy not in {"uniform", "front", "causal", "front-causal", "temporal-pressure"}:
@@ -50,6 +51,8 @@ class ResearchOptions:
             raise ValueError("Unknown research architecture.")
         if self.strategy == "temporal-pressure" and self.architecture != "method5":
             raise ValueError("Temporal pressure sampling requires the method5 research architecture.")
+        if self.pressure_huber and (self.architecture != "method5" or self.strategy != "uniform"):
+            raise ValueError("Pressure Huber requires the uniform method5 research architecture.")
         if (self.architecture in {"method5", "pressure-fourier"}
                 and (self.strategy not in {"uniform", "temporal-pressure"} or self.balance_labels)):
             raise ValueError("Method-5 pressure pilots retain the original joint objective.")
@@ -119,6 +122,10 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
                                  normalization_scales=training_scales)
         data = replace(data, weak=training_weak)
     run = base._prepare_training(data, progress, cancel, output_dir)
+    original_losses = run.losses
+    if options.pressure_huber:
+        from .pressure_pilots import PressureHuberLosses
+        run.losses = PressureHuberLosses(original_losses)
     field, torch = run.field, run.field.torch
     if checkpoint is not None:
         if options.architecture == "film":
@@ -182,7 +189,8 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
         research_options_sha256=sha256(json.dumps(options_record, sort_keys=True).encode()).hexdigest(),
         originating_run_id=source.run_id, originating_config_hash=source.config.config_hash,
         requested_training_steps=source_copy.config.pinn_epochs,
-        optimizer={"name": "explicit research Adam + original raw L-BFGS",
+        optimizer={"name": ("explicit research Adam + pressure Huber L-BFGS" if options.pressure_huber
+                            else "explicit research Adam + original raw L-BFGS"),
                    "adam": {"steps": options.adam_steps}, "lbfgs": {"steps": options.lbfgs_steps, "closure_evaluation_cap": 8}},
         research_training_weak_scales=training_scales,
         research_weak_normalization="training labels only; original oracle restored for final qualification",
@@ -190,6 +198,8 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
             "same-accepted-time stratified free-DOF training labels; separate seeded RNG"),
         research_physics_evaluations={"adam": 0, "causal_bootstrap": 0},
         research_completed=False)
+    if options.pressure_huber:
+        run.metadata["research_pressure_loss"] = run.losses.metadata()
     initial_validation = run.losses.validation_loss()
     initial_norms = None
     last_validation = initial_validation
@@ -295,11 +305,12 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
                     run.metadata["optimizer_steps_completed"]["lbfgs"] += 1
                     previous = {name: torch.as_tensor(run.history[name][-1] if run.history[name] else 0., **field.kw)
                                 for name in ("loss", "data_loss", "physics_loss", "boundary_loss")}
-                    record(previous, "unweighted L-BFGS")
+                    record(previous, "pressure Huber L-BFGS" if options.pressure_huber else "unweighted L-BFGS")
                     run.metadata["research_interrupted_after_accepted_step"] = True
                 raise
             run.metadata["optimizer_steps_completed"]["lbfgs"] += 1
-            record(terms, "unweighted L-BFGS", validation=step + 1 == options.lbfgs_steps)
+            record(terms, "pressure Huber L-BFGS" if options.pressure_huber else "unweighted L-BFGS",
+                   validation=step + 1 == options.lbfgs_steps)
         check_cancel()
         completed = True
     except SimulationCancelled as error:
@@ -318,6 +329,9 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
         cancel.clear()
 
     def finish():
+        # Candidate selection and validation both use the original raw MSE;
+        # Huber modifies only the optimization objective, never the oracle.
+        run.losses = original_losses
         if method5_pilot:
             # Selection uses the same FE equations normalized on training labels.
             selection_terms = base._deterministic_objective(run, panels, fixed_centers, backward=False)

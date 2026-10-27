@@ -69,12 +69,14 @@ def main(argv=None) -> int:
     parser.add_argument("--balance-labels", action="store_true")
     parser.add_argument("--causal-epsilon", type=float, default=1.)
     parser.add_argument("--causal-floor", type=float, default=.05)
+    parser.add_argument("--pressure-huber", action="store_true", help="Use fixed 0.003 Pa Huber pressure labels during method-5 training only")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--cpu-threads", type=int, default=2)
     parser.add_argument("--_supervised-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(raw_argv)
     options = ResearchOptions(args.strategy, args.architecture, args.adam_steps,
-        args.lbfgs_steps, args.seconds, args.balance_labels, args.causal_epsilon, args.causal_floor)
+        args.lbfgs_steps, args.seconds, args.balance_labels, args.causal_epsilon, args.causal_floor,
+        args.pressure_huber)
     try:
         options.validate()
     except ValueError as error:

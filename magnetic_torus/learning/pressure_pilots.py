@@ -6,6 +6,56 @@ from typing import Any
 import numpy as np
 
 from .fields import _cancelled
+from .training import TrainingLosses
+
+
+class PressureHuberLosses(TrainingLosses):
+    """Research-only Huber pressure labels, with all other losses unchanged."""
+
+    def __init__(self, original: TrainingLosses, delta_pa: float = .003):
+        super().__init__(original.field, original.field_validity, original.cancel)
+        scaling = self.field.data.scaling
+        if self.field.data.thermal or "pressure" not in scaling.names:
+            raise ValueError("Pressure Huber loss requires a coupled pressure field.")
+        index = scaling.names.index("pressure")
+        if scaling.widths[index] != 1 or not np.isfinite(delta_pa) or delta_pa <= 0:
+            raise ValueError("Pressure Huber requires a scalar pressure and positive finite transition.")
+        self.column = sum(scaling.widths[:index])
+        self.delta_pa = float(delta_pa)
+        self.delta = self.delta_pa / float(scaling.scales[self.column])
+        if not np.isfinite(self.delta) or self.delta <= 0:
+            raise ValueError("Pressure training scale must be positive and finite.")
+
+    def errors_at(self, ids: np.ndarray, *, training: bool = False,
+                  forward_batch_size: int | None = None) -> tuple[Any, np.ndarray]:
+        if not training:
+            return super().errors_at(ids, training=False, forward_batch_size=forward_batch_size)
+        field, data = self.field, self.field.data
+        ti, pi = np.divmod(ids, data.point_count)
+        if data.cache is not None:
+            rows = data.cache.training_rows[ids]
+            if np.any(rows < 0):
+                raise ValueError("A held-out label cannot enter the training-target cache.")
+            normalized = data.cache.targets[rows]
+        else:
+            if not np.isin(ids, data.train_ids).all():
+                raise ValueError("A held-out label cannot enter pressure Huber training.")
+            normalized = (data.reference[ti, pi] - data.scaling.offsets) / data.scaling.scales
+        residual = field.forward(field.input_at(ti, pi), pi, ti,
+                                 forward_batch_size=forward_batch_size) - field.torch.as_tensor(normalized, **field.kw)
+        pressure = residual[:, self.column:self.column + 1]
+        absolute = pressure.abs()
+        # Twice the standard Huber loss equals squared error in its quadratic region.
+        robust = field.torch.where(absolute <= self.delta, pressure.square(),
+                                   2 * self.delta * absolute - self.delta ** 2)
+        errors = field.torch.cat((residual[:, :self.column].square(), robust,
+                                  residual[:, self.column + 1:].square()), dim=1)
+        return errors, self.validity_at(ids, training=True)
+
+    def metadata(self) -> dict[str, Any]:
+        return {"kind": "pressure-only Huber", "delta_pa": self.delta_pa,
+                "normalized_delta": self.delta, "normalization": "training labels only",
+                "quadratic_region": "identical to squared normalized error"}
 
 
 class PressureTemporalSampler:

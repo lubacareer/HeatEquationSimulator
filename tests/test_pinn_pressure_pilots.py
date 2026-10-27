@@ -21,7 +21,7 @@ from magnetic_torus.learning.corrections import (
     create_correction_model, create_pressure_fourier_model, restore_model_from_checkpoint,
 )
 from magnetic_torus.learning.fields import _make_network
-from magnetic_torus.learning.pressure_pilots import PressureTemporalSampler
+from magnetic_torus.learning.pressure_pilots import PressureHuberLosses, PressureTemporalSampler
 from magnetic_torus.models import SimulationCancelled
 from magnetic_torus.store import RunStore
 from scripts.pinn_research import main as research_main, stage_source
@@ -100,6 +100,57 @@ class PressurePilotTests(unittest.TestCase):
         training._checkpoint(checkpoint, run.field.model, run.optimizer, 0, source,
                              data.scaling, run.history, run.metadata)
         return checkpoint
+
+    def test_huber_values_gradients_and_unchanged_validation(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+                "os.environ", {"MAGNETIC_TORUS_PINN_DEVICE": "cpu"}):
+            source, _ = self.source_pair(directory)
+            data = training._prepare_data(source, threading.Event())
+            run = training._prepare_training(data, lambda *_: None, threading.Event(), None)
+            original = run.losses
+            huber = PressureHuberLosses(original)
+            self.assertEqual(huber.delta, .003 / data.scaling.scales[huber.column])
+            self.assertEqual(huber.validation_loss(), original.validation_loss())
+            ids = data.train_ids[:4]
+            ti, pi = np.divmod(ids, data.point_count)
+            targets = (data.reference[ti, pi] - data.scaling.offsets) / data.scaling.scales
+            normalized = torch.as_tensor(targets, **run.field.kw)
+            offsets = torch.zeros_like(normalized)
+            offsets[:, huber.column] = torch.tensor([0., .5, -2., 3.], dtype=torch.float64) * huber.delta
+            offsets[:, 0] = .123
+            offsets.requires_grad_()
+            with patch.object(run.field, "forward", return_value=normalized + offsets):
+                errors, _ = huber.errors_at(ids, training=True)
+            pressure = errors[:, huber.column]
+            expected = torch.tensor([0., .25, 3., 5.], dtype=torch.float64) * huber.delta ** 2
+            self.assertTrue(torch.allclose(pressure, expected, atol=1e-12))
+            pressure.sum().backward()
+            expected_gradient = torch.tensor([0., 1., -2., 2.], dtype=torch.float64) * huber.delta
+            self.assertTrue(torch.allclose(offsets.grad[:, huber.column], expected_gradient, atol=1e-12))
+            self.assertTrue(torch.allclose(errors[:, 0], offsets[:, 0].square()))
+            with self.assertRaisesRegex(ValueError, "held-out"):
+                huber.errors_at(data.validation_ids[:1], training=True)
+
+    def test_huber_refinement_and_selection_ignore_heldout_labels(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+                "os.environ", {"MAGNETIC_TORUS_PINN_DEVICE": "cpu"}):
+            sources = self.source_pair(directory)
+            checkpoint = self.source_checkpoint(sources[0], directory)
+            payloads = []
+            for index, source in enumerate(sources):
+                options = research.ResearchOptions(architecture="method5", pressure_huber=True,
+                    adam_steps=2, lbfgs_steps=1, seconds=30.)
+                _, model, evidence = research.run_research(source, options, lambda *_: None,
+                    threading.Event(), Path(directory) / f"huber-{index}", checkpoint)
+                self.assertTrue(evidence["completed"])
+                self.assertEqual(model.metadata["research_pressure_loss"]["delta_pa"], .003)
+                self.assertEqual(model.metadata["optimizer_steps_completed"]["lbfgs"], 1)
+                payloads.append((model, torch.load(model.metadata["checkpoint_path"],
+                                                  map_location="cpu", weights_only=True)))
+            self.assertEqual(payloads[0][0].metadata["research_selection"], payloads[1][0].metadata["research_selection"])
+            for name, value in payloads[0][1]["model_state"].items():
+                self.assertTrue(torch.equal(value, payloads[1][1]["model_state"][name]), name)
+            self.assertNotEqual(payloads[0][0].metrics["validation_loss"], payloads[1][0].metrics["validation_loss"])
 
     def test_pressure_time_weights_are_bounded_and_independent_of_heldout_labels(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
