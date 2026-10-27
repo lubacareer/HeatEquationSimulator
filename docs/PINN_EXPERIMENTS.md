@@ -82,6 +82,29 @@ The experiment supports:
   weighting, clamped to relative weights 0.1 through 10, refreshed every 50
   steps. It balances training-label tasks only; physics/boundary coefficients
   remain one. This is not a full GradNorm or NTK algorithm.
+- **Temporal pressure sampling:** the `temporal-pressure` strategy weights
+  pressure-label sampling using differences at nodes present in the training
+  split at both accepted times. Relative weights are capped at 3:1. It does not
+  use importance correction, so the sampled training objective changes; the
+  final source oracle and all qualification gates remain unchanged.
+- **Pressure Fourier 16:** the `pressure-fourier` architecture adds a
+  zero-initialized, pressure-only sinusoidal head to an explicitly selected,
+  source-bound core or correction checkpoint. It preserves every output at
+  creation; subsequent training still uses the joint data, physics, and
+  boundary losses.
+
+The `method5` and `pressure-fourier` research architectures require an explicit
+checkpoint bound to the selected source. They run in an owned child with a hard
+`--seconds` deadline and separate worker/supervisor reports. The pressure
+follow-up's selection, reference comparison, and unsuccessful independent screen
+are recorded in [VALIDATION.md](VALIDATION.md#pressure-and-cuda-follow-up-2026-10-27).
+
+`scripts/pinn_refine_source.py refine --source SOURCE.h5 --output NEW_DIRECTORY`
+creates the six-step, seed-123 driven FE follow-up and checks it in a separate
+process. `scripts/pinn_pressure_diagnostics.py --source SOURCE.h5 --pinn PINN.h5
+--refined REFINED.h5 --output NEW_DIRECTORY` writes exploratory maps and
+statistics; omit `--refined` to inspect only the original fit. Both commands
+require a new empty output directory and copy inputs before extracting artifacts.
 
 An auxiliary strong pressure-Poisson loss was not added: its boundary conditions
 and turbulence terms would have to be derived and checked against the exported

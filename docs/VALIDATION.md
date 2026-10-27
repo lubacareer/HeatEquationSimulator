@@ -6,13 +6,13 @@ Reproduce with `python -B scripts/run_checks.py`, `python -B scripts/desktop_smo
 
 ## Representative suite and batching optimization (2026-10-26)
 
-Fresh `scripts/run_all_tests.py` invocations now select `features`: 52 cases, including 33 short regression modules and one fixed scientific configuration per major feature. The preserved `full` profile has 133 cases. Both executable coverage proofs pass independently. Representative coverage excludes all-preset/option-pair qualification, female anatomy, and phase-changing/dynamic coupled PINN qualification. All retained scientific gates, including measured water precision ≤5%, are unchanged.
+At this stage, fresh `scripts/run_all_tests.py` invocations selected `features`: 52 cases, including 33 short regression modules and one fixed scientific configuration per major feature. The then-current `full` profile had 133 cases. Both executable coverage proofs passed independently. The current catalog counts are in [TEST_MATRIX.md](TEST_MATRIX.md). Representative coverage excludes all-preset/option-pair qualification, female anatomy, and phase-changing/dynamic coupled PINN qualification. All retained scientific gates, including measured water precision ≤5%, are unchanged.
 
 There are 135 passing focused checks: eight batching/cache, 17 conditioning, 16 existing PINN, four normalization, seven PINN diagnostics, eight CLI/profile, nine representative catalog, 12 exhaustive matrix, 11 invocation budget, 24 existing runner, eight artifact security, seven atomic publication, and four FE-launch checks. Focused Ruff and whitespace checks pass. Tests exercise the 55-minute work cutoff/five-minute cleanup reserve with short/fake deadlines, including an actual 1.2-second supervisor run that terminates its own grandchild, returns 124, and preserves cached evidence. Required work left unfinished is never a passing result.
 
 A bounded synthetic CPU benchmark measured only the full-label gradient calculation: 5,200 training labels, float64, one CPU thread, five repetitions. Median time decreased from 57.315 ms (uncached 256-row batches, 21 neural calls) to 29.918 ms (cached 4,096-row batches, two calls), a 1.916× speedup. Loss was identical, maximum absolute gradient difference was 9.72e-17, and the host cache occupied 124,840 bytes. Evidence is `.cache/pinn-stall-worktree/.cache/pinn-batching-benchmark.json`. This is not a measured speedup for an entire PINN fit or scientific qualification.
 
-The exact conda entrypoint passed a real three-case selection (CLI regressions, melting/freezing/radiating thermal cycle, and short native source) with all six installed capabilities verified, followed by a successful inferred-profile targeted resume. Both correctly reported incomplete overall feature/full coverage; the resume retained unvisited evidence. Reports are in `.cache/pinn-stall-worktree/.cache/representative-cli-smoke-20261026/`. The complete 52-case representative run, its wall time, new representative PINN accuracy, anatomical transport, and fixed 524,288-history water precision remain pending for the user's run. The estimated 25–40 minutes is not a completed measurement.
+The exact conda entrypoint passed a real three-case selection (CLI regressions, melting/freezing/radiating thermal cycle, and short native source) with all six installed capabilities verified, followed by a successful inferred-profile targeted resume. Both correctly reported incomplete overall feature/full coverage; the resume retained unvisited evidence. Reports are in `.cache/pinn-stall-worktree/.cache/representative-cli-smoke-20261026/`. A complete representative run, its wall time, anatomical transport, and the current 1,048,576-history water precision case remain pending. The estimated 25–40 minutes is not a completed measurement.
 
 Development and these checks used an isolated checkout; the already-running full suite and its history were left untouched. Update the main working directory after it finishes, then start a fresh default command for the one-hour representative profile. Resuming an old `full` report intentionally retains exhaustive, multi-hour behavior.
 
@@ -294,6 +294,89 @@ conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --
 These results do not enable additional desktop PINN modes or qualify the wider
 coupled family. The failed pressure case, Liquid Dynamo timeout, other previously
 unsuccessful PINNs, water precision, and complete profiles remain open.
+
+## Pressure and CUDA follow-up (2026-10-27)
+
+Exploratory signed and absolute pressure maps, per-snapshot statistics, radial
+sample counts, and the accepted-field Lorentz-force reconstruction are saved in
+`.cache/pinn-pressure-followup/diagnostics-v5/`. At the original accepted
+0.020 s snapshot, 112 of 679 held-out pressure samples account for 55.56% of
+their total squared error. The conductor liquid fraction is nearly uniform
+(0.60000150–0.60000157), so this snapshot does not establish a phase-front
+cause. Outer-radius samples are numerous on this mesh; their error share alone
+does not establish a wall layer. The source and prediction hashes were unchanged.
+
+A separate driven FE source with six nominal steps and split seed 123 passed
+the accepted-source energy and independent weak-operator checks. Its seed field
+is inactive in driven mode. At the common accepted 0.020 s snapshot, with mesh
+coordinates and pressure anchor matched, its pressure differs from the original
+by 0.0047032 Pa RMS across conductor nodes; velocity differs by 1.6506e-8 m/s
+RMS and liquid fraction by at most 4.20e-9. No temporal interpolation was used.
+This single refinement shows sensitivity, not mesh/timestep convergence or an
+independent physical experiment. The refined-source aggregate difference was
+seen before pilot selection, so the later screen is not fully blinded.
+Evidence: `.cache/pinn-pressure-followup/refined/` and
+`.cache/pinn-pressure-followup/diagnostics-v5/report.json`.
+
+Three source-bound warm-start pilots each completed 200 Adam and 10 L-BFGS
+steps. The control, temporal-pressure sampler, and pressure-only Fourier-16
+head produced training pressure normalized RMSE 0.0850952, 0.0839624, and
+0.0847815, respectively. The temporal sampler was selected from these
+training-only diagnostics, before evaluating any candidate on the refined
+source. It samples adjacent-time pressure variation only from matched training
+nodes, with weights capped at 3:1. Research training uses training-only weak
+scales; each final audit restores the original unweighted source oracle.
+On the already examined original source, all three pilots still failed the
+pressure field gate: held-out normalized RMSE was 0.115890, 0.114909, and
+0.116011, respectively. The Fourier candidate is a zero-initialized additive
+pressure-only sinusoidal head; its outcome does not rule out richer models.
+The comparison and hashes are in
+`.cache/pinn-pressure-followup/selection.json` and the three `pilot-*` reports.
+
+The refined-source screen trained a fresh source-bound core for 210 steps,
+then trained the frozen temporal candidate for another 210 steps using only
+that source's checkpoint. The latter completed in 55.0 s but **failed** the
+unchanged gates: held-out MSE 0.0165178, pressure normalized RMSE 0.125310,
+electric-potential normalized RMSE 0.288336, and maximum residual RMS 0.05229
+(charge). Physics loss 0.000394955 and boundary loss 1.33e-37 passed. Source
+and implementation hashes were unchanged during both stages. These are short
+research fits; no candidate was promoted and no desktop mode was enabled.
+Evidence: `.cache/pinn-pressure-followup/refined-pretrain/report.json` and
+`.cache/pinn-pressure-followup/refined-temporal-screen/report.json`.
+
+For the saved Liquid source and epoch-850 checkpoint, the full FE graph,
+bounded neural recomputation, CPU-saved tensors, and history-size-10 alternatives
+matched the original full assembled objective and gradients in short probes.
+Three-repeat median times per optimizer step were 1.142, 1.381, 2.502, and
+1.628 s respectively; the fastest full-graph path remains the normal default.
+Peak GPU allocations were approximately 192–194 MiB, with about 7.2–7.4 GB
+free before the probes. Three further 13-step full-graph probes, each starting
+with the checkpoint's 20 history entries, completed all 39 steps without OOM;
+median time was 14.55 s per 13 steps. These bounded results do **not** prove
+that the earlier intermittent CUDA OOM is fixed. The original exception is now
+preserved if rollback also fails. Evidence:
+`.cache/pinn-fe-vjp-profile-20261027-b/report.json` and
+`.cache/pinn-fe-vjp-profile-20261027-c/report.json`.
+
+Five focused cases passed through the suite runner, covering the catalog,
+runner lifecycle, CPU/CUDA FE gradient equivalence, pressure pilots, and
+pressure diagnostics. After adding private source staging, the pressure-pilot
+case passed again (15 tests); a real-source CPU equivalence probe and a
+one-step Liquid GPU probe also passed. Evidence is under
+`.cache/pinn-pressure-followup/suite-check/`, `suite-check-final/`, and
+`.cache/pinn-fe-vjp-profile-private-check/`. These targeted runs do not
+constitute feature or full-suite qualification.
+
+The suite runner now reports a valid current-attempt worker failure after a
+five-second exit grace and owned-process cleanup, rather than waiting until a
+case timeout. PASS still requires a successful process exit. Cancellation and
+deadlines take precedence, and the worker error remains available separately.
+The pressure candidates remain experimental, so the targeted long rerun is
+Liquid only:
+
+```powershell
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --resume ".cache/test-suite/20261026T133138.135583Z" --case "pinn.fe.liquid.dynamo.vms"
+```
 
 ## Bounded proposal experiments: 2026-10-26
 

@@ -53,6 +53,13 @@ class FeatureCatalogTests(unittest.TestCase):
             )
         )
 
+    def test_pressure_diagnostic_regression_tracks_its_script(self):
+        case = self.by_id["unit.test_pressure_diagnostics"]
+        self.assertIn("scripts/pinn_pressure_diagnostics.py", case.dependencies)
+        pilot = self.by_id["unit.test_pinn_pressure_pilots"]
+        self.assertIn("scripts/pinn_research.py", pilot.dependencies)
+        self.assertIn("scripts/research_supervisor.py", pilot.dependencies)
+
     def test_missing_duplicate_mislabeled_and_disconnected_providers_cannot_claim_coverage(
         self,
     ):

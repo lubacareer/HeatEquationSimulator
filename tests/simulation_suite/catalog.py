@@ -20,6 +20,10 @@ _GEANT4_INTEGRATION_METHODS = (
     "test_torus_radiation.Geant4IntegrationTests.test_male_icrp110_transport",
     "test_torus_radiation.Geant4IntegrationTests.test_female_icrp110_transport",
 )
+_EXTRA_UNIT_DEPENDENCIES = {
+    "test_pressure_diagnostics.py": ("scripts/pinn_pressure_diagnostics.py",),
+    "test_pinn_pressure_pilots.py": ("scripts/pinn_research.py", "scripts/research_supervisor.py"),
+}
 
 
 def _module_capabilities(path: Path) -> tuple[str, ...]:
@@ -82,7 +86,7 @@ def unit_cases(
                     "tests/*.py",
                     "tests/simulation_suite/**/*.py",
                     "scripts/setup_*.sh",
-                ),
+                ) + _EXTRA_UNIT_DEPENDENCIES.get(path.name, ()),
             )
         )
     if full and include_integrations:
