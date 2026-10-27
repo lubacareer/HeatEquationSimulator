@@ -1,6 +1,8 @@
 """Exercise installer trust checks with local archives and harmless tool stubs."""
 from hashlib import sha256
+import errno
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -9,10 +11,58 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from simulation_suite.host_skips import host_skip_reason, is_host_limitation
 
 
 REPO = Path(__file__).resolve().parent.parent
 ARCHIVES = ("micromamba-2.3.3-0.tar.bz2", "geant4-11.4.3.tar.gz", "ICRPdata.tar.gz")
+
+_SYMLINK_PROBE = """\
+import errno, json, os, sys
+try:
+    os.symlink(sys.argv[1], sys.argv[2])
+except OSError as error:
+    print(json.dumps({'errno': error.errno, 'name': errno.errorcode.get(error.errno), 'message': str(error)}))
+    sys.exit(1)
+"""
+
+
+def create_linux_symlink(runner, source, destination):
+    """Classify symlink errors using the platform that created the link."""
+    interpreter = (os.environ.get("MAGNETIC_TORUS_FE_PYTHON") or "python3") if runner else sys.executable
+    try:
+        if runner:
+            check = subprocess.run(
+                [*runner, "bash", "-s", "--", interpreter],
+                input='candidate=$(command -v -- "$1") && [[ -f "$candidate" && -x "$candidate" ]] '
+                      '&& printf "available\\n" || printf "missing\\n"\n',
+                capture_output=True, text=True, timeout=30,
+            )
+            if check.returncode or check.stdout.strip() not in {"available", "missing"}:
+                raise RuntimeError(f"WSL interpreter check failed unexpectedly: {check.stderr}")
+            if check.stdout.strip() == "missing":
+                raise unittest.SkipTest(f"Symlink test needs an available WSL Python interpreter: {interpreter}")
+        result = subprocess.run([*runner, interpreter, "-", str(source), str(destination)],
+                                input=_SYMLINK_PROBE, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"Symlink probe failed unexpectedly: {error}") from error
+    if result.returncode == 0:
+        return
+    try:
+        failure = json.loads(result.stdout)
+        number, name, message = failure["errno"], failure["name"], failure["message"]
+        if (not isinstance(number, int) or isinstance(number, bool)
+                or (name is not None and not isinstance(name, str)) or not isinstance(message, str)):
+            raise ValueError("Invalid symlink error payload")
+    except (ValueError, TypeError, KeyError) as error:
+        raise RuntimeError(f"Linux symlink probe failed unexpectedly: {result.stderr}") from error
+    failure_error = OSError(number, message)
+    origin = "linux" if runner else "native"
+    if is_host_limitation(failure_error, origin=origin, error_name=name):
+        raise unittest.SkipTest(host_skip_reason("symlink", number, origin=origin, error_name=name)) from failure_error
+    raise failure_error
 
 
 class Geant4InstallerTests(unittest.TestCase):
@@ -216,14 +266,68 @@ touch "$TASK_TEST_PREFIX/lib/cmake/Geant4/Geant4Config.cmake" "$TASK_TEST_PREFIX
 
     def test_cached_archive_symlink_is_rejected(self):
         name = ARCHIVES[2]
-        linked = subprocess.run(self.runner + ["ln", "-s", self.shell_path(self.incoming / name),
-                                               self.shell_path(self.cache / name)], capture_output=True, text=True)
-        if linked.returncode:
-            self.skipTest("This filesystem does not support Linux symlinks.")
+        create_linux_symlink(self.runner, self.shell_path(self.incoming / name),
+                             self.shell_path(self.cache / name))
         result = self.run_installer("phantom")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Invalid cached download", result.stderr)
         self.assert_no_archive_use()
+
+
+class LinuxSymlinkProbeTests(unittest.TestCase):
+    def test_host_limitations_and_unexpected_errors_are_distinct(self):
+        def response(number, name):
+            return subprocess.CompletedProcess([], 1, json.dumps({"errno": number, "name": name, "message": "fixture"}), "")
+        available = subprocess.CompletedProcess([], 0, "available\n", "")
+        for number, name in ((13, "EACCES"), (38, "ENOSYS"), (95, "ENOTSUP"), (95, "EOPNOTSUPP")):
+            with self.subTest(number=number, name=name):
+                with (patch.dict(os.environ, {"MAGNETIC_TORUS_FE_PYTHON": ""}),
+                      patch("test_setup_geant4.subprocess.run", side_effect=[available, response(number, name)]) as run):
+                    with self.assertRaisesRegex(unittest.SkipTest, r"\[host-inapplicable:symlink:"):
+                        create_linux_symlink(["wsl", "--"], "/source", "/destination")
+                    self.assertEqual(run.call_args.args[0], ["wsl", "--", "python3", "-", "/source", "/destination"])
+        with patch("test_setup_geant4.subprocess.run", return_value=response(errno.ENOSPC, "ENOSPC")) as run:
+            with self.assertRaises(OSError) as error:
+                create_linux_symlink([], "/source", "/destination")
+            self.assertEqual(error.exception.errno, errno.ENOSPC)
+            self.assertEqual(run.call_args.args[0], [sys.executable, "-", "/source", "/destination"])
+        for number, name in ((38, "ENOSPC"), (95, "ENOSYS"), (28, "ENOSPC")):
+            with self.subTest(number=number, name=name):
+                with patch("test_setup_geant4.subprocess.run", side_effect=[available, response(number, name)]):
+                    with self.assertRaises(OSError):
+                        create_linux_symlink(["wsl", "--"], "/source", "/destination")
+        with patch("test_setup_geant4.subprocess.run", return_value=subprocess.CompletedProcess([], 1, "not json", "missing Python")):
+            with self.assertRaisesRegex(RuntimeError, "unexpectedly"):
+                create_linux_symlink([], "/source", "/destination")
+
+    def test_wsl_interpreter_selection_and_availability(self):
+        available = subprocess.CompletedProcess([], 0, "available\n", "")
+        success = subprocess.CompletedProcess([], 0, "", "")
+        for override, expected in ((None, "python3"), ("", "python3"), ("/opt/FE tools/python", "/opt/FE tools/python")):
+            with self.subTest(override=override):
+                env = {} if override is None else {"MAGNETIC_TORUS_FE_PYTHON": override}
+                with (patch.dict(os.environ, env, clear=True),
+                      patch("test_setup_geant4.subprocess.run", side_effect=[available, success]) as run):
+                    create_linux_symlink(["wsl", "--"], "/source", "/destination")
+                self.assertEqual(run.call_args_list[0].args[0][-1], expected)
+                self.assertEqual(run.call_args_list[1].args[0], ["wsl", "--", expected, "-", "/source", "/destination"])
+
+        missing = subprocess.CompletedProcess([], 0, "missing\n", "")
+        with patch("test_setup_geant4.subprocess.run", return_value=missing) as run:
+            with self.assertRaisesRegex(unittest.SkipTest, "available WSL Python interpreter"):
+                create_linux_symlink(["wsl", "--"], "/source", "/destination")
+            self.assertEqual(run.call_count, 1)
+
+        for failure in (subprocess.CompletedProcess([], 1, "", "WSL failed"),
+                        subprocess.CompletedProcess([], 0, "unexpected", ""), OSError("WSL failed")):
+            with self.subTest(failure=failure):
+                with patch("test_setup_geant4.subprocess.run", side_effect=[failure]):
+                    with self.assertRaisesRegex(RuntimeError, "unexpectedly"):
+                        create_linux_symlink(["wsl", "--"], "/source", "/destination")
+
+        with patch("test_setup_geant4.subprocess.run", side_effect=[available, subprocess.CompletedProcess([], 1, "bad", "failed")]):
+            with self.assertRaisesRegex(RuntimeError, "unexpectedly"):
+                create_linux_symlink(["wsl", "--"], "/source", "/destination")
 
 
 if __name__ == "__main__":

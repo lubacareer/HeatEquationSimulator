@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import errno
 import importlib.util
 import io
 import json
@@ -18,7 +19,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from simulation_suite import budget, capabilities, runner
+from simulation_suite import budget, capabilities, host_skips, reporting, runner
 from simulation_suite.spec import CaseSpec
 
 
@@ -404,6 +405,146 @@ class InvocationBudgetTests(unittest.TestCase):
                     self.assertEqual(worker.main(), expected)
                 record = json.loads(output.read_text(encoding="utf-8"))
                 self.assertEqual(record["metrics"]["skipped"], 1)
+
+    def test_worker_classifies_only_explicit_host_limitations(self):
+        path = Path(__file__).parent / "simulation_suite" / "unittest_worker.py"
+        spec = importlib.util.spec_from_file_location("applicability_unittest_worker", path)
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        request, output = self.root / "host-request.json", self.root / "host-result.json"
+        symlink_id = "test_research_publication.ResearchPublicationTests.test_cleanup_does_not_follow_stage_symlink"
+        reason = host_skips.host_skip_reason("symlink", errno.EPERM)
+
+        class Fixture(unittest.TestCase):
+            def __init__(self, identifier, *, skip=None, fail=False):
+                super().__init__("runTest")
+                self.identifier, self.skip_reason, self.should_fail = identifier, skip, fail
+
+            def id(self):
+                return self.identifier
+
+            def runTest(self):
+                if self.skip_reason:
+                    self.skipTest(self.skip_reason)
+                if self.should_fail:
+                    self.fail("intentional fixture failure")
+
+        def run(profile, cases):
+            request.write_text(json.dumps({"parameters": {"pattern": "fixture.py"}, "profile": profile}), encoding="utf-8")
+            with (patch.object(sys, "argv", ["worker", "--request", str(request), "--result", str(output)]),
+                  patch.object(sys, "path", list(sys.path)),
+                  patch.object(unittest.defaultTestLoader, "discover", return_value=unittest.TestSuite(cases)),
+                  patch.object(sys, "stderr", io.StringIO())):
+                code = worker.main()
+            return code, json.loads(output.read_text(encoding="utf-8"))
+
+        for profile in ("features", "full"):
+            with self.subTest(profile=profile):
+                code, record = run(profile, [Fixture("fixture.pass"), Fixture(symlink_id, skip=reason)])
+                self.assertEqual(code, 0)
+                self.assertEqual((record["status"], record["execution"], record["qualification"]),
+                                 ("PASS", "PASS", "NOT_APPLICABLE"))
+                self.assertEqual(record["metrics"]["tests_executed"], 1)
+                self.assertEqual(record["skipped"][0]["classification"], "NOT_APPLICABLE")
+                for skipped in (Fixture("fixture.unknown", skip="unavailable"),
+                                Fixture("fixture.cuda", skip="CUDA is unavailable"),
+                                Fixture("fixture.fenics", skip="FE is unavailable"),
+                                Fixture("fixture.geant4", skip="Geant4 is unavailable"),
+                                Fixture("fixture.desktop", skip="Desktop is unavailable"),
+                                Fixture(symlink_id, skip="unexpected I/O failure")):
+                    code, record = run(profile, [Fixture("fixture.pass"), skipped])
+                    self.assertEqual(code, 1)
+                    self.assertEqual(record["skipped"][0]["classification"], "MISSING")
+                self.assertEqual(run(profile, [Fixture(symlink_id, skip=reason)])[0], 1)
+                self.assertEqual(run(profile, [Fixture("fixture.fail", fail=True), Fixture(symlink_id, skip=reason)])[0], 1)
+                self.assertEqual(run(profile, [])[0], 1)
+        self.assertEqual(run("fast", [Fixture(symlink_id, skip=reason)])[0], 0)
+        self.assertEqual(run("fast", [Fixture("fixture.unknown", skip="unavailable")])[0], 0)
+
+        class WithSkippedSubtest(Fixture):
+            def runTest(self):
+                with self.subTest(sample=1):
+                    self.skipTest("an optional subtest")
+
+        code, record = run("fast", [WithSkippedSubtest("fixture.subtest")])
+        self.assertEqual(code, 0)
+        self.assertEqual(record["metrics"]["tests_executed"], 1)
+
+    def test_worker_records_linux_symlink_limitation_on_windows(self):
+        import test_setup_geant4
+
+        path = Path(__file__).parent / "simulation_suite" / "unittest_worker.py"
+        spec = importlib.util.spec_from_file_location("linux_errno_unittest_worker", path)
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        request, output = self.root / "linux-request.json", self.root / "linux-result.json"
+        request.write_text(json.dumps({"parameters": {"pattern": "fixture.py"}, "profile": "full"}), encoding="utf-8")
+        symlink_id = "test_setup_geant4.Geant4InstallerTests.test_cached_archive_symlink_is_rejected"
+        probe = subprocess.CompletedProcess(
+            [], 1, json.dumps({"errno": 95, "name": "EOPNOTSUPP", "message": "not supported"}), ""
+        )
+
+        class SymlinkProbe(unittest.TestCase):
+            def id(self):
+                return symlink_id
+
+            def runTest(self):
+                test_setup_geant4.create_linux_symlink(["wsl", "--"], "/source", "/destination")
+
+        class ApplicableTest(unittest.TestCase):
+            def runTest(self):
+                pass
+
+        for available in (True, False):
+            with self.subTest(interpreter_available=available):
+                availability = subprocess.CompletedProcess([], 0, "available\n" if available else "missing\n", "")
+                responses = [availability, probe] if available else [availability]
+                with (patch.object(sys, "argv", ["worker", "--request", str(request), "--result", str(output)]),
+                      patch.object(sys, "path", list(sys.path)),
+                      patch.object(unittest.defaultTestLoader, "discover",
+                                   return_value=unittest.TestSuite([ApplicableTest(), SymlinkProbe()])),
+                      patch.object(worker, "os", SimpleNamespace(name="nt")),
+                      patch.object(test_setup_geant4.subprocess, "run", side_effect=responses) as run,
+                      patch.object(sys, "stderr", io.StringIO())):
+                    self.assertEqual(worker.main(), 0 if available else 1)
+                record = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(run.call_count, 2 if available else 1)
+                self.assertEqual(record["status"], "PASS" if available else "FAIL")
+                self.assertEqual(record["metrics"]["tests_executed"], 1)
+                self.assertEqual(record["skipped"][0]["test"], symlink_id)
+                self.assertEqual(record["skipped"][0]["classification"], "NOT_APPLICABLE" if available else "MISSING")
+                if available:
+                    self.assertIn(":95:none:linux:EOPNOTSUPP]", record["skipped"][0]["reason"])
+                else:
+                    self.assertIn("interpreter", record["skipped"][0]["reason"].lower())
+
+    def test_host_skip_rules_and_html_keep_reasons_visible(self):
+        windows_id = "test_torus_publication.JobPublicationTests.test_transport_request_paths_survive_publication"
+        self.assertTrue(host_skips.is_host_inapplicable(windows_id, "Windows/WSL path representation", os_name="posix"))
+        self.assertFalse(host_skips.is_host_inapplicable(windows_id, "Windows/WSL path representation", os_name="nt"))
+        self.assertFalse(host_skips.is_host_limitation(OSError(errno.ENOSPC, "full")))
+        self.assertTrue(host_skips.is_host_limitation(OSError(errno.EACCES, "permission")))
+        with self.assertRaises(ValueError):
+            host_skips.host_skip_reason("symlink", errno.ENOSPC)
+        symlink_id = "test_setup_geant4.Geant4InstallerTests.test_cached_archive_symlink_is_rejected"
+        for name, number in (("EPERM", 1), ("EACCES", 13), ("ENOSYS", 38),
+                             ("ENOTSUP", 95), ("EOPNOTSUPP", 95)):
+            self.assertTrue(host_skips.is_host_limitation(OSError(number, "fixture"), origin="linux", error_name=name))
+            reason = host_skips.host_skip_reason("symlink", number, origin="linux", error_name=name)
+            self.assertTrue(host_skips.is_host_inapplicable(symlink_id, reason, os_name="nt"))
+        self.assertFalse(host_skips.is_host_limitation(OSError(38, "fixture"), origin="linux", error_name="ENOTSUP"))
+        with self.assertRaises(ValueError):
+            host_skips.host_skip_reason("symlink", 38, origin="linux", error_name="ENOTSUP")
+        self.assertFalse(host_skips.is_host_inapplicable(
+            symlink_id, "[host-inapplicable:symlink:38:none:linux:ENOTSUP] invalid", os_name="nt"))
+        self.assertFalse(host_skips.is_host_inapplicable(
+            symlink_id, "[host-inapplicable:symlink:38:1314:linux:ENOSYS] invalid", os_name="nt"))
+        html = reporting.render_html({"results": [{"id": "fixture", "status": "PASS", "execution": "PASS",
+            "qualification": "NOT_APPLICABLE", "skipped": [{"test": "fixture", "classification": "NOT_APPLICABLE",
+            "reason": "host <not supported>"}]}]})
+        self.assertIn("Skipped checks", html)
+        self.assertIn("NOT_APPLICABLE", html)
+        self.assertIn("host &lt;not supported&gt;", html)
 
 
 if __name__ == "__main__":

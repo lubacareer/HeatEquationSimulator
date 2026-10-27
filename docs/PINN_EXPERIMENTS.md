@@ -106,7 +106,7 @@ follow-up's selection, reference comparison, and unsuccessful independent screen
 are recorded in [VALIDATION.md](VALIDATION.md#pressure-and-cuda-follow-up-2026-10-27).
 
 `scripts/pinn_refine_source.py refine --source SOURCE.h5 --output NEW_DIRECTORY`
-creates the six-step, seed-123 driven FE follow-up and checks it in a separate
+creates the six-step, seed-123-driven FE follow-up and checks it in a separate
 process. `scripts/pinn_pressure_diagnostics.py --source SOURCE.h5 --pinn PINN.h5
 --refined REFINED.h5 --output NEW_DIRECTORY` writes exploratory maps and
 statistics; omit `--refined` to inspect only the original fit. Both commands

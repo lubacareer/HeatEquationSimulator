@@ -25,6 +25,7 @@ _EXTRA_UNIT_DEPENDENCIES = {
     "test_pinn_pressure_pilots.py": ("scripts/pinn_research.py", "scripts/research_supervisor.py"),
     "test_research_publication.py": ("scripts/pinn_research.py", "scripts/research_supervisor.py"),
     "test_fe_operator_compare.py": ("scripts/compare_fe_operator.py",),
+    "test_pinn_fe_vjp.py": ("scripts/verify_pinn_fe_vjp.py", "scripts/profile_pinn_fe_vjp.py"),
 }
 
 

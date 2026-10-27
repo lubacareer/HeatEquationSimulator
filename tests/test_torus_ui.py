@@ -165,6 +165,51 @@ class DesktopSourceTests(unittest.TestCase):
         self.assertTrue(note.isVisible())
         self.assertEqual(note.text(), reason)
 
+    def test_pinn_empty_state_tracks_source_immediately_on_activation(self):
+        from magnetic_torus.physics import enthalpy_from_temperature, liquid_fraction
+
+        unsupported = self.ring_result("changing-source", 8)
+        supported = self.ring_result("solid-source", 8)
+        temperature = np.stack((np.full(8, 1800.), np.full(8, 1801.)))
+        enthalpy = enthalpy_from_temperature(temperature, supported.config)
+        supported = replace(supported, fields={"temperature": temperature, "enthalpy": enthalpy,
+                            "liquid_fraction": liquid_fraction(enthalpy, supported.config)})
+        supported_path = self.window.store.save_run(supported)
+        unsupported_path = self.window.store.save_run(unsupported)
+        self.window.set_view("PINN")
+        self.window.activate_result(supported_path)
+        self.window.playback.seek_time(1.)
+        position = tuple(self.window.scene.plotter.camera.position)
+        card = self.window.chart_panel.cards[0]
+        note = self.window.chart_panel.training_unavailable_note
+        self.assertEqual(card.ax.texts[0].get_text(), "Train a PINN for the active saved scenario")
+        self.assertTrue(self.window.editor.train_button.isVisible())
+        self.assertFalse(note.isVisible())
+
+        self.window.activate_result(unsupported_path)
+        self.assertEqual(card.ax.texts[0].get_text(), "No PINN available for this saved scenario")
+        self.assertTrue(note.isVisible())
+        self.assertIn("Phase-changing", note.text())
+        self.assertFalse(self.window.editor.train_button.isVisible())
+        self.assertEqual(self.window.session.current_time, 1.)
+        np.testing.assert_allclose(self.window.scene.plotter.camera.position, position)
+
+        self.window.activate_result(supported_path)
+        self.assertEqual(card.ax.texts[0].get_text(), "Train a PINN for the active saved scenario")
+        self.assertFalse(note.isVisible())
+        self.assertTrue(self.window.editor.train_button.isVisible())
+        self.assertEqual(self.window.session.current_time, 1.)
+        np.testing.assert_allclose(self.window.scene.plotter.camera.position, position)
+
+        model = PINNResult("saved-pinn", unsupported.run_id, unsupported.config.config_hash,
+                           unsupported.fields, {}, {}, {"validation_status": "failed"})
+        self.window.store.save_pinn(model)
+        self.window.activate_result(unsupported_path)
+        self.assertEqual(self.window.session.pinn.run_id, "saved-pinn")
+        self.assertTrue(note.isVisible())
+        self.assertIn("Phase-changing", note.text())
+        self.assertFalse(self.window.editor.train_button.isVisible())
+
     def test_supported_training_returns_after_switching_sources_and_respects_busy(self):
         from magnetic_torus.physics import enthalpy_from_temperature, liquid_fraction
 

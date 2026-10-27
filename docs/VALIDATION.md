@@ -101,8 +101,8 @@ the user's saved runs and used the same equations, normalization, split and gate
 | --- | ---: | ---: | ---: |
 | Held-out normalized MSE | 0.1373 | 0.0514 | ≤0.01 |
 | Velocity normalized RMSE | 0.2865 | 0.2744 | ≤0.1 |
-| Pressure normalized RMSE | 0.4630 | 0.2419 | ≤0.1 |
-| Electric-potential normalized RMSE | 0.7260 | 0.4179 | ≤0.1 |
+| Pressure-normalized RMSE | 0.4630 | 0.2419 | ≤0.1 |
+| Electric-potential-normalized RMSE | 0.7260 | 0.4179 | ≤0.1 |
 
 Both fits correctly remain **failed**. Temperature RMSE improved from
 5.42e-5 K to 1.68e-5 K; magnetic-field accuracy and all independently checked
@@ -141,7 +141,7 @@ Runtime artifacts and machine-readable numerical reports live under `.cache/`. T
 
 - Native radiating thermal source, 1000 epochs: passed the held-out field and conservation gates, temperature RMSE 0.0713 K and maximum interval energy defect 0.01997%. Report: `.cache/pinn_final_native/report.json`.
 - Current-code stationary FE regression: passed. This does not validate evolving turbulent fields. Report: `.cache/pinn_stationary_regression/report.json`.
-- Nontrivial driven/mushy mixed-VMS source, 2000 CUDA epochs: failed. Held-out mean normalized MSE 0.00817 and small equation residuals did not compensate for pressure normalized RMSE 0.158 and electric-potential normalized RMSE 0.140, above the unchanged 0.1 per-field gate. Report: `.cache/pinn_coupled_2000/report.json`.
+- Nontrivial driven/mushy mixed-VMS source, 2000 CUDA epochs: failed. Held-out mean normalized MSE 0.00817 and small equation residuals did not compensate for pressure-normalized RMSE 0.158 and electric-potential-normalized RMSE 0.140, above the unchanged 0.1 per-field gate. Report: `.cache/pinn_coupled_2000/report.json`.
 - Nontrivial molten seed-removal mixed-VMS source, 1000 CUDA epochs: failed. Magnetic field, pressure, and potential normalized RMSE were 0.255, 0.139, and 0.325. Report: `.cache/pinn_dynamo_1000/report.json`.
 
 Failed models remain inspectable and are labelled failed in the scene and validation charts. They cannot supply radiation fields. The general coupled PINN accuracy gate remains open.
@@ -189,7 +189,7 @@ hashes. They diagnose conditioning rather than replaying primary training:
 
 | Source | Diagnostic stages | Time | Outcome |
 | --- | --- | ---: | --- |
-| Iron, old completed epoch-1000 checkpoint | Prototype method 4: 2,000 label-only Adam + 50 joint L-BFGS | 217.4 s | Per-source gates passed: pressure normalized RMSE 0.06561, potential 0.04689, held-out MSE 0.001088. This prototype is not the shipped method. |
+| Iron, old completed epoch-1000 checkpoint | Prototype method 4: 2,000 label-only Adam + 50 joint L-BFGS | 217.4 s | Per-source gates passed: pressure-normalized RMSE 0.06561, potential 0.04689, held-out MSE 0.001088. This prototype is not the shipped method. |
 | Lunar, old partial epoch-900 checkpoint | Prototype method 4: 2,000 label-only Adam + 50 joint L-BFGS | 335.2 s | Failed: enthalpy 0.3239, pressure 0.1197, potential 0.5487 normalized RMSE; continuity/charge also failed badly. |
 | Native phase-changing source, old completed epoch-1000 checkpoint, CUDA pilot | Method 5: 2,000 original-joint-objective Adam + 50 joint L-BFGS | 184.3 s | Failed: enthalpy 0.8174, temperature 0.1554, liquid fraction 0.3639 normalized RMSE; enthalpy residual RMS 2.0097. |
 
@@ -268,7 +268,7 @@ completed attempt's `training/*/metadata.json`; final checks are in its
 The three passing cases satisfy the existing held-out, loss, field-error,
 independent-residual, conservation, and source-identity checks. Mushy Driven
 VMS completed all 3,050 steps and passed the held-out loss, physics/boundary
-loss, and residual checks, but pressure normalized RMSE was 0.11633, exceeding
+loss, and residual checks, but pressure-normalized RMSE was 0.11633, exceeding
 the unchanged 0.1 per-field limit. This is the measured reason its combined
 `heldout_and_conservation_gates` check failed; the other fields and residuals
 do not override that pressure failure.
@@ -426,7 +426,7 @@ Evidence: `.cache/pinn-pressure-followup/refined/` and
 
 Three source-bound warm-start pilots each completed 200 Adam and 10 L-BFGS
 steps. The control, temporal-pressure sampler, and pressure-only Fourier-16
-head produced training pressure normalized RMSE 0.0850952, 0.0839624, and
+head produced training pressure-normalized RMSE 0.0850952, 0.0839624, and
 0.0847815, respectively. The temporal sampler was selected from these
 training-only diagnostics, before evaluating any candidate on the refined
 source. It samples adjacent-time pressure variation only from matched training
@@ -442,8 +442,8 @@ The comparison and hashes are in
 The refined-source screen trained a fresh source-bound core for 210 steps,
 then trained the frozen temporal candidate for another 210 steps using only
 that source's checkpoint. The latter completed in 55.0 s but **failed** the
-unchanged gates: held-out MSE 0.0165178, pressure normalized RMSE 0.125310,
-electric-potential normalized RMSE 0.288336, and maximum residual RMS 0.05229
+unchanged gates: held-out MSE 0.0165178, pressure-normalized RMSE 0.125310,
+electric-potential-normalized RMSE 0.288336, and maximum residual RMS 0.05229
 (charge). Physics loss 0.000394955 and boundary loss 1.33e-37 passed. Source
 and implementation hashes were unchanged during both stages. These are short
 research fits; no candidate was promoted and no desktop mode was enabled.
@@ -494,7 +494,7 @@ normalized RMSE from 0.8051 to 0.7511, still above 0.1. Lunar FiLM + causal
 reduced pressure error from 0.6072 to 0.4622 but worsened conservation; Iron
 label-gradient balancing worsened pressure/potential error.
 
-The temporal Lunar potential branch reduced phi normalized RMSE from 0.64046 to
+The temporal Lunar potential branch reduced phi-normalized RMSE from 0.64046 to
 0.00000584837 without changing reference labels or the FE gauge. The other
 fields were frozen; continuity RMS 0.8604, charge RMS 1.5266 and physics loss
 0.38385 still failed. This component improvement does not qualify Lunar or
