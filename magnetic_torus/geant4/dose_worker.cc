@@ -24,6 +24,8 @@
 #include <G4MagneticField.hh>
 #include <G4FieldManager.hh>
 #include <G4TransportationManager.hh>
+#include <G4PropagatorInField.hh>
+#include <G4Exception.hh>
 #include <G4VModularPhysicsList.hh>
 #include <G4PhysListFactory.hh>
 #include <G4EmStandardPhysics_option4.hh>
@@ -43,6 +45,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -64,12 +67,18 @@ G4ThreeVector gvec(Vec v) { return {v[0]*m,v[1]*m,v[2]*m}; }
 
 struct Tet { std::array<int64_t,4> ids; Vec lo, hi; };
 struct Node { Vec lo,hi; int left=-1,right=-1,begin=0,end=0; };
+struct FieldLimits {double support_radius=0,world_radius=0,clearance=0,maximum_step=0;};
+struct Primary {std::array<double,9> values;};
 class FrozenMagneticField: public G4MagneticField {
   std::vector<Vec> points,values;
   std::vector<Tet> tetra;
   std::vector<int> order;
   std::vector<Node> nodes;
   bool cell_constant=false;
+  bool exactly_zero=false;
+  FieldLimits limits;
+  mutable double maximum_query_radius_squared=0.;
+  mutable uint64_t field_queries=0;
   int build(int begin,int end) {
     Node node;
     node.begin=begin; node.end=end;
@@ -116,12 +125,20 @@ public:
     std::ifstream in(filename,std::ios::binary);int64_t count[3];
     in.read(reinterpret_cast<char*>(count),sizeof(count));
     if(!in||count[0]<4||count[1]<1)throw std::runtime_error("Invalid frozen exterior field file");
+    if(count[2]!=0&&count[2]!=1)throw std::runtime_error("Unsupported frozen magnetic field storage mode");
     cell_constant=count[2]==1;
     points.resize(count[0]);values.resize(cell_constant?count[1]:count[0]);tetra.resize(count[1]);
     in.read(reinterpret_cast<char*>(points.data()),points.size()*sizeof(Vec));
     for(auto& t:tetra)in.read(reinterpret_cast<char*>(t.ids.data()),sizeof(t.ids));
     in.read(reinterpret_cast<char*>(values.data()),values.size()*sizeof(Vec));
     if(!in)throw std::runtime_error("Truncated frozen exterior field file");
+    for(const auto& point:points)for(double value:point)if(!std::isfinite(value))
+      throw std::runtime_error("Frozen exterior field coordinates must be finite");
+    exactly_zero=true;
+    for(const auto& value:values)for(double component:value){
+      if(!std::isfinite(component))throw std::runtime_error("Frozen magnetic field values must be finite");
+      exactly_zero=exactly_zero&&component==0.;
+    }
     for(auto& t:tetra)for(int j=0;j<3;j++){
       t.lo[j]=1e100;t.hi[j]=-1e100;
       for(auto i:t.ids){if(i<0||i>=count[0])throw std::runtime_error("Invalid tetrahedron vertex");
@@ -129,15 +146,99 @@ public:
     }
     order.resize(tetra.size());std::iota(order.begin(),order.end(),0);build(0,order.size());
   }
+  bool is_exactly_zero()const{return exactly_zero;}
+  double maximum_query_radius()const{return std::sqrt(maximum_query_radius_squared);}
+  uint64_t query_count()const{return field_queries;}
+  const FieldLimits& field_limits()const{return limits;}
+  const FieldLimits& validate_world(double world_radius,double requested_step=0.){
+    if(!std::isfinite(world_radius)||world_radius<=0.)throw std::runtime_error("Transport world radius must be finite and positive");
+    struct FaceInfo {int count=0;double first_side=0.;};
+    std::map<std::array<int64_t,3>,FaceInfo> faces;
+    for(const auto& t:tetra){
+      double determinant=dot(sub(points[t.ids[1]],points[t.ids[0]]),
+          cross(sub(points[t.ids[2]],points[t.ids[0]]),sub(points[t.ids[3]],points[t.ids[0]])));
+      if(!std::isfinite(determinant)||std::abs(determinant)<1e-30)
+        throw std::runtime_error("Frozen exterior map contains a degenerate tetrahedron");
+      for(int missing=0;missing<4;missing++){
+        std::array<int64_t,3> face;int next=0;
+        for(int vertex=0;vertex<4;vertex++)if(vertex!=missing)face[next++]=t.ids[vertex];
+        std::sort(face.begin(),face.end());
+        auto& info=faces[face];
+        if(++info.count>2)throw std::runtime_error("Frozen exterior map has a nonmanifold tetrahedral face");
+        Vec normal=cross(sub(points[face[1]],points[face[0]]),sub(points[face[2]],points[face[0]]));
+        double side=dot(normal,sub(points[t.ids[missing]],points[face[0]]));
+        if(!std::isfinite(side)||side==0.)throw std::runtime_error("Frozen exterior map has an invalid tetrahedral face");
+        if(info.count==1)info.first_side=side;
+        else if((info.first_side>0.)==(side>0.))
+          throw std::runtime_error("Frozen exterior map has incident tetrahedra on the same side of a shared face");
+      }
+    }
+    Vec origin_value;
+    if(!find(0,{0.,0.,0.},origin_value))throw std::runtime_error("The accepted exterior map does not contain the world origin");
+    double support=std::numeric_limits<double>::infinity();
+    for(const auto& [face,info]:faces)if(info.count==1){
+      Vec normal=cross(sub(points[face[1]],points[face[0]]),sub(points[face[2]],points[face[0]]));
+      support=std::min(support,std::abs(dot(normal,points[face[0]]))/std::sqrt(dot(normal,normal)));
+    }
+    double clearance=support-world_radius;
+    if(!std::isfinite(support)||clearance<=std::max(1e-9,support*1e-10))
+      throw std::runtime_error("The transport world is not enclosed with positive clearance by the accepted FE tetrahedral map; enlarge the exterior domain and rerun");
+    double maximum_step=std::min(.1,clearance/4);
+    if(requested_step!=0.){
+      if(!std::isfinite(requested_step)||requested_step<=0.||requested_step>maximum_step)
+        throw std::runtime_error("Requested magnetic propagation step must be positive and no greater than the accepted-map clearance limit");
+      maximum_step=requested_step;
+    }
+    limits={support,world_radius,clearance,maximum_step};return limits;
+  }
   void GetFieldValue(const G4double p[4],G4double* b) const override {
     if(!enabled){b[0]=b[1]=b[2]=0;return;}
+    Vec location={p[0]/m,p[1]/m,p[2]/m};
+    bool finite=std::isfinite(location[0])&&std::isfinite(location[1])&&std::isfinite(location[2]);
+    ++field_queries;
+    if(finite)maximum_query_radius_squared=std::max(maximum_query_radius_squared,dot(location,location));
     Vec out;
-    if(!find(0,{p[0]/m,p[1]/m,p[2]/m},out))
-      G4Exception("FrozenMagneticField","OutsideAcceptedMap",FatalException,
-                  "Transport requested a field outside the accepted FE exterior mesh. Enlarge the exterior domain.");
+    if(!finite||!find(0,location,out)){
+      G4ExceptionDescription message;
+      message<<std::setprecision(17)<<"Transport requested a field outside the accepted FE exterior mesh. "
+        <<"Query [m] = ("<<p[0]/m<<", "<<p[1]/m<<", "<<p[2]/m<<"); world radius [m] = "<<limits.world_radius
+        <<"; certified support radius [m] = "<<limits.support_radius<<"; maximum propagation step [m] = "<<limits.maximum_step
+        <<". Enlarge the exterior domain and rerun.";
+      G4Exception("FrozenMagneticField","OutsideAcceptedMap",FatalException,message);
+    }
     for(int j=0;j<3;j++)b[j]=out[j]*tesla;
   }
 };
+
+std::vector<Primary> load_primaries(const json& request,double world_radius){
+  int histories=request.at("config").at("radiation_histories");
+  if(histories<2)throw std::runtime_error("At least two primary histories are needed for dose uncertainty");
+  std::ifstream input(std::string(request.at("primary_file")),std::ios::binary);
+  std::vector<Primary> primaries;Primary primary;
+  while(input.read(reinterpret_cast<char*>(primary.values.data()),sizeof(primary.values))){
+    const auto& v=primary.values;
+    for(double value:v)if(!std::isfinite(value))throw std::runtime_error("Incident primary samples must be finite");
+    if(v[0]<1||v[0]>28||v[1]<v[0]||std::floor(v[0])!=v[0]||std::floor(v[1])!=v[1]||v[2]<=0.)
+      throw std::runtime_error("Incident primary isotope and energy are invalid");
+    if(v[3]*v[3]+v[4]*v[4]+v[5]*v[5]>=world_radius*world_radius)
+      throw std::runtime_error("Incident primary starts outside the validated transport world");
+    if(std::abs(v[6]*v[6]+v[7]*v[7]+v[8]*v[8]-1.)>1e-6)
+      throw std::runtime_error("Incident primary direction must be a unit vector");
+    primaries.push_back(primary);
+  }
+  if(input.bad()||input.gcount()!=0||primaries.size()!=size_t(histories))
+    throw std::runtime_error("Paired primary file has wrong event count or a truncated record");
+  return primaries;
+}
+
+json field_limit_metadata(const FrozenMagneticField& field){
+  const auto& limits=field.field_limits();
+  return {{"field_map_support_radius_m",limits.support_radius},{"world_radius_m",limits.world_radius},
+    {"field_map_clearance_m",limits.clearance},{"maximum_field_step_m",limits.maximum_step},
+    {"maximum_field_query_radius_m",field.maximum_query_radius()},{"magnetic_field_queries",field.query_count()},
+    {"exact_zero_field_fast_path",field.is_exactly_zero()},
+    {"field_transport_mode",field.is_exactly_zero()?"straight-exact-zero":"bounded-frozen-map"}};
+}
 
 struct Target {
   std::array<int,3> shape{16,16,16};
@@ -290,12 +391,13 @@ public:
   }
   void ConstructSDandField()override{
     auto* manager=G4TransportationManager::GetTransportationManager()->GetFieldManager();
+    if(field->is_exactly_zero()){manager->SetDetectorField(nullptr);return;}
     manager->SetDetectorField(field);manager->CreateChordFinder(field);
     manager->SetDeltaOneStep(.01*mm);manager->SetDeltaIntersection(.001*mm);
+    G4TransportationManager::GetTransportationManager()->GetPropagatorInField()->SetLargestAcceptableStep(field->field_limits().maximum_step*m);
   }
 };
 
-struct Primary {std::array<double,9> values;};
 struct Accumulator {
   std::map<int,double> sum,squares,secondary,secondary_squares;
   std::unordered_map<size_t,double> voxel_sum,voxel_squares;
@@ -317,11 +419,7 @@ struct State {int mode=0;int histories=0;Accumulator score[2];json request;fs::p
 class Generator:public G4VUserPrimaryGeneratorAction{
   G4ParticleGun gun{1};std::vector<Primary> primaries;long seed;
 public:
-  Generator(const json& request):seed(long(request.at("config").at("seed"))){
-    std::ifstream in(std::string(request.at("primary_file")),std::ios::binary);
-    Primary p;while(in.read(reinterpret_cast<char*>(p.values.data()),sizeof(p.values)))primaries.push_back(p);
-    if(primaries.size()!=size_t(request.at("config").at("radiation_histories")))throw std::runtime_error("Paired primary file has wrong event count");
-  }
+  Generator(const json& request,std::vector<Primary> samples):primaries(std::move(samples)),seed(long(request.at("config").at("seed"))){}
   void GeneratePrimaries(G4Event* event)override{
     const auto& v=primaries.at(event->GetEventID()).values;
     // Reset each primary stream so matched field-on/off histories start from
@@ -383,14 +481,19 @@ double standard_error(double sum,double squares,int n){
 int main(int argc,char** argv){
   G4RunManager* manager=nullptr;
   try{
-    if(argc!=2)throw std::runtime_error("Usage: torus-dose request.json");
-    std::ifstream input(argv[1]);json request;input>>request;
+    bool inspect=argc==3&&std::string(argv[1])=="--inspect-field";
+    if(argc!=2&&!inspect)throw std::runtime_error("Usage: torus-dose request.json (or --inspect-field request.json)");
+    const char* request_path=argv[inspect?2:1];
+    std::ifstream input(request_path);json request;input>>request;
     if(request.at("schema_version")!=1)throw std::runtime_error("Unsupported dose request schema");
-    std::ofstream(fs::path(argv[1]).parent_path()/"worker.pid")<<getpid();
+    if(!inspect)std::ofstream(fs::path(request_path).parent_path()/"worker.pid")<<getpid();
     FrozenMagneticField field(request.at("field_file"));
+    field.validate_world(request.at("world_radius_m"),request.value("maximum_field_step_m",0.));
+    auto primaries=load_primaries(request,field.field_limits().world_radius);
+    if(inspect){auto report=field_limit_metadata(field);report["primary_count"]=primaries.size();std::cout<<report.dump()<<std::endl;return 0;}
     State state;state.request=request;state.histories=request.at("config").at("radiation_histories");
     if(state.histories<2)throw std::runtime_error("At least two primary histories are needed for dose uncertainty");
-    state.progress_file=fs::path(argv[1]).parent_path()/"progress.json";
+    state.progress_file=fs::path(request_path).parent_path()/"progress.json";
     // A failed user callback can leave Geant4 in EventProc; destroying its run
     // manager while unwinding may exit before our useful error is printed.
     // On failure this short-lived worker leaves cleanup to the operating system.
@@ -401,7 +504,7 @@ int main(int argc,char** argv){
     auto* physics=factory.GetReferencePhysList(list);if(!physics)throw std::runtime_error("Physics list is unavailable");
     physics->ReplacePhysics(new G4EmStandardPhysics_option4);
     physics->SetDefaultCutValue(double(request.at("production_cut_m"))*m);
-    manager->SetUserInitialization(physics);manager->SetUserAction(new Generator(request));
+    manager->SetUserInitialization(physics);manager->SetUserAction(new Generator(request,std::move(primaries)));
     manager->SetUserAction(new Stepper(detector,&state));manager->SetUserAction(new Events(&state));
     manager->Initialize();
     for(int mode=0;mode<2;mode++){state.mode=mode;field.enabled=mode==0;manager->BeamOn(state.histories);}
@@ -423,7 +526,7 @@ int main(int argc,char** argv){
     }
     // Sparse voxel artifact includes all scored voxels; missing voxels have
     // zero observed deposition, not an inferred physical zero dose.
-    fs::path voxel_file=fs::path(argv[1]).parent_path()/"voxel_dose.bin";
+    fs::path voxel_file=fs::path(request_path).parent_path()/"voxel_dose.bin";
     std::ofstream voxels(voxel_file,std::ios::binary);
     for(auto [index,sum]:state.score[0].voxel_sum){
       auto center=target.center(index);double mass=target.voxel_mass[index];
@@ -455,6 +558,7 @@ int main(int argc,char** argv){
       {"paired_primary_streams",true},{"random_seed",request.at("config").at("seed")},
       {"phantom_provenance","ICRP Publication 110 official Geant4 dataset; cite Menzel et al. 2009 and Large et al. 2020"},
       {"validation_status","research implementation; physics-list, cuts and mesh convergence required"}};
+    output["metadata"].update(field_limit_metadata(field));
     fs::path output_path=std::string(request.at("output_file"));
     std::ofstream(output_path.string()+".tmp")<<output.dump(2);
     fs::rename(output_path.string()+".tmp",output_path);

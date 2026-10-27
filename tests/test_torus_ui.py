@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import numpy as np
 import PyQt6.QtCore as QtCore
@@ -65,14 +65,16 @@ class DesktopSourceTests(unittest.TestCase):
         self.application.processEvents()
 
     def ring_result(self, run_id, count):
-        from magnetic_torus.physics import enthalpy_from_temperature
+        from magnetic_torus.physics import enthalpy_from_temperature, liquid_fraction
         config = replace(ScenarioConfig(), solver="thermal_benchmark", turbulence=False,
                          major_radius=.3, minor_radius=.06, habitat_radius=.12)
         angle = np.arange(count) * 2 * np.pi / count
         points = np.column_stack((config.major_radius * np.cos(angle),
                                   config.major_radius * np.sin(angle), np.zeros(count)))
         temperature = np.stack((np.full(count, 1800.), np.full(count, 1820.)))
-        fields = {"temperature": temperature, "enthalpy": enthalpy_from_temperature(temperature, config)}
+        enthalpy = enthalpy_from_temperature(temperature, config)
+        fields = {"temperature": temperature, "enthalpy": enthalpy,
+                  "liquid_fraction": liquid_fraction(enthalpy, config)}
         return RunResult(run_id, config, np.array([0., 1.]), points, fields, {}, {"backend": "UI fixture"})
 
     def tetra_result(self, run_id="ui-tetra", regularized=False):
@@ -107,6 +109,114 @@ class DesktopSourceTests(unittest.TestCase):
         self.window.session.set_pinn(model)
         self.window._update_actions()
         return model
+
+    def test_unqualified_training_is_removed_but_guard_and_playback_remain(self):
+        from magnetic_torus.learning.support import pinn_training_unavailable_reason
+
+        with patch("magnetic_torus.app.pinn_training_unavailable_reason",
+                   wraps=pinn_training_unavailable_reason) as classify:
+            self.activate(self.ring_result("phase-changing-training", 8))
+            reason = pinn_training_unavailable_reason(self.window.session.active)
+            self.assertIn("Phase-changing thermal PINN training is not qualified", reason)
+            self.assertFalse(self.window.editor.train_button.isVisible())
+            self.assertEqual(self.window.editor.train_button.toolTip(), reason)
+            self.assertFalse(self.window.editor.train_button.isEnabled())
+            self.window.set_view("PINN")
+            self.window.chart_panel._refresh()
+            note = self.window.chart_panel.training_unavailable_note
+            self.assertTrue(note.isVisible())
+            self.assertEqual(note.text(), reason)
+            self.assertTrue(note.wordWrap())
+            self.assertFalse(self.window.chart_panel.training_settings_button.isVisible())
+            self.assertFalse(self.window.chart_panel.training_settings_button.isEnabled())
+            self.assertEqual(self.window.chart_panel.cards[0].ax.texts[0].get_text(),
+                             "No PINN available for this saved scenario")
+            for _ in range(3):
+                self.window._update_actions()
+            with patch.object(self.window.jobs, "start") as start, patch.object(self.window.playback, "stop_all") as stop:
+                self.window.start_job("pinn")
+            start.assert_not_called()
+            stop.assert_not_called()
+            self.assertIn(reason, self.window.message.text())
+            self.assertEqual(classify.call_count, 1)
+        for button in (self.window.editor.run_button, self.window.editor.trace_button,
+                       self.window.editor.dose_button):
+            self.assertTrue(button.isEnabled())
+        accepted = self.window.session.active
+        for status in ("passed", "failed"):
+            model = PINNResult("saved-" + status, accepted.run_id,
+                               accepted.config.config_hash, accepted.fields, {}, {},
+                               {"validation_status": status})
+            path = self.window.store.save_pinn(model)
+            self.window.session.set_pinn(self.window.store.load_pinn(path), path)
+            self.window._update_actions()
+            self.window.refresh_plots()
+            self.assertTrue(note.isVisible())
+            self.assertEqual(note.text(), reason)
+            self.assertFalse(self.window.editor.train_button.isEnabled())
+            self.assertFalse(self.window.editor.train_button.isVisible())
+            self.window.source.setCurrentText("PINN")
+            self.assertIs(self.window.scene.display_selection.fields, self.window.session.pinn.fields)
+            self.window.source.setCurrentText("PINN error")
+            self.assertIs(self.window.scene.display_selection.fields, self.window.session.pinn_difference)
+        self.window.set_view("Thermal")
+        self.assertFalse(note.isVisible())
+        self.window.set_view("PINN")
+        self.assertTrue(note.isVisible())
+        self.assertEqual(note.text(), reason)
+
+    def test_supported_training_returns_after_switching_sources_and_respects_busy(self):
+        from magnetic_torus.physics import enthalpy_from_temperature, liquid_fraction
+
+        self.assertFalse(self.window.editor.train_button.isEnabled())
+        self.assertTrue(self.window.editor.train_button.isVisible())
+        self.activate(self.ring_result("unsupported-source", 8))
+        native = self.ring_result("single-phase-source", 8)
+        temperature = np.stack((np.full(8, 1800.), np.full(8, 1801.)))
+        enthalpy = enthalpy_from_temperature(temperature, native.config)
+        native = replace(native, fields={"temperature": temperature,
+                         "enthalpy": enthalpy,
+                         "liquid_fraction": liquid_fraction(enthalpy, native.config)})
+        coupled = self.tetra_result("stationary-coupled-source", regularized=True)
+        fields = {key: np.repeat(values[:1], len(coupled.times), axis=0)
+                  for key, values in coupled.fields.items()}
+        for key in ("pressure", "electric_potential"):
+            fields[key] = np.zeros((2, len(coupled.points)))
+        for key in ("vector_potential", "magnetic_field"):
+            fields[key] = np.zeros((2, len(coupled.points), 3))
+        coupled = replace(coupled, fields=fields)
+        evolving = replace(coupled, run_id="evolving-coupled-source",
+                           fields={**fields, "electric_potential": np.stack(
+                               (np.zeros(len(coupled.points)), np.ones(len(coupled.points))))})
+        self.activate(evolving)
+        self.assertFalse(self.window.editor.train_button.isEnabled())
+        self.assertFalse(self.window.editor.train_button.isVisible())
+        for result in (native, coupled):
+            with self.subTest(solver=result.config.solver):
+                self.activate(result)
+                self.assertTrue(self.window.editor.train_button.isVisible())
+                self.assertTrue(self.window.editor.train_button.isEnabled())
+                self.window.set_view("PINN")
+                self.window.chart_panel._refresh()
+                self.assertFalse(self.window.chart_panel.training_unavailable_note.isVisible())
+                self.assertEqual(self.window.chart_panel.training_unavailable_note.text(), "")
+                self.assertTrue(self.window.chart_panel.training_settings_button.isVisible())
+                self.assertTrue(self.window.chart_panel.training_settings_button.isEnabled())
+                for controller in (self.window.jobs, self.window.exports):
+                    with patch.object(type(controller), "busy", new_callable=PropertyMock, return_value=True):
+                        self.window._update_actions()
+                        self.assertFalse(self.window.editor.train_button.isEnabled())
+                        self.assertTrue(self.window.editor.train_button.isVisible())
+                        with patch.object(self.window.jobs, "start") as start:
+                            self.window.start_job("pinn")
+                        start.assert_not_called()
+                    self.window._update_actions()
+                    self.assertTrue(self.window.editor.train_button.isEnabled())
+                with patch.object(self.window.jobs, "start") as start, patch.object(self.window.playback, "stop_all") as stop:
+                    self.window.start_job("pinn")
+                start.assert_called_once()
+                self.assertEqual(start.call_args.args[0], "pinn")
+                stop.assert_called_once()
 
     def test_temperature_profile_rebuilt_when_switching_to_smaller_run(self):
         self.activate(self.ring_result("large-profile", 32))
@@ -330,7 +440,14 @@ class DesktopSourceTests(unittest.TestCase):
 
 
     def test_failed_pinn_explains_gates_and_adjust_training_reveals_existing_inputs(self):
-        source_path = self.activate(self.tetra_result("failed-fit-source"))
+        from magnetic_torus.physics import enthalpy_from_temperature, liquid_fraction
+        source = self.tetra_result("failed-fit-source")
+        temperature = np.full_like(source.fields["temperature"], 1800.)
+        enthalpy = enthalpy_from_temperature(temperature, source.config)
+        source = replace(source, fields={**source.fields, "temperature": temperature,
+                                         "enthalpy": enthalpy,
+                                         "liquid_fraction": liquid_fraction(enthalpy, source.config)})
+        source_path = self.activate(source)
         accepted = self.window.session.active
         model = PINNResult(
             "failed-fit", accepted.run_id, accepted.config.config_hash, accepted.fields,
@@ -344,6 +461,10 @@ class DesktopSourceTests(unittest.TestCase):
         self.window.editor.set_config(replace(accepted.config, pinn_epochs=2500))
         self.window.session.job_revision = self.window.session.selection_revision
         self.window._job_completed({"action": "pinn", "source_path": str(source_path), "path": str(model_path)})
+        self.assertTrue(self.window.editor.train_button.isEnabled())
+        self.assertTrue(self.window.source.model().item(1).isEnabled())
+        self.assertTrue(self.window.source.model().item(2).isEnabled())
+        self.assertEqual(self.window.session.pinn.run_id, model.run_id)
         message = self.window.message.text()
         self.assertIn("250 epochs", message)
         for check in ("held-out loss 0.137 > 0.01", "velocity normalized RMSE 0.286 > 0.1",

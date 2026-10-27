@@ -23,12 +23,14 @@ def _field_metrics(run: TrainingRun, predicted: dict[str, np.ndarray], initial_v
     scaling = data.scaling
     result = data.result
     conductor_mask = np.asarray(result.metadata.get('conductor_mask', np.ones(data.point_count)), dtype=bool)
+    completed_epochs = run.history.get("epoch", ())
     metrics: dict[str, float] = {"initial_validation_loss": initial_validation,
                                 "validation_loss": run.history["validation_loss"][-1],
                                 "training_loss": run.history["loss"][-1],
                                 "physics_loss": run.history["physics_loss"][-1],
                                 "boundary_loss": run.history["boundary_loss"][-1],
-                                "epochs": float(data.config.pinn_epochs)}
+                                "epochs": float(completed_epochs[-1] if len(completed_epochs) else data.config.pinn_epochs),
+                                "requested_epochs": float(data.config.pinn_epochs)}
     vi, vp = np.divmod(data.validation_ids, data.point_count)
     zero_reference_fields = []
     normalization = {}
@@ -171,6 +173,6 @@ def validate_prediction(run: TrainingRun, predicted: dict[str, np.ndarray], init
            "each independently checked FE normalized residual RMS ≤ 0.1"))
     run.metadata["validation_notes"] = ("Agreement with this source run is assessed; this does not establish "
                                     "physical validity or mesh convergence of the source simulation.")
-    run.metadata["software_versions"] = {"torch": field.torch.__version__, "numpy": np.__version__,
+    run.metadata["software_versions"] = {"torch": str(field.torch.__version__), "numpy": np.__version__,
                                      "python": platform.python_version(), "simulator": __version__}
     return metrics

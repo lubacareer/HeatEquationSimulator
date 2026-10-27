@@ -12,6 +12,7 @@ os.environ.setdefault("QT_API", "pyqt6")
 from PyQt6 import QtCore, QtGui, QtWidgets
 from .jobs import JobController
 from .learning.diagnostics import failed_checks, validation_message
+from .learning.support import pinn_training_unavailable_reason
 from .models import preset
 from .scene import QUANTITIES, SceneWidget, SceneOptions
 from .store import RunStore
@@ -34,6 +35,8 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.store = RunStore(data_dir)
         self.jobs = JobController(self.store, self)
         self.session = WorkspaceSession()
+        self._pinn_support_result = None
+        self._pinn_support_reason = None
         self._build()
         self.exports = ExportController(
             self.session,
@@ -340,6 +343,10 @@ class TorusWindow(QtWidgets.QMainWindow):
             config = self.editor.read_config()
             if action != "simulate" and self.session.active is None:
                 raise ValueError("Run a simulation first.")
+            if action == "pinn":
+                reason = self._pinn_training_unavailable_reason()
+                if reason is not None:
+                    raise ValueError(reason)
             self.playback.stop_all()
             pinn_path = None
             if action in {"dose", "trace"} and self.source.currentIndex():
@@ -395,8 +402,18 @@ class TorusWindow(QtWidgets.QMainWindow):
             valid_draft = False
         self.editor.run_button.setEnabled(not busy and valid_draft)
         has_result = self.session.active is not None
+        training_reason = self._pinn_training_unavailable_reason()
+        # Unsupported training modes are not presented as available actions.
+        # Keep the separate start_job guard for non-UI callers.
+        self.editor.train_button.setVisible(not has_result or training_reason is None)
+        self.editor.train_button.setEnabled(
+            has_result and not busy and training_reason is None
+        )
+        self.editor.train_button.setToolTip(
+            training_reason or "Train a PINN for the accepted simulation."
+        )
+        self.chart_panel.set_training_unavailable_reason(training_reason)
         for control in (
-            self.editor.train_button,
             self.editor.trace_button,
             self.editor.dose_button,
         ):
@@ -410,6 +427,15 @@ class TorusWindow(QtWidgets.QMainWindow):
             self.session.comparison_difference is not None
             and self.session.view == "Compare"
         )
+
+    def _pinn_training_unavailable_reason(self):
+        result = self.session.active
+        if result is not self._pinn_support_result:
+            self._pinn_support_result = result
+            self._pinn_support_reason = (
+                pinn_training_unavailable_reason(result) if result is not None else None
+            )
+        return self._pinn_support_reason
 
     def _job_completed(self, event):
         try:
@@ -527,6 +553,15 @@ class TorusWindow(QtWidgets.QMainWindow):
         active_path = (
             str(self.session.active_path) if self.session.active_path else None
         )
+        comparison_path = next(
+            (
+                record["path"]
+                for record in records
+                if self.session.comparison is not None
+                and record.get("run_id") == self.session.comparison.run_id
+            ),
+            None,
+        )
         for combo in (self.editor.history, self.editor.compare_history):
             combo.blockSignals(True)
             combo.clear()
@@ -534,7 +569,8 @@ class TorusWindow(QtWidgets.QMainWindow):
             for record in records:
                 label = f"{record['name']} · {record['created'][11:19]}"
                 combo.addItem(label, record["path"])
-            index = combo.findData(active_path) if combo == self.editor.history else 0
+            path = active_path if combo == self.editor.history else comparison_path
+            index = combo.findData(path)
             combo.setCurrentIndex(max(0, index))
             combo.blockSignals(False)
 
@@ -550,6 +586,7 @@ class TorusWindow(QtWidgets.QMainWindow):
 
     def set_view(self, view):
         self.session.view = view
+        self.playback.clamp_to_timeline()
         self.thermal_plot.setVisible(view == "Thermal")
         self.shield_plot.setVisible(view == "Shielding")
         for button in self.view_group.buttons():
@@ -637,11 +674,27 @@ class TorusWindow(QtWidgets.QMainWindow):
             self.source.setCurrentText("Numerical")
             self._set_quantity_availability()
         result = self.session.active
+        if self.session.comparison is not None:
+            comparison = self.session.comparison
+            try:
+                self.playback.comparison_indices(comparison)
+            except ValueError:
+                self._clear_comparison()
+            else:
+                self.session.set_comparison(comparison)
+        self.playback.clamp_to_timeline()
         self.scene.clear_analysis()
         self.scene.set_result(
             result, self.quantity.currentText(), self.session.current_index
         )
         self.scene.set_dose(self.session.dose)
+        if self.session.comparison is not None:
+            self.compare_scene.set_quantity(self.quantity.currentText())
+            self.compare_scene.plotter.camera = self.scene.plotter.camera
+            self._share_color_range()
+        self.compare_scene.setVisible(
+            self.session.view == "Compare" and self.session.comparison is not None
+        )
         self.badge.setText(
             "COUPLED MHD" if result.config.solver == "fenics" else "THERMAL BENCHMARK"
         )
@@ -667,24 +720,48 @@ class TorusWindow(QtWidgets.QMainWindow):
             f"Loaded {result.config.name} · accepted numerical snapshots"
         )
 
+    def _clear_comparison(self):
+        self.session.set_comparison(None)
+        if self.source.currentText() == "Run difference":
+            with QtCore.QSignalBlocker(self.source):
+                self.source.setCurrentText("Numerical")
+            self.session.source = "Numerical"
+        config = (
+            self.session.active.config
+            if self.session.active is not None
+            else self.compare_scene.config
+        )
+        self.compare_scene.preview(config)
+        self.compare_scene.hide()
+        self.scene.set_shared_color_range(None)
+        self.compare_scene.set_shared_color_range(None)
+
     def _compare_selected(self, index):
         path = self.editor.compare_history.itemData(index)
         if not path:
-            self.session.set_comparison(None)
-            if self.source.currentText() == "Run difference":
-                self.source.setCurrentText("Numerical")
-            self.compare_scene.hide()
+            self._clear_comparison()
             self._update_actions()
+            self.refresh_plots()
+            self._render()
             return
         try:
-            self.session.set_comparison(self.store.load_run(path))
+            comparison = self.store.load_run(path)
+            if self.session.active is not None:
+                self.playback.comparison_indices(comparison)
+            self.session.set_comparison(comparison)
             self.compare_scene.set_result(
                 self.session.comparison, self.quantity.currentText()
             )
+            if (
+                self.session.comparison_difference is None
+                and self.source.currentText() == "Run difference"
+            ):
+                self.source.setCurrentText("Numerical")
             self.compare_scene.plotter.camera = self.scene.plotter.camera
             self._share_color_range()
             self.set_view("Compare")
         except Exception as error:
+            self.refresh_history()
             self._notify(str(error), error=True)
 
     def _quantity_changed(self):
@@ -746,10 +823,16 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.playback.update_position()
         self.chart_panel.update_frame(selection)
         if self.session.view == "Compare" and self.session.comparison is not None:
+            _, indices = self.playback.comparison_indices(self.session.comparison)
             other = int(
-                np.argmin(
-                    np.abs(self.session.comparison.times - self.session.current_time)
-                )
+                indices[
+                    np.argmin(
+                        np.abs(
+                            self.session.comparison.times[indices]
+                            - self.session.current_time
+                        )
+                    )
+                ]
             )
             self.compare_scene.update_index(other)
 

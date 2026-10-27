@@ -189,6 +189,8 @@ class ChartPanel(QtWidgets.QWidget):
             lambda: self.training_settings_requested.emit()
         )
         self.training_settings_button.hide()
+        self.training_available = True
+        self.training_unavailable_reason = None
         self.cards[0].add_header_control(self.training_settings_button)
         self.energy_mode = QtWidgets.QComboBox()
         self.energy_mode.addItems(["Change (ΔE)", "Stored total"])
@@ -206,11 +208,20 @@ class ChartPanel(QtWidgets.QWidget):
         self.profile_samples = None
         self.thermal_mode = "Probe temperature"
         self.shield_mode = "First-contact outcomes"
-        layout = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(7)
+        self.training_unavailable_note = QtWidgets.QLabel()
+        self.training_unavailable_note.setObjectName("subtitle")
+        self.training_unavailable_note.setWordWrap(True)
+        self.training_unavailable_note.hide()
+        layout.addWidget(self.training_unavailable_note)
+        cards_layout = QtWidgets.QHBoxLayout()
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        cards_layout.setSpacing(7)
         for card in self.cards:
-            layout.addWidget(card)
+            cards_layout.addWidget(card)
+        layout.addLayout(cards_layout)
 
     def invalidate(self):
         self.profile_samples = None
@@ -277,9 +288,24 @@ class ChartPanel(QtWidgets.QWidget):
         ):
             card.empty(title, message)
 
+    def set_training_unavailable_reason(self, reason: str | None) -> None:
+        """Explain unsupported training without obscuring saved PINN plots."""
+        self.training_unavailable_reason = reason
+        self.training_available = reason is None
+        self.training_unavailable_note.setText(reason or "")
+        self.training_settings_button.setEnabled(self.training_available)
+        self._update_training_visibility()
+
+    def _update_training_visibility(self) -> None:
+        pinn_view = self.session.view == "PINN"
+        self.training_settings_button.setVisible(pinn_view and self.training_available)
+        self.training_unavailable_note.setVisible(
+            pinn_view and self.session.active is not None and bool(self.training_unavailable_reason)
+        )
+
     def _refresh(self):
         self.energy_mode.setVisible(self.session.view == "Thermal")
-        self.training_settings_button.setVisible(self.session.view == "PINN")
+        self._update_training_visibility()
         self.energy_mode.setEnabled(self.session.active is not None)
         if self.session.active is None:
             self.empty()
@@ -788,11 +814,13 @@ class ChartPanel(QtWidgets.QWidget):
         if self.session.active is None:
             return
         if self.session.pinn is None:
+            empty_message = ("Train a PINN for the active saved scenario" if self.training_available
+                             else "No PINN available for this saved scenario")
             for card, title in zip(
                 self.cards,
                 ("Training convergence", "Held-out validation", "Numerical / PINN"),
             ):
-                card.empty(title, "Train a PINN for the active saved scenario")
+                card.empty(title, empty_message)
             return
         epochs = training_epochs(self.session.pinn)
         ax = self.cards[0].reset(

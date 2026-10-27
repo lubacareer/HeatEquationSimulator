@@ -80,10 +80,11 @@ def write_validation_report(destination: str | Path, include_fenics: bool = Fals
         report_progress(.75, "Running analytical FE Hartmann and magnetic-diffusion reductions")
         worker = Path(__file__).resolve().parent.parent / "workers" / "fenics_worker.py"
         case_file = destination.with_name(destination.stem + "_fenics.json")
+        interpreter = os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3")
         if sys.platform == "win32":
-            command = ["wsl", "-d", wsl_distribution(), "--", "/usr/bin/python3", wsl_path(worker), "--benchmarks", wsl_path(case_file)]
+            command = ["wsl", "-d", wsl_distribution(), "--", interpreter, wsl_path(worker), "--benchmarks", wsl_path(case_file)]
         else:
-            command = [os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3"), str(worker), "--benchmarks", str(case_file)]
+            command = [interpreter, str(worker), "--benchmarks", str(case_file)]
         try:
             subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
             cases_data = json.loads(case_file.read_text(encoding="utf-8"))
