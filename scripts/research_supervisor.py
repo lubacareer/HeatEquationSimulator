@@ -5,12 +5,51 @@ import json
 import os
 import signal
 from pathlib import Path
+import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
 from hashlib import sha256
 from typing import Any
+
+
+def _linklike(path: Path) -> bool:
+    """Recognize symlinks and Windows reparse points even on older Python."""
+    info = path.lstat()
+    return (path.is_symlink() or bool(getattr(info, "st_file_attributes", 0)
+                                     & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)))
+
+
+def _remove_owned_stages(directory: Path, pid: int) -> list[str]:
+    """Remove only this reaped worker's private stages, without following links."""
+    notes = []
+    store = directory / "store"
+    try:
+        if not store.exists() and not store.is_symlink():
+            return notes
+        if _linklike(store) or store.resolve().parent != directory:
+            return ["Stage cleanup: research store is not a direct, non-link child of the output directory."]
+        if not store.is_dir():
+            return ["Stage cleanup: research store is not a directory."]
+        prefix = f".research-stage-{pid}-"
+        for candidate in store.iterdir():
+            if not candidate.name.startswith(prefix) or len(candidate.name) == len(prefix):
+                continue
+            if _linklike(candidate) or candidate.resolve().parent != store.resolve():
+                notes.append(f"Stage cleanup: skipped linked or escaping path {candidate.name}.")
+                continue
+            if not candidate.is_dir():
+                notes.append(f"Stage cleanup: skipped non-directory path {candidate.name}.")
+                continue
+            try:
+                shutil.rmtree(candidate)
+            except OSError as error:
+                notes.append(f"Stage cleanup {candidate.name}: {type(error).__name__}: {error}")
+    except OSError as error:
+        notes.append(f"Stage cleanup: {type(error).__name__}: {error}")
+    return notes
 
 
 def _read_worker_report(path: Path, provenance: dict[str, Any]) -> dict[str, Any] | None:
@@ -138,10 +177,12 @@ def supervise(command: list[str], directory: Path, *, started: float, seconds: f
             except OSError:
                 pass
         if child is not None and child.poll() is None and reason is not None:
-            try:
-                child.wait(timeout=max(.001, min(2., hard_deadline - time.monotonic())))
-            except subprocess.TimeoutExpired:
-                pass
+            grace = max(0., min(2., hard_deadline - time.monotonic() - .4))
+            if grace:
+                try:
+                    child.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    pass
         try:
             if owner is not None:
                 owner.close()
@@ -158,9 +199,30 @@ def supervise(command: list[str], directory: Path, *, started: float, seconds: f
                 child.kill()
         if child is not None and child.poll() is None:
             try:
-                child.wait(timeout=max(.001, min(2., hard_deadline - time.monotonic())))
+                child.wait(timeout=max(.001, min(2., hard_deadline - time.monotonic() - .15)))
             except subprocess.TimeoutExpired:
                 pass
+        if child is not None and child.poll() is not None:
+            # A worker force-killed inside HDF5 cannot run TemporaryDirectory's
+            # cleanup. Bound our cleanup by the same hard deadline.
+            cleanup_done = threading.Event()
+            owned_notes = []
+            def clean_stages():
+                try:
+                    owned_notes.extend(_remove_owned_stages(directory, child.pid))
+                finally:
+                    cleanup_done.set()
+            budget = max(0., hard_deadline - time.monotonic() - .1)
+            if budget:
+                threading.Thread(target=clean_stages, daemon=True).start()
+                if not cleanup_done.wait(budget):
+                    cleanup_notes.append("Stage cleanup did not finish before the deadline.")
+                else:
+                    cleanup_notes.extend(owned_notes)
+            else:
+                cleanup_notes.append("Stage cleanup could not start before the deadline.")
+        elif child is not None:
+            cleanup_notes.append("Stage cleanup skipped because the worker has not exited.")
 
     latest = _read_worker_report(worker_path, provenance)
     if latest is not None:

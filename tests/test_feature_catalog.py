@@ -59,6 +59,9 @@ class FeatureCatalogTests(unittest.TestCase):
         pilot = self.by_id["unit.test_pinn_pressure_pilots"]
         self.assertIn("scripts/pinn_research.py", pilot.dependencies)
         self.assertIn("scripts/research_supervisor.py", pilot.dependencies)
+        publication = self.by_id["unit.test_research_publication"]
+        self.assertIn("scripts/pinn_research.py", publication.dependencies)
+        self.assertIn("scripts/research_supervisor.py", publication.dependencies)
 
     def test_missing_duplicate_mislabeled_and_disconnected_providers_cannot_claim_coverage(
         self,

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
+import errno
 from hashlib import sha256
 import json
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -47,6 +49,66 @@ def stage_source(source: Path, directory: Path, expected_sha256: str) -> Path:
     finally:
         partial.unlink(missing_ok=True)
     return staged
+
+
+def _rename_directory_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without overwriting an existing path."""
+    if os.name == "nt":
+        # On Windows os.rename fails if the destination already exists.
+        os.rename(source, destination)
+        return
+    # POSIX rename may replace an existing *empty* directory even if a
+    # previous existence check succeeded. Use the platform's no-replace
+    # primitive rather than allow a racing writer's evidence to be erased.
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        function = getattr(libc, "renameat2", None)
+        if function is None:
+            raise OSError(errno.ENOTSUP, "Atomic no-replace directory rename is unavailable.")
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        arguments = (-100, os.fsencode(source), -100, os.fsencode(destination), 1)  # AT_FDCWD, RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        function = getattr(libc, "renamex_np", None)
+        if function is None:
+            raise OSError(errno.ENOTSUP, "Atomic no-replace directory rename is unavailable.")
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        arguments = (os.fsencode(source), os.fsencode(destination), 4)  # RENAME_EXCL
+    else:
+        raise OSError(errno.ENOTSUP, "Atomic no-replace directory rename is unavailable.")
+    function.restype = ctypes.c_int
+    if function(*arguments) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+def publish_research_bundle(store, source, model, cancel: threading.Event) -> tuple[Path, Path]:
+    """Publish a source and its PINN together as one complete run directory."""
+    from magnetic_torus.models import SimulationCancelled
+    from magnetic_torus.store import RunStore
+
+    if model.source_run_id != source.run_id:
+        raise ValueError("The research PINN must belong to the source being published.")
+    # RunStore.directory performs the same run-id validation during staging.
+    root = store.root.resolve()
+    destination = root / "runs" / source.run_id
+    if os.path.lexists(destination):
+        raise FileExistsError("The research publication destination already exists.")
+    with tempfile.TemporaryDirectory(prefix=f".research-stage-{os.getpid()}-", dir=root) as pending:
+        stage = RunStore(Path(pending), target_root=root)
+        source_path = stage.save_run(source)
+        model_path = stage.save_pinn(model)
+        final_source = stage.published_path(source_path)
+        final_model = stage.published_path(model_path)
+        if cancel.is_set():
+            raise SimulationCancelled("Research cancelled before publishing its results.")
+        if os.path.lexists(destination):
+            raise FileExistsError("The research publication destination already exists.")
+        if source_path.parent != model_path.parent or final_source.parent != destination or final_model.parent != destination:
+            raise ValueError("The research source and PINN must share one destination.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _rename_directory_noreplace(source_path.parent, destination)
+        return final_source, final_model
 
 
 def main(argv=None) -> int:
@@ -181,13 +243,15 @@ def main(argv=None) -> int:
         def progress(fraction, message):
             print(json.dumps({"progress": fraction, "message": message}), flush=True)
         copied, model, evidence = run_research(source, options, progress, stop, directory / "training", args.checkpoint)
-        source_path = store.save_run(copied)
-        model_path = store.save_pinn(model)
-        report.update(**evidence, metrics=dict(model.metrics), metadata=dict(model.metadata),
-                      source_path=str(source_path), pinn_path=str(model_path))
         code = {"PASS": 0, "FAIL": 3, "TIMEOUT": 124, "INTERRUPTED": 130}[evidence["status"]]
-        if stop.is_set() and code not in {124, 130}:
-            report["status"], code = "INTERRUPTED", 130
+        if not (stop.is_set() and code in {124, 130}):
+            source_path, model_path = publish_research_bundle(store, copied, model, stop)
+            report.update(**evidence, metrics=dict(model.metrics), metadata=dict(model.metadata),
+                          source_path=str(source_path), pinn_path=str(model_path))
+            if stop.is_set() and code not in {124, 130}:
+                report["status"], code = "INTERRUPTED", 130
+        else:
+            report.update(**evidence, metrics=dict(model.metrics), metadata=dict(model.metadata))
     except ResearchPilotTimeout as error:
         report.update(status="TIMEOUT", error=str(error), actual_steps=error.steps,
                       elapsed_s=error.elapsed_s)
@@ -197,6 +261,7 @@ def main(argv=None) -> int:
         code = 130
     except Exception as error:
         report.update(status="ERROR", error=f"{type(error).__name__}: {error}")
+        code = 1
     finally:
         watch_finished.set()
         signal.signal(signal.SIGINT, previous_handler)

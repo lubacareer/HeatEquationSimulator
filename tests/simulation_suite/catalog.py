@@ -23,6 +23,7 @@ _GEANT4_INTEGRATION_METHODS = (
 _EXTRA_UNIT_DEPENDENCIES = {
     "test_pressure_diagnostics.py": ("scripts/pinn_pressure_diagnostics.py", "scripts/pinn_source_residuals.py"),
     "test_pinn_pressure_pilots.py": ("scripts/pinn_research.py", "scripts/research_supervisor.py"),
+    "test_research_publication.py": ("scripts/pinn_research.py", "scripts/research_supervisor.py"),
     "test_fe_operator_compare.py": ("scripts/compare_fe_operator.py",),
 }
 
