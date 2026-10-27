@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -260,6 +261,62 @@ class IsolatedRunnerTests(unittest.TestCase):
             case, root=self.root, run_dir=self.run_dir, capabilities={}, **kwargs
         )
 
+    def terminal_child(self, value, *, mode="atomic", timeout=12.0, descendant=False,
+                       linger=30., return_code=1):
+        """Publish a result and remain alive, like a worker stuck in teardown."""
+        script = self.root / "terminal worker.py"
+        script.write_text(
+            "import json,os,subprocess,sys,time\nfrom pathlib import Path\n"
+            "out=Path(sys.argv[1])\n"
+            f"value={value!r}; mode={mode!r}\n"
+            f"descendant={descendant!r}\n"
+            "if descendant:\n"
+            " child=subprocess.Popen([sys.executable,'-B','-c','import time;time.sleep(30)'])\n"
+            " (out.parent/'descendant.pid').write_text(str(child.pid),encoding='ascii')\n"
+            "if mode=='malformed': out.write_text('{',encoding='utf-8')\n"
+            "elif mode=='delayed':\n"
+            " out.write_text('{',encoding='utf-8');time.sleep(.3)\n"
+            " temp=out.with_suffix('.partial');temp.write_text(json.dumps(value),encoding='utf-8');os.replace(temp,out)\n"
+            "elif mode in ('atomic','partial'):\n"
+            " temp=out.with_suffix('.partial');temp.write_text(json.dumps(value),encoding='utf-8')\n"
+            " if mode=='atomic': os.replace(temp,out)\n"
+            "print('published terminal result',flush=True)\n"
+            f"time.sleep({linger!r})\n"
+            f"raise SystemExit({return_code!r})\n",
+            encoding="utf-8",
+        )
+        return CaseSpec(
+            "fixture.terminal", "fixture", "Terminal failure with a stuck child",
+            ("{python}", "-B", str(script), "{case_dir}/result.json"),
+            timeout, kind="scientific", dependencies=(script.name,),
+        )
+
+    def assert_process_stopped(self, pid):
+        if os.name == "nt":
+            from ctypes import wintypes
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            kernel.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel.OpenProcess(0x1000, False, pid)
+            if handle:
+                try:
+                    code = wintypes.DWORD()
+                    self.assertTrue(kernel.GetExitCodeProcess(handle, ctypes.byref(code)))
+                    self.assertNotEqual(code.value, 259, "Owned descendant remains active.")
+                finally:
+                    kernel.CloseHandle(handle)
+        else:
+            status = Path(f"/proc/{pid}/stat")
+            if status.exists():
+                self.assertEqual(status.read_text().split()[2], "Z")
+            else:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
     def test_real_child_preserves_logs_qualification_and_artifacts(self):
         case = self.child_case(
             result={
@@ -378,6 +435,209 @@ class IsolatedRunnerTests(unittest.TestCase):
         )
         self.assertEqual(interrupted["status"], "INTERRUPTED")
         self.assertLess(time.monotonic() - started, 10.0)
+
+    def test_atomic_failure_gets_five_seconds_then_owned_tree_is_stopped(self):
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "original CUDA OOM",
+                   "traceback": "original traceback", "artifacts": {}, "metrics": {}}
+        unrelated = subprocess.Popen(
+            [sys.executable, "-B", "-c", "import time;time.sleep(30)"],
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        try:
+            started = time.monotonic()
+            result = self.execute(self.terminal_child(failure, descendant=True))
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, 4.8)
+            self.assertLess(elapsed, 15.0)
+            self.assertEqual(result["status"], "ERROR")
+            self.assertEqual(result["reason"], "original CUDA OOM")
+            self.assertEqual(result["traceback"], "original traceback")
+            self.assertTrue(result["terminal_failure_detected"])
+            pid = int((Path(result["case_dir"]) / "descendant.pid").read_text())
+            self.assert_process_stopped(pid)
+            self.assertIsNone(unrelated.poll(), "An unrelated process was stopped.")
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=5)
+
+    def test_terminal_scientific_failure_is_preserved_after_cleanup(self):
+        failure = {"case_id": "fixture.terminal", "status": "FAIL", "execution": "PASS",
+                   "qualification": "FAIL", "reason": "pressure accuracy gate",
+                   "artifacts": {}, "metrics": {"pressure_normalized_rmse": .116}}
+        with patch.object(self.runner, "_FAILURE_EXIT_GRACE_SECONDS", .2):
+            result = self.execute(self.terminal_child(failure))
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["qualification"], "FAIL")
+        self.assertEqual(result["reason"], "pressure accuracy gate")
+        self.assertEqual(result["metrics"]["pressure_normalized_rmse"], .116)
+
+    def test_invalid_failure_artifact_does_not_erase_original_error(self):
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "original CUDA OOM",
+                   "artifacts": {"bad": str(self.root / "outside")}, "metrics": {}}
+        with patch.object(self.runner, "_FAILURE_EXIT_GRACE_SECONDS", .2):
+            result = self.execute(self.terminal_child(failure))
+        self.assertEqual(result["status"], "ERROR")
+        self.assertIn("original CUDA OOM", result["reason"])
+        self.assertIn("Invalid or missing case artifact", result["reason"])
+
+    def test_nonfinite_json_is_not_an_early_terminal_result(self):
+        case = self.terminal_child(None, mode="none")
+        directory = self.root / "attempt"
+        directory.mkdir()
+        (directory / "result.json").write_text(
+            '{"case_id":"fixture.terminal","status":"ERROR","execution":"FAIL",'
+            '"qualification":"NOT_APPLICABLE","reason":"bad","metrics":{"x":NaN}}',
+            encoding="utf-8",
+        )
+        self.assertIsNone(self.runner._terminal_failure(case, directory))
+
+    def test_worker_can_exit_naturally_during_failure_grace(self):
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "worker failed"}
+        result = self.execute(self.terminal_child(failure, linger=.4))
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["reason"], "worker failed")
+        self.assertNotIn("terminal_failure_detected", result)
+        self.assertEqual(result["returncode"], 1)
+
+    def test_case_deadline_wins_over_failure_grace(self):
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "worker failed"}
+        result = self.execute(self.terminal_child(failure, timeout=1.5))
+        self.assertTrue((Path(result["case_dir"]) / "result.json").is_file())
+        self.assertEqual(result["status"], "TIMEOUT")
+        self.assertEqual(result["worker_failure"]["reason"], "worker failed")
+
+    def test_case_deadline_wins_if_worker_exits_between_polls(self):
+        success = {"case_id": "fixture.terminal", "status": "PASS", "execution": "PASS",
+                   "qualification": "PASS"}
+        original = self.runner._terminal_failure
+        delayed = threading.Event()
+
+        def delay_first_result(case, directory):
+            value = original(case, directory)
+            if (directory / "result.json").is_file() and not delayed.is_set():
+                delayed.set()
+                time.sleep(1.4)
+            return value
+
+        with patch.object(self.runner, "_terminal_failure", side_effect=delay_first_result):
+            result = self.execute(self.terminal_child(success, timeout=1.2, linger=.6, return_code=0))
+        self.assertTrue(delayed.is_set())
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["status"], "TIMEOUT")
+
+    def test_case_deadline_wins_during_pipe_drain_and_retains_worker_error(self):
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "original worker error"}
+        result = self.execute(self.terminal_child(failure, timeout=1.5, descendant=True, linger=.05))
+        self.assertEqual(result["status"], "TIMEOUT")
+        self.assertEqual(result["worker_failure"]["reason"], "original worker error")
+        pid = int((Path(result["case_dir"]) / "descendant.pid").read_text())
+        self.assert_process_stopped(pid)
+
+    def test_partial_malformed_wrong_case_and_pass_files_do_not_end_case(self):
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "failure"}
+        cases = (
+            ("partial", failure),
+            ("malformed", failure),
+            ("atomic", {**failure, "case_id": "different.case"}),
+            ("atomic", {**failure, "execution": "PASS"}),
+            ("atomic", {"case_id": "fixture.terminal", "status": "PASS",
+                        "execution": "PASS", "qualification": "PASS"}),
+        )
+        for mode, value in cases:
+            with self.subTest(mode=mode, value=value):
+                with patch.object(self.runner, "_FAILURE_EXIT_GRACE_SECONDS", .2):
+                    result = self.execute(self.terminal_child(value, mode=mode, timeout=1.5))
+                self.assertEqual(result["status"], "TIMEOUT")
+                path = Path(result["case_dir"]) / ("result.partial" if mode == "partial" else "result.json")
+                self.assertTrue(path.is_file(), "The child did not publish its fixture.")
+
+    def test_previous_attempt_failure_is_not_read_by_new_attempt(self):
+        previous = self.run_dir / "cases" / "fixture.terminal" / "attempt-0001"
+        previous.mkdir(parents=True)
+        (previous / "result.json").write_text(json.dumps({
+            "case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+            "qualification": "NOT_APPLICABLE", "reason": "stale error",
+        }), encoding="utf-8")
+        result = self.execute(self.terminal_child(None, mode="none", timeout=1.5))
+        self.assertEqual(result["status"], "TIMEOUT")
+        self.assertEqual(Path(result["case_dir"]).name, "attempt-0002")
+
+    def test_incomplete_file_can_be_followed_by_an_atomic_failure(self):
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "eventual failure"}
+        with patch.object(self.runner, "_FAILURE_EXIT_GRACE_SECONDS", .2):
+            result = self.execute(self.terminal_child(failure, mode="delayed"))
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["reason"], "eventual failure")
+
+    def test_user_and_budget_cancellation_override_published_failure(self):
+        from simulation_suite.budget import InvocationBudget
+
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "worker failed"}
+        for reason in ("user", "budget"):
+            with self.subTest(reason=reason):
+                event = threading.Event()
+                budget = InvocationBudget(time.monotonic(), 30., 1.) if reason == "budget" else None
+                found = threading.Event()
+                parent = self.run_dir / "cases" / "fixture.terminal"
+                attempt = 1
+                while (parent / f"attempt-{attempt:04d}").exists():
+                    attempt += 1
+                expected_result = parent / f"attempt-{attempt:04d}" / "result.json"
+
+                def cancel_after_result():
+                    for _ in range(200):
+                        if expected_result.is_file():
+                            found.set()
+                            if budget is not None:
+                                budget.request_stop("budget")
+                            else:
+                                event.set()
+                            return
+                        time.sleep(.05)
+
+                watcher = threading.Thread(target=cancel_after_result, daemon=True)
+                watcher.start()
+                result = self.execute(self.terminal_child(failure), stop_event=event, budget=budget)
+                watcher.join(timeout=2)
+                self.assertTrue(found.is_set(), "The failure was not published before cancellation.")
+                self.assertEqual(result["status"], "INTERRUPTED")
+                self.assertEqual(result["stop_reason"], reason)
+                self.assertEqual(result["qualification"], "NOT_RUN")
+
+    def test_cancel_during_pipe_cleanup_overrides_published_failure(self):
+        failure = {"case_id": "fixture.terminal", "status": "ERROR", "execution": "FAIL",
+                   "qualification": "NOT_APPLICABLE", "reason": "worker failed"}
+        event, published = threading.Event(), threading.Event()
+        path = self.run_dir / "cases" / "fixture.terminal" / "attempt-0001" / "result.json"
+
+        def cancel_after_exit():
+            for _ in range(200):
+                if path.is_file():
+                    published.set()
+                    time.sleep(.3)
+                    event.set()
+                    return
+                time.sleep(.05)
+
+        watcher = threading.Thread(target=cancel_after_exit, daemon=True)
+        watcher.start()
+        result = self.execute(
+            self.terminal_child(failure, descendant=True, linger=.05), stop_event=event
+        )
+        watcher.join(timeout=2)
+        self.assertTrue(published.is_set())
+        self.assertEqual(result["status"], "INTERRUPTED")
+        self.assertEqual(result["stop_reason"], "user")
+        pid = int((Path(result["case_dir"]) / "descendant.pid").read_text())
+        self.assert_process_stopped(pid)
 
     def test_fingerprints_change_with_inputs_dependencies_and_runtime_versions(self):
         case = self.child_case(

@@ -27,6 +27,9 @@ from .processes import OwnedProcessGroup, stop_owned_wsl
 from .spec import CaseSpec
 
 
+_FAILURE_EXIT_GRACE_SECONDS = 5.0
+
+
 @lru_cache(maxsize=1)
 def software_versions() -> dict:
     packages = {}
@@ -217,7 +220,8 @@ def _environment(case_dir: Path, profile: str) -> dict[str, str]:
 
 
 def _stop_owned_process(
-    process: subprocess.Popen, case_dir: Path, *, external: bool, budget=None
+    process: subprocess.Popen, case_dir: Path, *, external: bool, budget=None,
+    grace_seconds: float | None = None,
 ) -> list[str]:
     notes = []
 
@@ -238,7 +242,9 @@ def _stop_owned_process(
         except (OSError, ValueError):
             pass
     try:
-        process.wait(timeout=timeout(15 if external else 1))
+        process.wait(timeout=timeout(
+            (15 if external else 1) if grace_seconds is None else grace_seconds
+        ))
         return notes
     except subprocess.TimeoutExpired:
         pass
@@ -276,6 +282,66 @@ def _stop_owned_process(
         except subprocess.TimeoutExpired:
             notes.append("The owned child did not acknowledge forced termination.")
     return notes
+
+
+def _validate_case_data(case: CaseSpec, data: object, returncode: int) -> dict:
+    if not isinstance(data, dict) or data.get("status") not in {
+        "PASS",
+        "FAIL",
+        "ERROR",
+        "UNAVAILABLE",
+    }:
+        raise ValueError("Invalid child result status.")
+    if not isinstance(data.get("artifacts", {}), dict) or not isinstance(
+        data.get("metrics", {}), dict
+    ):
+        raise ValueError("Child artifacts and metrics must be mappings.")
+    if data.get("execution") not in {"PASS", "FAIL"} or data.get(
+        "qualification"
+    ) not in {"PASS", "FAIL", "NOT_APPLICABLE"}:
+        raise ValueError("Invalid child execution or qualification status.")
+    if data.get("status") == "PASS" and (returncode or data.get("execution") != "PASS"):
+        raise ValueError("A failing child cannot publish a passing result.")
+    if (
+        data.get("status") == "PASS"
+        and case.kind == "scientific"
+        and data.get("qualification") != "PASS"
+    ):
+        raise ValueError("Scientific case did not publish a passing qualification gate.")
+    if data.get("qualification") == "FAIL" and data.get("status") != "ERROR":
+        data["status"] = "FAIL"
+    return data
+
+
+def _terminal_failure(case: CaseSpec, case_dir: Path) -> dict | None:
+    """Read only a complete, case-specific published failure from this attempt.
+
+    Scientific workers publish result.json by atomic replacement. A partial,
+    inaccessible, wrong-case or success result is never an early terminal event.
+    """
+    path = case_dir / "result.json"
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        _inside(path, case_dir)
+
+        def reject_nonfinite_constant(value):
+            raise ValueError(f"Non-finite JSON constant: {value}")
+
+        data = json.loads(
+            path.read_text(encoding="utf-8"), parse_constant=reject_nonfinite_constant
+        )
+        if (not isinstance(data, dict) or data.get("case_id") != case.id
+                or data.get("status") not in {"ERROR", "FAIL"}
+                or not isinstance(data.get("reason"), str)):
+            return None
+        if data["status"] == "ERROR" and data.get("execution") != "FAIL":
+            return None
+        if data["status"] == "FAIL" and data.get("qualification") == "PASS":
+            return None
+        return _validate_case_data(case, data, 1)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
 
 
 def _decode_case(
@@ -319,34 +385,7 @@ def _decode_case(
         }
     else:
         raise ValueError("Child published no structured result; inspect its log.")
-    if not isinstance(data, dict) or data.get("status") not in {
-        "PASS",
-        "FAIL",
-        "ERROR",
-        "UNAVAILABLE",
-    }:
-        raise ValueError("Invalid child result status.")
-    if not isinstance(data.get("artifacts", {}), dict) or not isinstance(
-        data.get("metrics", {}), dict
-    ):
-        raise ValueError("Child artifacts and metrics must be mappings.")
-    if data.get("execution") not in {"PASS", "FAIL"} or data.get(
-        "qualification"
-    ) not in {"PASS", "FAIL", "NOT_APPLICABLE"}:
-        raise ValueError("Invalid child execution or qualification status.")
-    if data.get("status") == "PASS" and (returncode or data.get("execution") != "PASS"):
-        raise ValueError("A failing child cannot publish a passing result.")
-    if (
-        data.get("status") == "PASS"
-        and case.kind == "scientific"
-        and data.get("qualification") != "PASS"
-    ):
-        raise ValueError(
-            "Scientific case did not publish a passing qualification gate."
-        )
-    if data.get("qualification") == "FAIL":
-        data["status"] = "FAIL"
-    return data
+    return _validate_case_data(case, data, returncode)
 
 
 def run_case(
@@ -449,6 +488,7 @@ def run_case(
     process = None
     owner = None
     reader = None
+    accepted_failure = False
     capture_stop = threading.Event()
     last_lines: deque[str] = deque(maxlen=40)
     with log_path.open("w", encoding="utf-8") as log:
@@ -486,53 +526,135 @@ def run_case(
 
             reader = threading.Thread(target=output, daemon=True)
             reader.start()
-            while process.poll() is None:
-                interrupted = stop.is_set()
-                stop_reason = "user" if interrupted else None
+            pending_failure = None
+            failure_seen_at = None
+            external = any(
+                name in case.capabilities
+                for name in ("fenics", "geant4", "torch_cpu", "torch_cuda")
+            )
+
+            def interrupted_reason():
+                reason = "user" if stop.is_set() else None
                 if budget is not None:
                     try:
                         budget.poll()
                     except InvocationStopped as stopped:
-                        interrupted = True
-                        stop_reason = stopped.reason
-                if interrupted or time.monotonic() - started > case.timeout:
-                    result.update(
-                        status="INTERRUPTED" if interrupted else "TIMEOUT",
-                        execution="FAIL",
-                        reason=(
-                            "Invocation time budget exhausted."
-                            if stop_reason == "budget"
-                            else "User interrupted the run."
-                        )
-                        if interrupted
-                        else f"Case exceeded {case.timeout:g} seconds.",
-                    )
+                        reason = stopped.reason
+                return reason
+
+            def preserve_failure():
+                if "worker_failure" in result:
+                    return
+                failure = (result if accepted_failure and result.get("status") in {"ERROR", "FAIL"}
+                           else _terminal_failure(case, case_dir))
+                if failure is not None:
+                    result["worker_failure"] = {
+                        key: failure[key] for key in ("status", "reason", "traceback")
+                        if key in failure
+                    }
+
+            def mark_interrupted(reason):
+                preserve_failure()
+                if process.poll() is None:
                     result["cleanup_notes"] = _stop_owned_process(
-                        process,
-                        case_dir,
-                        external=any(
-                            name in case.capabilities
-                            for name in ("fenics", "geant4", "torch_cpu", "torch_cuda")
-                        ),
-                        budget=budget,
+                        process, case_dir, external=external, budget=budget,
                     )
-                    if stop_reason is not None:
-                        result["stop_reason"] = stop_reason
+                result.update(
+                    status="INTERRUPTED", execution="FAIL",
+                    qualification="NOT_RUN" if case.kind == "scientific" else "NOT_APPLICABLE",
+                    artifacts={}, metrics={},
+                    reason=("Invocation time budget exhausted." if reason == "budget"
+                            else "User interrupted the run."),
+                    stop_reason=reason,
+                )
+
+            def mark_timeout():
+                preserve_failure()
+                if process.poll() is None:
+                    result["cleanup_notes"] = _stop_owned_process(
+                        process, case_dir, external=external, budget=budget,
+                    )
+                result.update(
+                    status="TIMEOUT", execution="FAIL",
+                    qualification="NOT_RUN" if case.kind == "scientific" else "NOT_APPLICABLE",
+                    artifacts={}, metrics={},
+                    reason=f"Case exceeded {case.timeout:g} seconds.",
+                )
+
+            while True:
+                stop_reason = interrupted_reason()
+                completed = process.poll() is not None
+                if stop_reason is not None:
+                    mark_interrupted(stop_reason)
+                    break
+                if time.monotonic() - started >= case.timeout:
+                    mark_timeout()
+                    break
+                if completed:
+                    break
+
+                current_failure = _terminal_failure(case, case_dir)
+                if current_failure != pending_failure:
+                    pending_failure = current_failure
+                    failure_seen_at = time.monotonic() if current_failure is not None else None
+                elif (current_failure is not None and failure_seen_at is not None
+                      and time.monotonic() - failure_seen_at >= _FAILURE_EXIT_GRACE_SECONDS):
+                    # The failure must remain unchanged throughout the grace period.
+                    # A still-running process and its descendants are ours to clean up.
+                    if process.poll() is not None:
+                        break
+                    result.update(current_failure)
+                    accepted_failure = True
+                    result["terminal_failure_detected"] = True
+                    try:
+                        result["cleanup_notes"] = _stop_owned_process(
+                            process, case_dir, external=external, budget=budget,
+                            grace_seconds=0.,
+                        )
+                    except Exception as error:
+                        result["cleanup_notes"] = [f"Owned process cleanup failed: {error}"]
                     break
                 time.sleep(0.1)
-            reader.join(timeout=3)
+
+            # A cancellation arriving during the grace or cleanup takes priority.
+            stop_reason = interrupted_reason()
+            if stop_reason is not None:
+                mark_interrupted(stop_reason)
+            elif result["status"] not in {"INTERRUPTED", "TIMEOUT"} and time.monotonic() - started >= case.timeout:
+                mark_timeout()
+            join_timeout = max(0., min(3., case.timeout - (time.monotonic() - started)))
+            if budget is not None:
+                join_timeout = min(join_timeout, budget.remaining_seconds())
+            reader.join(timeout=join_timeout)
+            stop_reason = interrupted_reason()
+            if stop_reason is not None:
+                mark_interrupted(stop_reason)
+            elif result["status"] not in {"INTERRUPTED", "TIMEOUT"} and time.monotonic() - started >= case.timeout:
+                mark_timeout()
             if reader.is_alive():
                 if owner is not None:
                     owner.close()
                 reader.join(timeout=3)
                 if result["status"] not in {"TIMEOUT", "INTERRUPTED"}:
-                    raise ValueError(
-                        "Child left descendants holding its output pipe; owned processes were stopped."
+                    failure = pending_failure if accepted_failure else _terminal_failure(case, case_dir)
+                    if failure is None:
+                        raise ValueError(
+                            "Child left descendants holding its output pipe; owned processes were stopped."
+                        )
+                    result.update(failure)
+                    result.setdefault("cleanup_notes", []).append(
+                        "Owned descendants holding the output pipe were stopped."
                     )
-            if result["status"] not in {"TIMEOUT", "INTERRUPTED"}:
+                    accepted_failure = True
+            if result["status"] not in {"TIMEOUT", "INTERRUPTED"} and not accepted_failure:
                 result.update(
                     _decode_case(case, case_dir, process.wait(timeout=3), last_lines)
                 )
+            stop_reason = interrupted_reason()
+            if stop_reason is not None:
+                mark_interrupted(stop_reason)
+            elif result["status"] not in {"INTERRUPTED", "TIMEOUT"} and time.monotonic() - started >= case.timeout:
+                mark_timeout()
             result["returncode"] = process.poll()
         except KeyboardInterrupt:
             stop.set()
@@ -575,10 +697,12 @@ def run_case(
                 Path(value), run_dir, budget
             )
     except (OSError, ValueError) as error:
+        original_reason = result.get("reason", "") if accepted_failure else ""
         result.update(
             status="ERROR",
             execution="FAIL",
-            reason=f"Invalid or missing case artifact: {error}",
+            reason=(f"{original_reason}; " if original_reason else "")
+                   + f"Invalid or missing case artifact: {error}",
         )
     # Envelopes are owned by the runner, not trusted child-supplied metadata.
     result.update(
