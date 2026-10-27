@@ -46,9 +46,9 @@ conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --
 
 `--resume` without `--profile` inherits the report's recorded profile. Old `full` reports therefore remain exhaustive and multi-hour; they are never rewritten as representative reports. An explicit mismatched profile is rejected. Start a fresh default invocation to use the one-hour feature profile.
 
-The latest completed full run, `.cache/test-suite/20261026T133138.135583Z/` at revision `47c87d7`, tested 129 cases in **4 h 30 min 28 s** on 2026-10-26: **120 PASS, seven FAIL, and two TIMEOUT**, with no errors or blocked cases. Numerical/FE, functional transport, and desktop cases passed; the unchanged resolution-8 desktop benchmark measured **48.13 FPS**. Eight PINNs remained unsuccessful. The water precision case also failed: its last 524,288-history ensemble measured relative standard error **5.08554%**, above the strict 5% limit. These are historical results from the original report; the newer correction training, extended PINN deadlines, and fixed 1,048,576-history water case have not yet passed their nine canonical reruns.
+The original full run, `.cache/test-suite/20261026T133138.135583Z/` at revision `47c87d7`, tested 129 cases in **4 h 30 min 28 s** on 2026-10-26: **120 PASS, seven FAIL, and two TIMEOUT**, with no errors or blocked cases. Numerical/FE, functional transport, and desktop cases passed; the unchanged resolution-8 desktop benchmark measured **48.13 FPS**. Eight PINNs remained unsuccessful. The water precision case also failed: its last 524,288-history ensemble measured relative standard error **5.08554%**, above the strict 5% limit. A targeted method-5 resume on 2026-10-27 reran five near-miss PINNs: Iron, Regolith composite, and Freezing passed; Mushy Driven VMS failed its pressure error gate; Liquid Dynamo VMS timed out after CUDA OOM during L-BFGS recovery. Details are in [VALIDATION.md](VALIDATION.md#canonical-method-5-coupled-pinn-replay-2026-10-27). The fixed 1,048,576-history water case and other unsuccessful PINNs remain unqualified.
 
-The earlier 125-case run had 94 passes, 16 failures, five errors, one timeout, and nine blocked cases; its evidence remains under `.cache/test-suite/20261026T065717.373686Z/`. Neither completed report has been edited to change its outcome. Scientific results and broader qualification gates are documented in [VALIDATION.md](VALIDATION.md).
+The earlier 125-case run had 94 passes, 16 failures, five errors, one timeout, and nine blocked cases; its evidence remains under `.cache/test-suite/20261026T065717.373686Z/`. Attempt-0001 outcomes remain preserved. The resumed `report.json` now summarizes the selected ten-case run (eight PASS, one FAIL, one TIMEOUT) and retains 119 unselected results; this partial selection does not claim full coverage. Scientific results and broader qualification gates are documented in [VALIDATION.md](VALIDATION.md).
 
 ## Exhaustive finite coverage (`full`)
 
@@ -141,9 +141,9 @@ Exit code 0 means all selected required cases and gates passed; exit 1 means a f
 
 After a full run, share `report.json` and the logs for non-passing cases. Scientific accuracy failures will be investigated without weakening thresholds, followed by focused reruns and a complete resume.
 
-## Rerun the nine outstanding canonical cases
+## Rerun the outstanding PINN and water-precision cases
 
-The completed 129-case run already contains JSON and per-case text logs. The disabled PINN modes remain available to the research backend and retain their original scientific gates. To investigate its eight unsuccessful PINNs and retry water precision, including their prerequisites, use the explicit full profile:
+The original 129-case run and per-case logs remain available, including the first attempts for all eight unsuccessful PINNs. The 2026-10-27 method-5 replay qualified three of its five selected PINNs; one missed the pressure error gate and one timed out after a CUDA OOM during L-BFGS recovery. Those two cases, the other previously unsuccessful PINNs, and water precision still need passing evidence. The disabled PINN modes remain available to the research backend and retain their original scientific gates. Use the explicit full profile to retry those cases and include their prerequisites:
 
 ```powershell
 conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --resume ".cache/test-suite/20261026T133138.135583Z" --case "pinn.thermal.*" --case "pinn.preset.*" --case "pinn.fe.*" --case "dose.water-precision"

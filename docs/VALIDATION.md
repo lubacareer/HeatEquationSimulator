@@ -148,13 +148,14 @@ Failed models remain inspectable and are labelled failed in the scene and valida
 
 ## Full-suite follow-up (2026-10-26)
 
-The completed report at `.cache/test-suite/20261026T133138.135583Z/`, revision
-`47c87d7`, contains 129 cases: 120 PASS, seven FAIL, and two TIMEOUT after
-4 h 30 min 28 s. All numerical solves, functional transport cases, and desktop
-checks passed. The five-repeat desktop benchmark measured 48.13 FPS. Its eight
-unsuccessful PINN cases and water precision failure remain recorded unchanged.
-The final 524,288-history water ensemble measured 5.08554% relative standard
-error, correctly failing the 5% gate.
+The original attempt-0001 full-profile run at
+`.cache/test-suite/20261026T133138.135583Z/`, revision `47c87d7`, recorded 129
+cases: 120 PASS, seven FAIL, and two TIMEOUT after 4 h 30 min 28 s. All numerical
+solves, functional transport cases, and desktop checks passed. The five-repeat
+desktop benchmark measured 48.13 FPS. The attempt-0001 artifacts remain
+preserved. The 524,288-history water ensemble measured 5.08554% relative
+standard error, correctly failing the 5% gate. A later 10-case method-5 resume
+updated the report's selected-case summary; its results are recorded below.
 
 Both current profiles now use one fixed 1,048,576-history ensemble with the
 same seed, source, geometry, normalization, and physics list. Its projected
@@ -174,11 +175,13 @@ uses the original held-out field, loss, conservation, and source-identity gates.
 Cancelled or failed line searches now restore the pre-step weights, gradients,
 and optimizer state before propagating the error.
 
-The eight unsuccessful full-profile PINN cases have 3,600 s execution limits;
+The eight unsuccessful full-profile PINN cases had 3,600 s execution limits;
 feature case limits and the one-hour representative supervisor remain unchanged.
-Longer execution does not qualify an inaccurate model. New canonical fits and
-the enlarged water run remain pending. See [TEST_MATRIX.md](TEST_MATRIX.md#rerun-the-nine-outstanding-canonical-cases)
-for one targeted resume command and the separate one-hour default.
+Longer execution does not qualify an inaccurate model. The targeted five-case
+method-5 outcomes are recorded above; the failed and timed-out cases remain
+unqualified, as do the other unsuccessful PINNs and enlarged water run. See
+[TEST_MATRIX.md](TEST_MATRIX.md#rerun-the-outstanding-pinn-and-water-precision-cases)
+for the current targeted resume command and separate one-hour default.
 
 Private checkpoint pilots preserved the original source, checkpoint, and report
 hashes. They diagnose conditioning rather than replaying primary training:
@@ -235,6 +238,59 @@ resolution-8 five-repeat benchmark. Evidence:
 `.cache/conditioning-desktop-20261026/output.log`.
 The complete one-hour representative invocation and enlarged water ensemble
 remain pending; these short checks do not replace them.
+
+## Canonical method-5 coupled PINN replay (2026-10-27)
+
+The requested full-profile resume selected five accepted FE source cases and
+their five dependent PINNs. Source fingerprints required recomputing all five
+parents; all five source runs passed and the completed PINNs remained bound to
+their recorded source run IDs. Method 5 used seed 42, CUDA, batch size 256, and
+1,000 requested primary steps. Its training-only activation target remained
+0.05. Completed fits used 3,050 total optimization steps: 800 primary Adam,
+200 primary L-BFGS, 2,000 joint correction Adam, and 50 joint correction
+L-BFGS. No thresholds or physics objectives changed.
+
+| PINN case | Source run | Activated correction groups and triggering training diagnostics | Held-out MSE / physics MSE / boundary MSE | Maximum normalized field RMSE | Maximum independent residual RMS | Elapsed | Result |
+| --- | --- | --- | --- | --- | --- | ---: | --- |
+| Iron | `training-0f29303d2efd4826a2b4816f2b6e8000` | Elliptic (pressure 0.2039, electric potential 0.2413) and thermofluid (velocity 0.0830); maximum activation residual 0.04202 (charge) | 0.0011653 / 0.0002213 / 3.31e-37 | 0.06801 (pressure) | 0.04202 (charge) | 1000.61 s | **PASS** |
+| Regolith composite | `training-7c874db6c9b74a8fb754ea17924f5998` | Elliptic (pressure 0.1280, electric potential 0.06710); maximum activation residual 0.0008660 (charge) | 0.0009555 / 1.39e-7 / 8.84e-38 | 0.05955 (pressure) | 0.0008660 (charge) | 1039.98 s | **PASS** |
+| Mushy Driven VMS | `training-6481dcff0aac45308dc25f33f5dce3e1` | Elliptic (pressure 0.1603, electric potential 0.1396) and thermofluid (velocity 0.06520); maximum activation residual 0.007600 (charge) | 0.0025108 / 8.91e-6 / 1.32e-37 | **0.11633 (pressure)** | 0.007600 (charge) | 862.98 s | **FAIL** |
+| Liquid Dynamo VMS | No finalized PINN metadata | No correction activation recorded; primary L-BFGS reached epoch 862 before a CUDA out-of-memory error during rollback | Intermediate held-out MSE 0.010006 at epoch 860; no final loss audit | Not available | Not available | 3659.95 s | **TIMEOUT** |
+| Freezing | `training-f7a7eac9a1ae454db67eecb95b45e7b5` | Elliptic (pressure 0.1138); maximum activation residual 0.08493 (momentum) | 0.00005525 / 0.0007200 / 2.41e-64 | 0.01773 (pressure) | 0.07298 (momentum) | 723.36 s | **PASS** |
+
+The full training-only field and equation diagnostics, activation decisions,
+source hashes, optimizer stages, and actual step/evaluation counts are in each
+completed attempt's `training/*/metadata.json`; final checks are in its
+`result.json` and `runner-result.json`.
+
+The three passing cases satisfy the existing held-out, loss, field-error,
+independent-residual, conservation, and source-identity checks. Mushy Driven
+VMS completed all 3,050 steps and passed the held-out loss, physics/boundary
+loss, and residual checks, but pressure normalized RMSE was 0.11633, exceeding
+the unchanged 0.1 per-field limit. This is the measured reason its combined
+`heldout_and_conservation_gates` check failed; the other fields and residuals
+do not override that pressure failure.
+
+Liquid Dynamo VMS failed before a final audit. Its worker log shows CUDA out of
+memory while restoring weights during a bounded L-BFGS recovery at about 218 s,
+after progress reached primary epoch 862. The worker did not publish completed
+training metadata; the full-profile supervisor ultimately recorded TIMEOUT at
+3,659.95 s and qualification `NOT_RUN`. The intermediate loss is not a passing
+result. The retained attempt and diagnostics are under
+`.cache/test-suite/20261026T133138.135583Z/cases/pinn.fe.liquid.dynamo.vms/attempt-0002/`.
+
+The current report records the targeted selection as 10 cases: eight PASS
+(five sources and three PINNs), one FAIL, and one TIMEOUT. Its 119 unselected
+results remain retained, and full coverage remains false. The exact replay
+command was:
+
+```powershell
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --resume ".cache/test-suite/20261026T133138.135583Z" --case "pinn.preset.iron" --case "pinn.preset.regolith-composite" --case "pinn.fe.freezing" --case "pinn.fe.liquid.dynamo.vms" --case "pinn.fe.mushy.driven.vms"
+```
+
+These results do not enable additional desktop PINN modes or qualify the wider
+coupled family. The failed pressure case, Liquid Dynamo timeout, other previously
+unsuccessful PINNs, water precision, and complete profiles remain open.
 
 ## Bounded proposal experiments: 2026-10-26
 
