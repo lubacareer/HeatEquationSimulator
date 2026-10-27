@@ -31,9 +31,23 @@ except OSError as error:
 
 def create_linux_symlink(runner, source, destination):
     """Classify symlink errors using the platform that created the link."""
-    interpreter = "/usr/bin/python3" if runner else sys.executable
-    result = subprocess.run([*runner, interpreter, "-", str(source), str(destination)],
-                            input=_SYMLINK_PROBE, capture_output=True, text=True, timeout=30)
+    interpreter = (os.environ.get("MAGNETIC_TORUS_FE_PYTHON") or "python3") if runner else sys.executable
+    try:
+        if runner:
+            check = subprocess.run(
+                [*runner, "bash", "-s", "--", interpreter],
+                input='candidate=$(command -v -- "$1") && [[ -f "$candidate" && -x "$candidate" ]] '
+                      '&& printf "available\\n" || printf "missing\\n"\n',
+                capture_output=True, text=True, timeout=30,
+            )
+            if check.returncode or check.stdout.strip() not in {"available", "missing"}:
+                raise RuntimeError(f"WSL interpreter check failed unexpectedly: {check.stderr}")
+            if check.stdout.strip() == "missing":
+                raise unittest.SkipTest(f"Symlink test needs an available WSL Python interpreter: {interpreter}")
+        result = subprocess.run([*runner, interpreter, "-", str(source), str(destination)],
+                                input=_SYMLINK_PROBE, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"Symlink probe failed unexpectedly: {error}") from error
     if result.returncode == 0:
         return
     try:
@@ -264,12 +278,14 @@ class LinuxSymlinkProbeTests(unittest.TestCase):
     def test_host_limitations_and_unexpected_errors_are_distinct(self):
         def response(number, name):
             return subprocess.CompletedProcess([], 1, json.dumps({"errno": number, "name": name, "message": "fixture"}), "")
+        available = subprocess.CompletedProcess([], 0, "available\n", "")
         for number, name in ((13, "EACCES"), (38, "ENOSYS"), (95, "ENOTSUP"), (95, "EOPNOTSUPP")):
             with self.subTest(number=number, name=name):
-                with patch("test_setup_geant4.subprocess.run", return_value=response(number, name)) as run:
+                with (patch.dict(os.environ, {"MAGNETIC_TORUS_FE_PYTHON": ""}),
+                      patch("test_setup_geant4.subprocess.run", side_effect=[available, response(number, name)]) as run):
                     with self.assertRaisesRegex(unittest.SkipTest, r"\[host-inapplicable:symlink:"):
                         create_linux_symlink(["wsl", "--"], "/source", "/destination")
-                    self.assertEqual(run.call_args.args[0], ["wsl", "--", "/usr/bin/python3", "-", "/source", "/destination"])
+                    self.assertEqual(run.call_args.args[0], ["wsl", "--", "python3", "-", "/source", "/destination"])
         with patch("test_setup_geant4.subprocess.run", return_value=response(errno.ENOSPC, "ENOSPC")) as run:
             with self.assertRaises(OSError) as error:
                 create_linux_symlink([], "/source", "/destination")
@@ -277,12 +293,41 @@ class LinuxSymlinkProbeTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[0], [sys.executable, "-", "/source", "/destination"])
         for number, name in ((38, "ENOSPC"), (95, "ENOSYS"), (28, "ENOSPC")):
             with self.subTest(number=number, name=name):
-                with patch("test_setup_geant4.subprocess.run", return_value=response(number, name)):
+                with patch("test_setup_geant4.subprocess.run", side_effect=[available, response(number, name)]):
                     with self.assertRaises(OSError):
                         create_linux_symlink(["wsl", "--"], "/source", "/destination")
         with patch("test_setup_geant4.subprocess.run", return_value=subprocess.CompletedProcess([], 1, "not json", "missing Python")):
             with self.assertRaisesRegex(RuntimeError, "unexpectedly"):
                 create_linux_symlink([], "/source", "/destination")
+
+    def test_wsl_interpreter_selection_and_availability(self):
+        available = subprocess.CompletedProcess([], 0, "available\n", "")
+        success = subprocess.CompletedProcess([], 0, "", "")
+        for override, expected in ((None, "python3"), ("", "python3"), ("/opt/FE tools/python", "/opt/FE tools/python")):
+            with self.subTest(override=override):
+                env = {} if override is None else {"MAGNETIC_TORUS_FE_PYTHON": override}
+                with (patch.dict(os.environ, env, clear=True),
+                      patch("test_setup_geant4.subprocess.run", side_effect=[available, success]) as run):
+                    create_linux_symlink(["wsl", "--"], "/source", "/destination")
+                self.assertEqual(run.call_args_list[0].args[0][-1], expected)
+                self.assertEqual(run.call_args_list[1].args[0], ["wsl", "--", expected, "-", "/source", "/destination"])
+
+        missing = subprocess.CompletedProcess([], 0, "missing\n", "")
+        with patch("test_setup_geant4.subprocess.run", return_value=missing) as run:
+            with self.assertRaisesRegex(unittest.SkipTest, "available WSL Python interpreter"):
+                create_linux_symlink(["wsl", "--"], "/source", "/destination")
+            self.assertEqual(run.call_count, 1)
+
+        for failure in (subprocess.CompletedProcess([], 1, "", "WSL failed"),
+                        subprocess.CompletedProcess([], 0, "unexpected", ""), OSError("WSL failed")):
+            with self.subTest(failure=failure):
+                with patch("test_setup_geant4.subprocess.run", side_effect=[failure]):
+                    with self.assertRaisesRegex(RuntimeError, "unexpectedly"):
+                        create_linux_symlink(["wsl", "--"], "/source", "/destination")
+
+        with patch("test_setup_geant4.subprocess.run", side_effect=[available, subprocess.CompletedProcess([], 1, "bad", "failed")]):
+            with self.assertRaisesRegex(RuntimeError, "unexpectedly"):
+                create_linux_symlink(["wsl", "--"], "/source", "/destination")
 
 
 if __name__ == "__main__":

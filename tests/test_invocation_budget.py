@@ -489,26 +489,34 @@ class InvocationBudgetTests(unittest.TestCase):
                 return symlink_id
 
             def runTest(self):
-                with patch.object(test_setup_geant4.subprocess, "run", return_value=probe):
-                    test_setup_geant4.create_linux_symlink(["wsl", "--"], "/source", "/destination")
+                test_setup_geant4.create_linux_symlink(["wsl", "--"], "/source", "/destination")
 
         class ApplicableTest(unittest.TestCase):
             def runTest(self):
                 pass
 
-        with (patch.object(sys, "argv", ["worker", "--request", str(request), "--result", str(output)]),
-              patch.object(sys, "path", list(sys.path)),
-              patch.object(unittest.defaultTestLoader, "discover",
-                           return_value=unittest.TestSuite([ApplicableTest(), SymlinkProbe()])),
-              patch.object(worker, "os", SimpleNamespace(name="nt")),
-              patch.object(sys, "stderr", io.StringIO())):
-            self.assertEqual(worker.main(), 0)
-        record = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(record["status"], "PASS")
-        self.assertEqual(record["metrics"]["tests_executed"], 1)
-        self.assertEqual(record["skipped"][0]["test"], symlink_id)
-        self.assertEqual(record["skipped"][0]["classification"], "NOT_APPLICABLE")
-        self.assertIn(":95:none:linux:EOPNOTSUPP]", record["skipped"][0]["reason"])
+        for available in (True, False):
+            with self.subTest(interpreter_available=available):
+                availability = subprocess.CompletedProcess([], 0, "available\n" if available else "missing\n", "")
+                responses = [availability, probe] if available else [availability]
+                with (patch.object(sys, "argv", ["worker", "--request", str(request), "--result", str(output)]),
+                      patch.object(sys, "path", list(sys.path)),
+                      patch.object(unittest.defaultTestLoader, "discover",
+                                   return_value=unittest.TestSuite([ApplicableTest(), SymlinkProbe()])),
+                      patch.object(worker, "os", SimpleNamespace(name="nt")),
+                      patch.object(test_setup_geant4.subprocess, "run", side_effect=responses) as run,
+                      patch.object(sys, "stderr", io.StringIO())):
+                    self.assertEqual(worker.main(), 0 if available else 1)
+                record = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(run.call_count, 2 if available else 1)
+                self.assertEqual(record["status"], "PASS" if available else "FAIL")
+                self.assertEqual(record["metrics"]["tests_executed"], 1)
+                self.assertEqual(record["skipped"][0]["test"], symlink_id)
+                self.assertEqual(record["skipped"][0]["classification"], "NOT_APPLICABLE" if available else "MISSING")
+                if available:
+                    self.assertIn(":95:none:linux:EOPNOTSUPP]", record["skipped"][0]["reason"])
+                else:
+                    self.assertIn("interpreter", record["skipped"][0]["reason"].lower())
 
     def test_host_skip_rules_and_html_keep_reasons_visible(self):
         windows_id = "test_torus_publication.JobPublicationTests.test_transport_request_paths_survive_publication"
