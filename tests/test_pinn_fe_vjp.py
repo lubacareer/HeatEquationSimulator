@@ -1,7 +1,12 @@
 """The global FE loss and its neural gradients survive bounded recomputation."""
 
 from dataclasses import replace
+import hashlib
+import json
 import os
+from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -17,6 +22,7 @@ except ImportError:
 from magnetic_torus.learning import training
 from magnetic_torus.learning.corrections import create_correction_model
 from magnetic_torus.models import SimulationCancelled
+from magnetic_torus.store import RunStore
 from test_pinn_research_scaling import tiny_fe_source
 
 
@@ -127,6 +133,46 @@ class GlobalFEGradientTests(unittest.TestCase):
             for offload in (False, True):
                 with self.subTest(correction=correction, offload=offload):
                     self.compare_pair("cuda", correction=correction, offload=offload)
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_verification_resolves_paths_from_external_caller(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(prefix="fe vjp external ") as temporary:
+            base = Path(temporary)
+            run = self.make_run(base, "cpu")
+            source = run.field.data.result
+            source_path = RunStore(base / "source data").save_run(source)
+            checkpoint = base / "checkpoint data" / "trained model.pt"
+            checkpoint.parent.mkdir()
+            training._checkpoint(checkpoint, run.field.model, run.optimizer, 0, source,
+                                 run.field.data.scaling, run.history, run.metadata)
+            original = {path: hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in (source_path, checkpoint)}
+            caller = base / "caller directory"
+            caller.mkdir()
+            report = caller / "result directory" / "probe result.json"
+            def relative(path):
+                return os.path.relpath(path, caller)
+            command = [sys.executable, "-B", str(root / "scripts" / "verify_pinn_fe_vjp.py"),
+                       "--source", relative(source_path), "--checkpoint", relative(checkpoint),
+                       "--output", relative(report), "--device", "cuda", "--seconds", "90"]
+            completed = subprocess.run(command, cwd=caller, capture_output=True, text=True, timeout=100)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            child = report.with_name("probe result-child.json")
+            log = report.with_name("probe result-child.log")
+            self.assertTrue(report.is_file())
+            self.assertTrue(child.is_file())
+            self.assertTrue(log.is_file())
+            self.assertEqual(json.loads(report.read_text())["status"], "PASS")
+            self.assertEqual(json.loads(child.read_text())["status"], "PASS")
+            for path, expected in original.items():
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected)
+            # Existing output must be rejected without overwriting any evidence.
+            old_report = report.read_bytes()
+            repeated = subprocess.run(command, cwd=caller, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(repeated.returncode, 0)
+            self.assertIn("Choose a new output file", repeated.stderr)
+            self.assertEqual(report.read_bytes(), old_report)
 
 
 if __name__ == "__main__":

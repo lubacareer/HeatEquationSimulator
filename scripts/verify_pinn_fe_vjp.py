@@ -26,6 +26,9 @@ def main() -> int:
     parser.add_argument("--seconds", type=int, default=120)
     parser.add_argument("--_child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.source = args.source.resolve()
+    args.checkpoint = args.checkpoint.resolve()
+    args.output = args.output.resolve()
     if args.seconds < 1:
         parser.error("The time limit must be positive.")
     if args.output.exists():
