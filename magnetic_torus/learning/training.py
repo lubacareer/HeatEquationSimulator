@@ -412,16 +412,11 @@ class TrainingLosses:
         fraction = fields["liquid_fraction"].reshape(2, len(support))[1, positions]
         return {"residual": residual, "initial_error": initial_error, "liquid_fraction": fraction}
 
-    def coupled_components(self, ti: int) -> Mapping[str, Any]:
+    def _coupled_components_for_fields(self, ti: int, fields: Mapping[str, Any]) -> Mapping[str, Any]:
         field = self.field
         data = field.data
         torch = field.torch
         assert data.weak is not None
-        tids = np.repeat(np.array([ti - 1, ti], dtype=np.int64), data.point_count)
-        pids = np.tile(np.arange(data.point_count, dtype=np.int64), 2)
-        values = field.predict(field.input_at(tids, pids), pids, tids,
-                               forward_batch_size=_FULL_LABEL_BATCH_SIZE)
-        fields = {key: value.reshape((2, data.point_count) + value.shape[1:]) for key, value in values.items()}
         components = data.weak(data.config, data.result, fields, np.asarray([ti - 1, ti], dtype=np.int64))
         if not isinstance(components, Mapping) or not components:
             raise UnsupportedPINNConfiguration("The coupled FE adapter returned no weak residuals.")
@@ -434,15 +429,87 @@ class TrainingLosses:
                 raise ValueError(f"The FE PINN residual {key} is non-finite or detached from the neural fields.")
         return components
 
-    def coupled_physics(self, ti: int | None = None) -> tuple[Any, Any]:
-        data, torch = self.field.data, self.field.torch
-        ti = int(data.rng.integers(1, data.snapshot_count)) if ti is None else ti
-        # Adapter residuals are nondimensionalized by the exact worker scales.
+    def coupled_components(self, ti: int) -> Mapping[str, Any]:
+        field = self.field
+        data = field.data
+        tids = np.repeat(np.array([ti - 1, ti], dtype=np.int64), data.point_count)
+        pids = np.tile(np.arange(data.point_count, dtype=np.int64), 2)
+        values = field.predict(field.input_at(tids, pids), pids, tids,
+                               forward_batch_size=_FULL_LABEL_BATCH_SIZE)
+        fields = {key: value.reshape((2, data.point_count) + value.shape[1:]) for key, value in values.items()}
+        return self._coupled_components_for_fields(ti, fields)
+
+    def _coupled_component_losses(self, components: Mapping[str, Any]) -> tuple[Any, Any]:
+        torch = self.field.torch
         physics_terms, boundary_terms = [], []
-        for key, value in self.coupled_components(ti).items():
+        for key, value in components.items():
             (boundary_terms if key.startswith("boundary") else physics_terms).append(value.square().mean())
         return torch.stack(physics_terms).mean(), (torch.stack(boundary_terms).mean() if boundary_terms else
                                                    torch.zeros((), **self.field.kw))
+
+    def coupled_physics(self, ti: int | None = None) -> tuple[Any, Any]:
+        data = self.field.data
+        ti = int(data.rng.integers(1, data.snapshot_count)) if ti is None else ti
+        # Adapter residuals are nondimensionalized by the exact worker scales.
+        return self._coupled_component_losses(self.coupled_components(ti))
+
+    def coupled_physics_backprop(self, ti: int, *, weight: float = 1., batch_size: int = 1024,
+                                 offload_saved_tensors: bool = False) -> tuple[Any, Any]:
+        """Backpropagate the unchanged global FE loss through bounded neural chunks.
+
+        The FE assembly and its reduction still cover the entire snapshot pair.
+        Independent leaf fields first yield the global loss cotangents. Recomputing
+        all neural outputs per chunk then applies their chain rule, including the
+        enthalpy-derived temperature and fraction and unused field cotangents.
+        """
+        from contextlib import nullcontext
+
+        field, data, torch = self.field, self.field.data, self.field.torch
+        if data.thermal or data.weak is None:
+            raise ValueError("Global FE cotangents require a coupled weak operator.")
+        if not 1 <= ti < data.snapshot_count:
+            raise ValueError("Global FE cotangents require a consecutive accepted snapshot pair.")
+        if not 1 <= batch_size <= _FULL_LABEL_BATCH_SIZE or not math.isfinite(weight):
+            raise ValueError("Invalid FE cotangent batch size or loss weight.")
+        _cancelled(self.cancel)
+        tids = np.repeat(np.array([ti - 1, ti], dtype=np.int64), data.point_count)
+        pids = np.tile(np.arange(data.point_count, dtype=np.int64), 2)
+        with torch.no_grad():
+            values = field.predict(field.input_at(tids, pids), pids, tids,
+                                   forward_batch_size=batch_size)
+        leaves = {name: value.reshape((2, data.point_count) + value.shape[1:]).detach().requires_grad_(True)
+                  for name, value in values.items()}
+        del values
+        context = (torch.autograd.graph.save_on_cpu(pin_memory=False)
+                   if offload_saved_tensors and field.device.type == "cuda" else nullcontext())
+        with context:
+            components = self._coupled_components_for_fields(ti, leaves)
+            physics, boundary = self._coupled_component_losses(components)
+            objective = weight * (physics + boundary)
+            if not bool(torch.isfinite(objective)):
+                raise FloatingPointError("PINN physics objective became non-finite.")
+            cotangents = torch.autograd.grad(objective, tuple(leaves.values()), allow_unused=True)
+        physics_value, boundary_value = physics.detach(), boundary.detach()
+        cotangents = {name: None if gradient is None else gradient.detach().reshape((len(tids),) + gradient.shape[2:])
+                      for name, gradient in zip(leaves, cotangents)}
+        del components, objective, physics, boundary, leaves
+        _cancelled(self.cancel)
+        for start in range(0, len(tids), batch_size):
+            _cancelled(self.cancel)
+            stop = min(start + batch_size, len(tids))
+            chunk_tids, chunk_pids = tids[start:stop], pids[start:stop]
+            predicted = field.predict(field.input_at(chunk_tids, chunk_pids), chunk_pids, chunk_tids,
+                                      forward_batch_size=batch_size)
+            outputs, gradients = [], []
+            for name, value in predicted.items():
+                gradient = cotangents[name]
+                if gradient is not None and value.requires_grad:
+                    outputs.append(value)
+                    gradients.append(gradient[start:stop])
+            if outputs:
+                torch.autograd.backward(outputs, gradients)
+            _cancelled(self.cancel)
+        return physics_value, boundary_value
 
 
 @dataclass
@@ -663,6 +730,7 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
         "max_forward_batch": max(field.maximum_batch, field.full_label_batch_size),
         "stochastic_label_batch_size": field.maximum_batch,
         "full_label_batch_size": field.full_label_batch_size,
+        "coupled_refinement_gradient": "full graph",
         "host_training_cache_bytes": data.cache.nbytes if data.cache is not None else 0,
         "host_training_cache_limit_bytes": _HOST_TRAINING_CACHE_BYTES,
         "host_training_cache_scope": "training targets and fixed coordinates only; streaming fallback above limit",
@@ -724,7 +792,9 @@ def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: 
 
 
 def _deterministic_objective(run: TrainingRun, indices: np.ndarray, centers: np.ndarray,
-                             *, backward: bool) -> dict[str, Any]:
+                             *, backward: bool, coupled_vjp: bool | None = None,
+                             offload_saved_tensors: bool = False,
+                             vjp_batch_size: int = 1024) -> dict[str, Any]:
     """A fixed training objective, streamed without retaining all batch graphs."""
     losses, field = run.losses, run.field
     data_loss = losses.stream_training_loss(backward=backward)
@@ -732,12 +802,20 @@ def _deterministic_objective(run: TrainingRun, indices: np.ndarray, centers: np.
     boundary_loss = field.torch.zeros((), **field.kw)
     for index in indices:
         _cancelled(losses.cancel)
-        physics, boundary = (losses.thermal_physics(int(index), centers) if field.data.thermal
-                             else losses.coupled_physics(int(index)))
+        # The global FE VJP is available for bounded probes. Measurements on
+        # the reference GPU selected the faster full graph for the normal path.
+        use_vjp = backward and not field.data.thermal and bool(coupled_vjp)
+        if use_vjp:
+            physics, boundary = losses.coupled_physics_backprop(
+                int(index), weight=1. / len(indices), batch_size=vjp_batch_size,
+                offload_saved_tensors=offload_saved_tensors)
+        else:
+            physics, boundary = (losses.thermal_physics(int(index), centers) if field.data.thermal
+                                 else losses.coupled_physics(int(index)))
         loss = (physics + boundary) / len(indices)
         if not bool(field.torch.isfinite(loss)):
             raise FloatingPointError("PINN physics objective became non-finite.")
-        if backward:
+        if backward and not use_vjp:
             loss.backward()
         physics_loss += physics.detach() / len(indices)
         boundary_loss += boundary.detach() / len(indices)
@@ -779,9 +857,15 @@ def _bounded_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Ca
     except _RefinementEvaluationBudget:
         restore()
         return evaluations, True
-    except BaseException:
+    except BaseException as error:
         # PyTorch may still have trial weights installed when a closure fails.
-        restore()
+        try:
+            restore()
+        except BaseException as rollback_error:
+            # Retain the original failure when CUDA is too exhausted to restore.
+            # The caller must discard this optimizer/model and may not publish it.
+            if hasattr(error, "add_note"):
+                error.add_note(f"L-BFGS rollback also failed: {type(rollback_error).__name__}: {rollback_error}")
         raise
     return evaluations, False
 
