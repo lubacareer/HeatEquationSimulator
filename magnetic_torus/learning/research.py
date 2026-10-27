@@ -161,9 +161,13 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
             torch.manual_seed(data.config.seed)
             field.model = create_film_model(torch=torch).to(field.device)
     elif options.architecture == "temporal-phi":
-        from .gauge import create_temporal_gauge_model
-        normalized_times = (source_copy.times - field.start_time) / field.time_scale
-        field.model = create_temporal_gauge_model(field.model, normalized_times, torch=torch)
+        from .gauge import TEMPORAL_GAUGE_ARCHITECTURE, create_temporal_gauge_model
+        if isinstance(field.model, torch.nn.Sequential):
+            normalized_times = (source_copy.times - field.start_time) / field.time_scale
+            field.model = create_temporal_gauge_model(field.model, normalized_times, torch=torch)
+        elif (not hasattr(field.model, "architecture_metadata")
+              or field.model.architecture_metadata().get("kind") != TEMPORAL_GAUGE_ARCHITECTURE):
+            raise ValueError("Temporal phi warm starts require a source-bound core or temporal phi checkpoint.")
     elif options.architecture == "pressure-fourier":
         field.model = create_pressure_fourier_model(field.model, torch=torch)
     if hasattr(field.model, "architecture_metadata"):

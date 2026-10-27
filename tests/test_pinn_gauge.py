@@ -6,7 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -19,6 +21,7 @@ from magnetic_torus.learning.fields import _make_network
 from magnetic_torus.learning.gauge import create_temporal_gauge_model
 from magnetic_torus.learning.corrections import restore_model_from_checkpoint
 from test_pinn_correction_model import source_run, checkpoint_for
+from test_pinn_research_scaling import tiny_fe_source
 import test_pinn_conditioning as conditioning
 
 SUITE_CAPABILITIES = ("torch_cpu",)
@@ -244,6 +247,88 @@ class TemporalGaugeTests(unittest.TestCase):
                 altered["model_state"]["normalized_times"][-1] = .5
             with self.subTest(location=location), self.assertRaises(ValueError):
                 restore_model_from_checkpoint(altered, source)
+
+    def test_research_warm_start_reuses_its_temporal_checkpoint(self):
+        from magnetic_torus.learning import research, training
+        from magnetic_torus.learning.corrections import create_correction_model
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"MAGNETIC_TORUS_PINN_DEVICE": "cpu"}
+        ):
+            root = Path(directory)
+            source = tiny_fe_source(root)
+            data = training._prepare_data(source, threading.Event())
+            run = training._prepare_training(data, lambda *_: None, threading.Event(), None)
+            initial = root / "core.pt"
+            training._checkpoint(initial, run.field.model, run.optimizer, 0, source,
+                                 data.scaling, run.history, run.metadata)
+            options = research.ResearchOptions(architecture="temporal-phi", adam_steps=2,
+                                                lbfgs_steps=0, seconds=30.)
+            copied, first, evidence = research.run_research(
+                source, options, lambda *_: None, threading.Event(), root / "first", initial
+            )
+            self.assertTrue(evidence["completed"])
+            generated_checkpoint = Path(first.metadata["checkpoint_path"])
+            # The tiny all-zero FE fixture can have no potential gradient. Give
+            # the produced checkpoint a nonzero prior correction so the retry
+            # cannot silently reset it and still pass this regression.
+            payload = torch.load(generated_checkpoint, map_location="cpu", weights_only=True)
+            payload["model_state"]["phi_bias"] = torch.tensor([.25, -.4], dtype=torch.float64)
+            checkpoint = root / "warm-start.pt"
+            torch.save(payload, checkpoint)
+            original_bytes = checkpoint.read_bytes()
+            model = restore_model_from_checkpoint(checkpoint, copied)
+            self.assertTrue(torch.count_nonzero(model.phi_bias).item())
+            sample = self.inputs([0., .25, .5, .75, 1.])
+            expected_prediction = model(sample).detach().clone()
+            expected_bias = model.phi_bias.detach().clone()
+            expected_core = deepcopy(model.core.state_dict())
+            captured = {}
+            original_validation = training.TrainingLosses.validation_loss
+
+            def capture_pre_training(losses):
+                if not captured:
+                    candidate = losses.field.model
+                    captured.update(prediction=candidate(sample).detach().clone(),
+                                    bias=candidate.phi_bias.detach().clone(),
+                                    architecture=candidate.architecture_metadata(),
+                                    core_frozen=all(not parameter.requires_grad for parameter in candidate.core.parameters()))
+                return original_validation(losses)
+
+            with patch.object(training.TrainingLosses, "validation_loss", capture_pre_training):
+                resumed_source, second, resumed = research.run_research(
+                    copied, options, lambda *_: None, threading.Event(), root / "second", checkpoint
+                )
+            self.assertTrue(resumed["completed"])
+            self.assertTrue(torch.equal(captured["prediction"], expected_prediction))
+            self.assertTrue(torch.equal(captured["bias"], expected_bias))
+            self.assertEqual(captured["architecture"], model.architecture_metadata())
+            self.assertTrue(captured["core_frozen"])
+            self.assertEqual(second.metadata["research_warm_start"]["source_run_id"], copied.run_id)
+            self.assertEqual(second.metadata["optimizer_steps_completed"]["adam"], 2)
+            self.assertEqual(checkpoint.read_bytes(), original_bytes)
+            restored = restore_model_from_checkpoint(second.metadata["checkpoint_path"], resumed_source)
+            for name, value in expected_core.items():
+                self.assertTrue(torch.equal(restored.core.state_dict()[name], value), name)
+
+            with self.assertRaisesRegex(ValueError, "different source"):
+                research.run_research(source, options, lambda *_: None, threading.Event(),
+                                      root / "wrong-source", checkpoint)
+            payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            payload["metadata"]["architecture"]["normalized_times"][1] += .01
+            bad_knots = root / "bad-knots.pt"
+            torch.save(payload, bad_knots)
+            with self.assertRaisesRegex(ValueError, "knots"):
+                research.run_research(copied, options, lambda *_: None, threading.Event(),
+                                      root / "bad-knots", bad_knots)
+            correction = create_correction_model(run.field.model, ("elliptic",), torch=torch)
+            correction_path = root / "correction.pt"
+            training._checkpoint(correction_path, correction, torch.optim.Adam(correction.parameters()),
+                                 0, source, data.scaling, run.history,
+                                 {**run.metadata, "architecture": correction.architecture_metadata()})
+            with self.assertRaisesRegex(ValueError, "source-bound core or temporal phi checkpoint"):
+                research.run_research(source, options, lambda *_: None, threading.Event(),
+                                      root / "wrong-architecture", correction_path)
 
 
 class LazyGaugeImportTests(unittest.TestCase):
