@@ -23,6 +23,15 @@ from .fields import _cancelled, validate_pinn_source
 from .validation import validate_prediction
 
 
+class ResearchPilotTimeout(SimulationCancelled):
+    """A pressure pilot expired before completing its independent audit."""
+
+    def __init__(self, steps: int, elapsed_s: float):
+        super().__init__("The pressure research deadline expired before qualification.")
+        self.steps = steps
+        self.elapsed_s = elapsed_s
+
+
 @dataclass(frozen=True)
 class ResearchOptions:
     strategy: str = "uniform"
@@ -35,10 +44,15 @@ class ResearchOptions:
     causal_floor: float = .05
 
     def validate(self) -> ResearchOptions:
-        if self.strategy not in {"uniform", "front", "causal", "front-causal"}:
+        if self.strategy not in {"uniform", "front", "causal", "front-causal", "temporal-pressure"}:
             raise ValueError("Unknown research sampling strategy.")
-        if self.architecture not in {"mlp", "film", "temporal-phi"}:
+        if self.architecture not in {"mlp", "film", "temporal-phi", "method5", "pressure-fourier"}:
             raise ValueError("Unknown research architecture.")
+        if self.strategy == "temporal-pressure" and self.architecture != "method5":
+            raise ValueError("Temporal pressure sampling requires the method5 research architecture.")
+        if (self.architecture in {"method5", "pressure-fourier"}
+                and (self.strategy not in {"uniform", "temporal-pressure"} or self.balance_labels)):
+            raise ValueError("Method-5 pressure pilots retain the original joint objective.")
         if (not isinstance(self.adam_steps, int) or isinstance(self.adam_steps, bool)
                 or not isinstance(self.lbfgs_steps, int) or isinstance(self.lbfgs_steps, bool)
                 or self.adam_steps < 0 or self.lbfgs_steps < 0
@@ -76,11 +90,15 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
     deadline = start + options.seconds
     _cancelled(cancel)
     from .curriculum import CausalWeights, LabelGradientBalancer, TimeLabelSampler
-    from .corrections import restore_model_from_checkpoint
+    from .corrections import (CORRECTION_ARCHITECTURE, create_correction_model,
+                              create_pressure_fourier_model, restore_model_from_checkpoint)
     from .research_scaling import fit_training_weak_scales
     from .sampling import FrontResidualSampler
 
     thermal = source.config.solver == "thermal_benchmark"
+    method5_pilot = options.architecture in {"method5", "pressure-fourier"}
+    if method5_pilot and checkpoint is None:
+        raise ValueError("Method-5 pressure pilots require an explicit source-bound pretrained checkpoint.")
     if options.architecture != "mlp" and thermal:
         raise ValueError("The experimental time architectures require a coupled FE source.")
     if "front" in options.strategy and not thermal:
@@ -110,6 +128,14 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
         field.model = restore_model_from_checkpoint(payload, source, str(field.device))
         if options.architecture == "mlp" and not isinstance(field.model, torch.nn.Sequential):
             raise ValueError("MLP research warm starts require a legacy Sequential checkpoint; inspect other architectures with their source-bound loader.")
+        cloned_sequential_core = False
+        if method5_pilot:
+            if isinstance(field.model, torch.nn.Sequential):
+                field.model = create_correction_model(field.model, ("elliptic", "thermofluid"), torch=torch)
+                cloned_sequential_core = True
+            elif (not hasattr(field.model, "architecture_metadata")
+                    or field.model.architecture_metadata().get("kind") != CORRECTION_ARCHITECTURE):
+                raise ValueError("Method-5 pressure pilots require a source-bound core or correction checkpoint.")
         if (tuple(payload.get("field_names", ())) != data.scaling.names
                 or tuple(payload.get("field_widths", ())) != data.scaling.widths
                 or not np.array_equal(payload.get("field_offsets"), data.scaling.offsets)
@@ -117,7 +143,8 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
             raise ValueError("Warm-start normalization differs from this training split; use a fresh model.")
         run.metadata["research_warm_start"] = {"checkpoint_sha256": sha256(checkpoint_bytes).hexdigest(),
             "source_run_id": source.run_id, "source_config_hash": source.config.config_hash,
-            "checkpoint_epoch": int(payload["epoch"]), "explicit": True}
+            "checkpoint_epoch": int(payload["epoch"]), "explicit": True,
+            "cloned_sequential_core": cloned_sequential_core}
     if options.architecture == "film":
         from .modulation import create_film_model
         if 2 * data.point_count * data.output_width * 3 > 2_000_000:
@@ -130,11 +157,18 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
         from .gauge import create_temporal_gauge_model
         normalized_times = (source_copy.times - field.start_time) / field.time_scale
         field.model = create_temporal_gauge_model(field.model, normalized_times, torch=torch)
+    elif options.architecture == "pressure-fourier":
+        field.model = create_pressure_fourier_model(field.model, torch=torch)
     if hasattr(field.model, "architecture_metadata"):
         run.metadata["architecture"] = field.model.architecture_metadata()
     parameters = tuple(parameter for parameter in field.model.parameters() if parameter.requires_grad)
     run.optimizer = torch.optim.Adam(parameters, lr=1e-3)
     labels = TimeLabelSampler(run.losses, seed=data.config.seed ^ 0xA11CE)
+    if options.strategy == "temporal-pressure":
+        from .pressure_pilots import PressureTemporalSampler
+        pressure_sampler = PressureTemporalSampler(run.losses)
+    else:
+        pressure_sampler = None
     time_rng = np.random.default_rng(data.config.seed ^ 0x71AE)
     sampler = FrontResidualSampler(data.config.seed ^ 0xF20A7) if "front" in options.strategy else None
     causal = CausalWeights(data.snapshot_count, epsilon=options.causal_epsilon,
@@ -152,7 +186,8 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
                    "adam": {"steps": options.adam_steps}, "lbfgs": {"steps": options.lbfgs_steps, "closure_evaluation_cap": 8}},
         research_training_weak_scales=training_scales,
         research_weak_normalization="training labels only; original oracle restored for final qualification",
-        research_label_sampling="same-accepted-time stratified free-DOF training labels; separate seeded RNG",
+        research_label_sampling=("method-5 free-DOF stratified training labels" if method5_pilot else
+            "same-accepted-time stratified free-DOF training labels; separate seeded RNG"),
         research_physics_evaluations={"adam": 0, "causal_bootstrap": 0},
         research_completed=False)
     initial_validation = run.losses.validation_loss()
@@ -211,12 +246,14 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
             field.model.train()
             run.optimizer.zero_grad(set_to_none=True)
             ti = int(time_rng.integers(1, data.snapshot_count))
-            components = labels.components(ti)
+            components = {} if method5_pilot else labels.components(ti)
             if initial_norms is None and components:
                 initial_norms = _label_gradient_norms(components, parameters, torch)
-            label_loss = (balancer.combine(components, parameters, step) if balancer is not None
-                          else torch.stack(tuple(components.values())).mean() if components
-                          else parameters[0].sum() * 0.)
+            label_loss = (pressure_sampler.sampled_loss() if pressure_sampler is not None else
+                          run.losses.sampled_training_loss() if method5_pilot else
+                          balancer.combine(components, parameters, step) if balancer is not None else
+                          torch.stack(tuple(components.values())).mean() if components else
+                          parameters[0].sum() * 0.)
             if thermal:
                 if sampler is None:
                     centers = time_rng.choice(data.point_count, min(field.maximum_batch, data.point_count), replace=False)
@@ -269,44 +306,81 @@ def run_research(source: RunResult, options: ResearchOptions, progress: Progress
         timed_out = time.monotonic() - start >= options.seconds
         stopped = str(error)
     finally:
-        timer.cancel()
+        if not method5_pilot or not completed:
+            timer.cancel()
     training_seconds = time.monotonic() - start
     _cancelled_after_training = cancel.is_set()
-    cancel.clear()
-    # Restore precisely the original source oracle. Neither training-only
-    # scales, causal weights nor importance proposals enter qualification.
-    field.data = replace(field.data, weak=original_weak)
-    run.metadata.update(research_completed=completed, research_training_seconds=training_seconds,
-                        research_initial_label_gradient_norms=initial_norms,
-                        research_label_sampler=labels.metadata())
-    if sampler is not None:
-        run.metadata["research_front_sampler"] = sampler.metadata()
-    if causal is not None:
-        run.metadata["research_causal"] = causal.metadata()
-    if balancer is not None:
-        run.metadata["research_label_balancer"] = balancer.metadata()
-    if not run.history["epoch"]:
-        # No optimizer step completed; keep the accepted initial model's
-        # diagnostics without inventing a training step.
-        run.history = {key: [0.] for key in run.history}
-        run.metadata.update(actual_training_steps=0, training_epochs=0)
-    terms = base._deterministic_objective(run, panels, fixed_centers, backward=False)
-    run.metadata["function_evaluations"]["final_objective"] += 1
-    for key, value in terms.items():
-        run.history[key][-1] = float(value.detach())
-    run.history["validation_loss"][-1] = run.losses.validation_loss()
-    predicted = base._predict_fields(run, progress, cancel)
-    metrics = validate_prediction(run, predicted, initial_validation, progress, cancel)
-    scientific_status = run.metadata["validation_status"]
-    if not completed:
-        run.metadata["validation_status"] = "failed"
-    run.metadata["research_scientific_gate_status"] = scientific_status
-    candidate = base._assemble_result(run, predicted, metrics, progress, cancel)
-    validate_pinn_source(candidate, source_copy)
-    if _cancelled_after_training:
-        cancel.set()
-    evidence = {"completed": completed, "timed_out": timed_out, "stop_reason": stopped,
-        "scientific_gate_status": scientific_status,
-        "status": "PASS" if completed and scientific_status == "passed" else "FAIL" if completed else "TIMEOUT" if timed_out else "INTERRUPTED",
-        "training_seconds": training_seconds, "elapsed_s": time.monotonic() - start}
-    return source_copy, candidate, evidence
+    if method5_pilot and not completed:
+        if timed_out:
+            raise ResearchPilotTimeout(len(run.history["epoch"]), training_seconds)
+        raise SimulationCancelled(stopped or "Pressure research was cancelled.")
+    if not method5_pilot:
+        cancel.clear()
+
+    def finish():
+        if method5_pilot:
+            # Selection uses the same FE equations normalized on training labels.
+            selection_terms = base._deterministic_objective(run, panels, fixed_centers, backward=False)
+            diagnostics = base._training_diagnostics(run, panels)
+            run.metadata["research_selection"] = {
+                "source": "training labels and training-normalized raw equations only",
+                "pressure_normalized_rmse": diagnostics["fields"].get("pressure"),
+                "maximum_residual_rms": max(diagnostics["residuals"].values(), default=0.),
+                "physics_loss": float(selection_terms["physics_loss"].detach()),
+                "boundary_loss": float(selection_terms["boundary_loss"].detach()),
+                "diagnostics": diagnostics,
+                "eligible": completed,
+            }
+        # Restore the original source oracle for final qualification.
+        field.data = replace(field.data, weak=original_weak)
+        run.metadata.update(research_completed=completed, research_training_seconds=training_seconds,
+                            research_initial_label_gradient_norms=initial_norms,
+                            research_label_sampler=labels.metadata())
+        if pressure_sampler is not None:
+            run.metadata["research_pressure_sampler"] = pressure_sampler.metadata()
+        if sampler is not None:
+            run.metadata["research_front_sampler"] = sampler.metadata()
+        if causal is not None:
+            run.metadata["research_causal"] = causal.metadata()
+        if balancer is not None:
+            run.metadata["research_label_balancer"] = balancer.metadata()
+        if not run.history["epoch"]:
+            run.history = {key: [0.] for key in run.history}
+            run.metadata.update(actual_training_steps=0, training_epochs=0)
+        terms = base._deterministic_objective(run, panels, fixed_centers, backward=False)
+        run.metadata["function_evaluations"]["final_objective"] += 1
+        for key, value in terms.items():
+            run.history[key][-1] = float(value.detach())
+        run.history["validation_loss"][-1] = run.losses.validation_loss()
+        predicted = base._predict_fields(run, progress, cancel)
+        metrics = validate_prediction(run, predicted, initial_validation, progress, cancel)
+        scientific_status = run.metadata["validation_status"]
+        if not completed:
+            run.metadata["validation_status"] = "failed"
+        run.metadata["research_scientific_gate_status"] = scientific_status
+        candidate = base._assemble_result(run, predicted, metrics, progress, cancel)
+        validate_pinn_source(candidate, source_copy)
+        if method5_pilot and cancel.is_set():
+            # A deadline or interruption during atomic checkpoint publication
+            # must not leave a qualified pilot checkpoint behind.
+            if run.checkpoint_path is not None:
+                run.checkpoint_path.unlink(missing_ok=True)
+            _cancelled(cancel)
+        if _cancelled_after_training:
+            cancel.set()
+        evidence = {"completed": completed, "timed_out": timed_out, "stop_reason": stopped,
+            "scientific_gate_status": scientific_status,
+            "status": "PASS" if completed and scientific_status == "passed" else "FAIL" if completed else "TIMEOUT" if timed_out else "INTERRUPTED",
+            "training_seconds": training_seconds, "elapsed_s": time.monotonic() - start}
+        if method5_pilot:
+            evidence["training_only_selection"] = run.metadata["research_selection"]
+        return source_copy, candidate, evidence
+
+    try:
+        return finish()
+    except SimulationCancelled as error:
+        if method5_pilot and time.monotonic() >= deadline:
+            raise ResearchPilotTimeout(len(run.history["epoch"]), time.monotonic() - start) from error
+        raise
+    finally:
+        timer.cancel()

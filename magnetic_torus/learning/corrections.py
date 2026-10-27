@@ -14,6 +14,8 @@ from typing import Any
 
 CORRECTION_ARCHITECTURE = "coupled_correction_branches"
 CORRECTION_VERSION = 1
+PRESSURE_FOURIER_ARCHITECTURE = "research_pressure_fourier"
+PRESSURE_FOURIER_VERSION = 1
 _GROUP_OUTPUTS = {"thermofluid": (0, 1, 2, 3), "elliptic": (10, 11)}
 _FREQUENCIES = (1, 2, 4, 8)
 
@@ -145,6 +147,48 @@ def create_correction_model(
     return CoupledCorrectionModel()
 
 
+def create_pressure_fourier_model(base: Any, *, torch: Any = None) -> Any:
+    """Add a zero-initialized pressure-only high-frequency research correction."""
+    if torch is None:
+        from .fields import _torch
+
+        torch = _torch()
+    if (not hasattr(base, "architecture_metadata")
+            or base.architecture_metadata().get("kind") != CORRECTION_ARCHITECTURE):
+        raise ValueError("Pressure Fourier research requires a coupled correction model.")
+
+    class PressureFourierModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.base = base
+            parameter = next(base.parameters())
+            self.pressure_weight = torch.nn.Parameter(parameter.new_zeros(8))
+
+        def architecture_metadata(self) -> dict[str, Any]:
+            return {
+                "kind": PRESSURE_FOURIER_ARCHITECTURE,
+                "version": PRESSURE_FOURIER_VERSION,
+                "widths": [21, 64, 64, 64, 12],
+                "activation": "tanh",
+                "dtype": "float64",
+                "frequency": 16,
+                "output": "pressure",
+                "base": self.base.architecture_metadata(),
+            }
+
+        def forward(self, inputs: Any) -> Any:
+            output = self.base(inputs)
+            coordinates = torch.stack((inputs[:, 3] * inputs[:, 4],
+                                       inputs[:, 3] * inputs[:, 5],
+                                       inputs[:, 6], inputs[:, 7]), dim=1)
+            phase = torch.pi * 16 * coordinates
+            features = torch.cat((torch.sin(phase), torch.cos(phase)), dim=1)
+            pressure = output[:, 10:11] + features @ self.pressure_weight[:, None]
+            return torch.cat((output[:, :10], pressure, output[:, 11:]), dim=1)
+
+    return PressureFourierModel()
+
+
 def restore_model_from_checkpoint(
     checkpoint: str | Path | Mapping[str, Any], source: Any, device: str = "cpu"
 ) -> Any:
@@ -228,7 +272,7 @@ def restore_model_from_checkpoint(
         raise ValueError("Unsupported PINN checkpoint network architecture.")
     kind = architecture.get("kind", "sequential_tanh")
     if kind not in {"sequential_tanh", CORRECTION_ARCHITECTURE, FILM_ARCHITECTURE,
-                    TEMPORAL_GAUGE_ARCHITECTURE}:
+                    TEMPORAL_GAUGE_ARCHITECTURE, PRESSURE_FOURIER_ARCHITECTURE}:
         raise ValueError("Unsupported PINN checkpoint network architecture.")
     # Creating a known architecture must not change the caller's random stream.
     with torch.random.fork_rng(devices=[]):
@@ -255,15 +299,28 @@ def restore_model_from_checkpoint(
         model = create_temporal_gauge_model(model, expected_times, torch=torch)
         if dict(architecture) != model.architecture_metadata():
             raise ValueError("Unsupported temporal phi architecture metadata.")
-    elif kind == CORRECTION_ARCHITECTURE:
-        if thermal or architecture.get("version") != CORRECTION_VERSION:
+    elif kind in {CORRECTION_ARCHITECTURE, PRESSURE_FOURIER_ARCHITECTURE}:
+        if kind == PRESSURE_FOURIER_ARCHITECTURE:
+            if thermal or architecture.get("version") != PRESSURE_FOURIER_VERSION:
+                raise ValueError("Unsupported pressure Fourier architecture version.")
+            inner = architecture.get("base")
+            if not isinstance(inner, Mapping):
+                raise ValueError("Pressure Fourier architecture has no correction base.")
+        else:
+            inner = architecture
+        if (thermal or inner.get("kind") != CORRECTION_ARCHITECTURE
+                or inner.get("version") != CORRECTION_VERSION):
             raise ValueError("Unsupported PINN correction architecture version.")
-        groups = architecture.get("active_groups")
+        groups = inner.get("active_groups")
         if not isinstance(groups, list):
             raise ValueError("Checkpoint correction groups must be a list.")
         model = create_correction_model(model, tuple(groups), torch=torch)
-        if dict(architecture) != model.architecture_metadata():
+        if dict(inner) != model.architecture_metadata():
             raise ValueError("Unsupported PINN correction architecture metadata.")
+        if kind == PRESSURE_FOURIER_ARCHITECTURE:
+            model = create_pressure_fourier_model(model, torch=torch)
+            if dict(architecture) != model.architecture_metadata():
+                raise ValueError("Unsupported pressure Fourier architecture metadata.")
     elif (
         set(architecture) - {"kind", "version", "widths", "activation", "dtype"}
         or architecture.get("version", 1) != 1
