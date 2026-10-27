@@ -202,8 +202,15 @@ def main(argv=None) -> int:
                     os.replace(temporary, directory / "report.json")
                     print(json.dumps({"status": "ERROR", "report": str(directory / "report.json")}), flush=True)
                     return 1
+            # The child runs from ROOT, so caller-relative paths must not be
+            # interpreted again there. Argparse uses the last occurrence of
+            # each option, preserving all other effective arguments, including
+            # abbreviated or repeated path options supplied by the caller.
+            resolved_paths = [f"--source={selected[0]}", f"--output={directory}"]
+            if args.checkpoint is not None:
+                resolved_paths.append(f"--checkpoint={selected[1]}")
             command = [sys.executable, "-B", str(Path(__file__).resolve()),
-                       *raw_argv, "--_supervised-worker"] if finished_hashing.is_set() else []
+                       *raw_argv, *resolved_paths, "--_supervised-worker"] if finished_hashing.is_set() else []
             code, outcome = supervise(command, directory, started=started, seconds=args.seconds,
                                       provenance=report, stop=stop, cwd=ROOT)
         finally:

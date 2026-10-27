@@ -312,6 +312,88 @@ class PressurePilotTests(unittest.TestCase):
             self.assertEqual(original_files, {path.relative_to(source_path.parent): path.read_bytes()
                 for path in source_path.parent.rglob("*") if path.is_file()})
 
+    def test_supervised_cli_resolves_caller_relative_paths_for_both_architectures(self):
+        repo = Path(__file__).resolve().parents[1]
+        script = repo / "scripts" / "pinn_research.py"
+        with tempfile.TemporaryDirectory(prefix="torus research caller ") as directory, patch.dict(
+                "os.environ", {"MAGNETIC_TORUS_PINN_DEVICE": "cpu"}):
+            cwd = Path(directory)
+            relative_root = Path(f"research paths {cwd.name}")
+            fixture = cwd / relative_root
+            fixture.mkdir()
+            source, _ = self.source_pair(fixture)
+            source_path = RunStore(fixture / "source store").save_run(source)
+            data = training._prepare_data(source, threading.Event())
+            run = training._prepare_training(data, lambda *_: None, threading.Event(), None)
+            models = fixture / "checkpoint files"
+            models.mkdir()
+            checkpoints = {}
+            for architecture in ("method5", "pressure-fourier"):
+                core = run.field.model
+                model = core if architecture == "method5" else create_correction_model(
+                    core, ("elliptic", "thermofluid"), torch=torch)
+                metadata = dict(run.metadata)
+                if architecture == "pressure-fourier":
+                    metadata["architecture"] = model.architecture_metadata()
+                checkpoint = models / f"{architecture} source.pt"
+                training._checkpoint(checkpoint, model, torch.optim.Adam(model.parameters()),
+                                     0, source, data.scaling, run.history, metadata)
+                checkpoints[architecture] = checkpoint
+
+            original_source = source_path.read_bytes()
+            source_relative = source_path.relative_to(cwd)
+            for architecture in ("method5", "pressure-fourier"):
+                with self.subTest(architecture=architecture):
+                    checkpoint = checkpoints[architecture]
+                    original_checkpoint = checkpoint.read_bytes()
+                    checkpoint_relative = checkpoint.relative_to(cwd)
+                    relative_output = relative_root / f"{architecture} output"
+                    output = cwd / relative_output
+                    repo_output = repo / relative_output
+                    self.assertFalse(repo_output.exists())
+                    # The earlier occurrences are deliberately wrong; mixed
+                    # option forms verify the caller's last values still win.
+                    command = [sys.executable, "-B", str(script),
+                               "--source=ignored source.h5", "--source", str(source_relative),
+                               "--checkpoint", "ignored checkpoint.pt", f"--checkpoint={checkpoint_relative}",
+                               "--output=ignored output", "--output", str(relative_output),
+                               "--architecture", architecture, "--adam-steps", "1", "--lbfgs-steps", "0",
+                               "--seconds", "40", "--device", "cpu", "--cpu-threads", "1"]
+                    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=50)
+                    self.assertIn(result.returncode, (0, 3), result.stdout + result.stderr)
+                    final = json.loads((output / "report.json").read_text(encoding="utf-8"))
+                    worker = json.loads((output / "worker-report.json").read_text(encoding="utf-8"))
+                    self.assertEqual(final["status"], worker["status"])
+                    self.assertTrue(final["completed"])
+                    self.assertTrue(final["originals_unchanged"])
+                    self.assertTrue(final["implementation_unchanged"])
+                    self.assertTrue(final["supervisor"]["worker_provenance_matches"])
+                    self.assertEqual(final["supervisor"]["child_returncode"], result.returncode)
+                    self.assertEqual(final["selected_inputs"], [str(source_path.resolve()), str(checkpoint.resolve())])
+                    for name in ("source_path", "pinn_path", "private_source_path"):
+                        self.assertTrue(Path(final[name]).is_file(), name)
+                        self.assertTrue(Path(final[name]).resolve().is_relative_to(output.resolve()), name)
+                    self.assertEqual(source_path.read_bytes(), original_source)
+                    self.assertEqual(checkpoint.read_bytes(), original_checkpoint)
+                    self.assertFalse(repo_output.exists())
+
+            # A missing optional argument is not synthesized, and the child's
+            # normal missing-checkpoint diagnostic stays in the caller's output.
+            relative_output = relative_root / "missing checkpoint output"
+            output = cwd / relative_output
+            command = [sys.executable, "-B", str(script), f"--source={source_relative}",
+                       "--output", str(relative_output), "--architecture", "method5", "--adam-steps", "1",
+                       "--lbfgs-steps", "0", "--seconds", "40", "--device", "cpu"]
+            result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=50)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            final = json.loads((output / "report.json").read_text(encoding="utf-8"))
+            worker = json.loads((output / "worker-report.json").read_text(encoding="utf-8"))
+            self.assertEqual(final["status"], "ERROR")
+            self.assertEqual(final["status"], worker["status"])
+            self.assertIn("explicit source-bound pretrained checkpoint", worker["error"])
+            self.assertEqual(final["selected_inputs"], [str(source_path.resolve())])
+            self.assertEqual(source_path.read_bytes(), original_source)
+
     def test_private_source_copy_rejects_a_mismatched_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
