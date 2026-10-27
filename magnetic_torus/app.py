@@ -711,6 +711,9 @@ class TorusWindow(QtWidgets.QMainWindow):
                     )
                 )
             )
+        self.chart_panel.set_training_unavailable_reason(
+            self._pinn_training_unavailable_reason()
+        )
         self.refresh_plots()
         self._render()
         self.refresh_history()
