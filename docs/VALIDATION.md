@@ -359,6 +359,13 @@ On the distinct accepted 0–0.01667 s interval, the same four residual and five
 Jacobian comparisons matched; raw heat again failed (maximum difference
 1.1214e-4, normalized maximum 4.49e-13). Evidence:
 `.cache/pinn-pressure-followup/operator-probe-second-interval/report.json`.
+New operator probes record the worker-output SHA-256 for verified reuse. Older
+reports without this digest remain readable, but their worker output cannot be
+reused; run a fresh probe to create verifiable evidence.
+A fresh source-bound worker and its verified reuse produced matching probe hashes
+and both retained the documented raw enthalpy comparison failure. Evidence:
+`.cache/review-probe-digest-20261027-fresh/report.json` and
+`.cache/review-probe-digest-20261027-reuse/report.json`.
 
 The source-bound Huber pilot used 0.003 Pa and the training-only pressure scale;
 its quadratic region matches MSE. Against a matched control, training pressure

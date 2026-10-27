@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +24,35 @@ sys.path.insert(0, str(ROOT))
 def digest(path: Path) -> str:
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def read_probe_digest(directory: Path) -> str:
+    """Require the digest recorded by the worker's original completed run."""
+    try:
+        value = (directory / "operator_probe.sha256").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("Worker probe digest is missing or unreadable; run a fresh FE worker before reuse.") from exc
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError("Worker probe digest is malformed; run a fresh FE worker before reuse.")
+    return value
+
+
+def verified_probe_bytes(path: Path, expected: str) -> bytes:
+    """Hash the exact bytes returned for later loading, not a separately opened file."""
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError("Worker probe SHA-256 mismatch; run a fresh FE worker before reuse.")
+    return data
+
+
+def write_probe_digest(directory: Path, value: str) -> None:
+    target = directory / "operator_probe.sha256"
+    partial = directory / "operator_probe.sha256.partial"
+    try:
+        partial.write_text(value + "\n", encoding="ascii")
+        os.replace(partial, target)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def comparisons(fe: np.ndarray, reconstructed: np.ndarray) -> dict[str, float | bool]:
@@ -45,7 +76,7 @@ def main() -> int:
     parser.add_argument("--interval", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=int, default=300)
-    parser.add_argument("--reuse-worker", type=Path, help="Reuse a completed worker only when every probe input is identical.")
+    parser.add_argument("--reuse-worker", type=Path, help="Reuse a completed worker only when its recorded probe digest and all inputs match.")
     parser.add_argument("--freeze-temperature", action="store_true", help="Counterfactual diagnostic: hold temperature fixed across the pair.")
     args = parser.parse_args()
     if args.timeout < 1 or args.output.exists():
@@ -114,13 +145,17 @@ def main() -> int:
         other = args.reuse_worker.resolve()
         if (other / "worker.sha256").read_text(encoding="ascii").strip() != digest(worker):
             raise ValueError("Worker reuse requires the identical FE worker implementation.")
-        if json.loads((other / "request.json").read_text(encoding="utf-8")) != config.to_dict():
+        if json.loads((other / "request.json").read_text(encoding="utf-8")) != json.loads(request.read_text(encoding="utf-8")):
             raise ValueError("Worker reuse requires the identical scenario configuration.")
         with np.load(other / "input.npz", allow_pickle=False) as saved:
             if set(saved.files) != set(payload) or any(not np.array_equal(saved[k], v) for k, v in payload.items()):
                 raise ValueError("Worker reuse requires identical source fields, geometry, boundaries, time and direction.")
+        probe_hash = read_probe_digest(other)
+        verified_probe_bytes(other / "worker" / "operator_probe.npz", probe_hash)
         output.mkdir()
         shutil.copy2(other / "worker" / "operator_probe.npz", output / "operator_probe.npz")
+        probe_bytes = verified_probe_bytes(output / "operator_probe.npz", probe_hash)
+        write_probe_digest(directory, probe_hash)
         shutil.copy2(other / "worker.log", directory / "worker.log")
         shutil.copy2(other / "worker.sha256", directory / "worker.sha256")
     else:
@@ -137,7 +172,10 @@ def main() -> int:
         if completed.returncode:
             raise RuntimeError(f"FE operator worker returned {completed.returncode}; see worker.log.")
         (directory / "worker.sha256").write_text(digest(worker), encoding="ascii")
-    with np.load(output / "operator_probe.npz", allow_pickle=False) as archive:
+        probe_bytes = (output / "operator_probe.npz").read_bytes()
+        probe_hash = hashlib.sha256(probe_bytes).hexdigest()
+        write_probe_digest(directory, probe_hash)
+    with np.load(BytesIO(probe_bytes), allow_pickle=False) as archive:
         fenics = {key: archive[key].copy() for key in archive.files}
     torch.set_num_threads(2)
     previous = {name: torch.as_tensor(payload[name][0], dtype=torch.float64) for name in names}
@@ -179,6 +217,7 @@ def main() -> int:
               "source_sha256": before_hash, "source_unchanged": digest(source_path) == before_hash,
               "source_run_id": source.run_id, "config_hash": config.config_hash, "seed": args.seed,
               "worker_sha256": digest(worker),
+              "operator_probe_sha256": probe_hash,
               "times_s": source.times[ids].tolist(), "mesh_and_boundary_masks_match": True,
               "counterfactual_frozen_temperature": args.freeze_temperature,
               "comparison": "raw assembled free-node vectors, not solver convergence tolerance",
