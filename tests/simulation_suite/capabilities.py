@@ -276,9 +276,14 @@ print(json.dumps({'available': True, 'reason': 'DOLFINx, Gmsh, and PETSc importe
 """
 
 _TRANSPORT_PROBE = r"""
-import hashlib, json, os, re, shutil, subprocess, sys
+import argparse, hashlib, json, os, re, shutil, subprocess, sys
 from pathlib import Path
-override = sys.argv[1] if len(sys.argv) > 1 else os.environ.get('TORUS_GEANT4_WORKER', '')
+def worker_override(argv, environ):
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument('--worker', default='')
+    options, _ownership_token = parser.parse_known_args(argv)
+    return options.worker or environ.get('TORUS_GEANT4_WORKER', '')
+override = worker_override(sys.argv[1:], os.environ)
 worker = Path(override or shutil.which('torus-dose-run') or '/opt/magnetic-torus/bin/torus-dose-run')
 root = Path('/opt/magnetic-torus/data/ICRPdata')
 out = {}
@@ -445,10 +450,12 @@ def detect_capabilities(*, budget=None, stop_event=None) -> dict[str, dict[str, 
         **options,
     )
     caps["fenics"] = fenics or _record(False, error)
+    worker_override = os.environ.get("TORUS_GEANT4_WORKER", "")
+    worker_option = [f"--worker={worker_override}"] if worker_override else []
     transport, error = _run_json(
         [
             *_backend_command(),
-            os.environ.get("TORUS_GEANT4_WORKER", ""),
+            *worker_option,
             *preflight_tag,
         ],
         timeout=60.0,

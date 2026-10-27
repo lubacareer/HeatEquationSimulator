@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import argparse
 import copy
 from dataclasses import replace
 import ctypes
@@ -123,7 +124,7 @@ class CapabilityProbeTests(unittest.TestCase):
         ):
             detected = capabilities.detect_capabilities()
         self.assertEqual(
-            probes.call_args_list[3].args[0][-1], "/custom worker/torus-dose"
+            probes.call_args_list[3].args[0][-1], "--worker=/custom worker/torus-dose"
         )
         self.assertEqual(
             set(detected),
@@ -138,6 +139,52 @@ class CapabilityProbeTests(unittest.TestCase):
         for record in detected.values():
             self.assertIsInstance(record["versions"], dict)
             self.assertIsInstance(record["details"], dict)
+
+    def test_transport_worker_option_and_owned_token_remain_unambiguous(self):
+        yes = {"available": True, "reason": "checked", "versions": {}, "details": {}}
+        for platform in ("win32", "linux"):
+            for override in (None, "", "/custom worker/torus-dose"):
+                for owned in (False, True):
+                    with self.subTest(platform=platform, override=override, owned=owned):
+                        responses = [(yes.copy(), ""), ({"torch_cpu": yes.copy(), "torch_cuda": yes.copy()}, ""),
+                                     (yes.copy(), ""), ({"geant4": yes.copy(), "icrp110": yes.copy()}, "")]
+                        budget = SimpleNamespace(preflight_token=Path("owner") if owned else None,
+                                                 register_preflight=lambda: None, poll=lambda: None)
+                        with (patch.object(capabilities.sys, "platform", platform),
+                              patch.object(capabilities, "wsl_distribution", return_value="test-wsl"),
+                              patch.object(capabilities, "wsl_path", return_value="/owned/probe"),
+                              patch.object(capabilities, "_run_json", side_effect=responses) as probes,
+                              patch.object(capabilities.importlib.metadata, "version", return_value="test-version"),
+                              patch.dict(capabilities.os.environ, {}, clear=False)):
+                            if override is None:
+                                capabilities.os.environ.pop("TORUS_GEANT4_WORKER", None)
+                            else:
+                                capabilities.os.environ["TORUS_GEANT4_WORKER"] = override
+                            capabilities.detect_capabilities(budget=budget if owned else None)
+                            command = probes.call_args_list[3].args[0]
+                        self.assertNotIn("", command)
+                        self.assertEqual(command[:5] if platform == "win32" else command[:2],
+                                         ["wsl", "-d", "test-wsl", "--", "/usr/bin/python3"]
+                                         if platform == "win32" else ["/usr/bin/python3", "-"])
+                        self.assertEqual([value for value in command if value.startswith("--worker=")],
+                                         [f"--worker={override}"] if override else [])
+                        if owned:
+                            expected_token = "/owned/probe" if os.name == "nt" else str(Path("owner") / "probe")
+                            self.assertEqual(command[-1], expected_token)
+
+    def test_transport_probe_worker_selection_preserves_environment_fallback(self):
+        tree = ast.parse(capabilities._TRANSPORT_PROBE)
+        helper = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "worker_override")
+        namespace = {"argparse": argparse}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "<worker selection>", "exec"), namespace)
+        choose = namespace["worker_override"]
+        token = "/tmp/owned token/probe"
+        self.assertEqual(choose([], {}), "")
+        self.assertEqual(choose([token], {}), "")
+        self.assertEqual(choose([token], {"TORUS_GEANT4_WORKER": "/env worker/dose"}), "/env worker/dose")
+        self.assertEqual(choose(["--worker=/custom worker/dose", token],
+                                {"TORUS_GEANT4_WORKER": "/env worker/dose"}), "/custom worker/dose")
+        self.assertEqual(choose(["--worker=", token], {"TORUS_GEANT4_WORKER": "/env worker/dose"}), "/env worker/dose")
 
 
 class MatrixAndReportTests(unittest.TestCase):
