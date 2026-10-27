@@ -60,6 +60,11 @@ def render_html(report: dict) -> str:
     rows = []
     for result in report.get("results", []):
         metrics = json.dumps(result.get("metrics", {}), indent=2, ensure_ascii=False)
+        skipped = result.get("skipped", [])
+        skip_details = (
+            f"<details><summary>Skipped checks</summary><pre>{esc(json.dumps(skipped, indent=2, ensure_ascii=False))}</pre></details>"
+            if skipped else ""
+        )
         rows.append(
             "<tr>"
             + "".join(
@@ -73,7 +78,7 @@ def render_html(report: dict) -> str:
                     result.get("reason", ""),
                 )
             )
-            + f"<td><details><summary>Metrics</summary><pre>{esc(metrics)}</pre></details>"
+            + f"<td><details><summary>Metrics</summary><pre>{esc(metrics)}</pre></details>{skip_details}"
             + f"<code>{esc(result.get('log_path', ''))}</code></td></tr>"
         )
     summary = report.get("summary", {})

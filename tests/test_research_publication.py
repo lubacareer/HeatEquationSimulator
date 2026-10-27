@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from contextlib import redirect_stdout
+import errno
 from io import StringIO
 import json
 import os
@@ -21,6 +22,17 @@ from magnetic_torus.models import PINNResult, RunResult, SimulationCancelled, pr
 from magnetic_torus.store import RunStore
 from scripts.pinn_research import _rename_directory_noreplace, main, publish_research_bundle
 from scripts.research_supervisor import _remove_owned_stages, supervise
+from simulation_suite.host_skips import host_skip_reason, is_host_limitation
+
+
+def create_host_symlink(source, destination):
+    """Create a test link or classify an explicit host limitation."""
+    try:
+        os.symlink(source, destination, target_is_directory=True)
+    except OSError as error:
+        if not is_host_limitation(error):
+            raise
+        raise unittest.SkipTest(host_skip_reason("symlink", error.errno, getattr(error, "winerror", None))) from error
 
 
 class ResearchPublicationTests(unittest.TestCase):
@@ -259,14 +271,19 @@ class ResearchPublicationTests(unittest.TestCase):
         external.mkdir()
         (external / "keep").write_bytes(b"keep")
         link = store / ".research-stage-77-link"
-        try:
-            os.symlink(external, link, target_is_directory=True)
-        except OSError as error:
-            self.skipTest(f"Directory symlink creation unavailable: {error}")
+        create_host_symlink(external, link)
         notes = _remove_owned_stages(output.resolve(), 77)
         self.assertTrue(link.is_symlink())
         self.assertEqual((external / "keep").read_bytes(), b"keep")
         self.assertTrue(any("skipped linked" in note for note in notes))
+
+    def test_symlink_unavailability_distinguishes_host_and_io_errors(self):
+        with patch("os.symlink", side_effect=OSError(errno.EPERM, "not permitted")):
+            with self.assertRaisesRegex(unittest.SkipTest, r"\[host-inapplicable:symlink:"):
+                create_host_symlink("source", "destination")
+        with patch("os.symlink", side_effect=OSError(errno.ENOSPC, "disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                create_host_symlink("source", "destination")
 
 
 if __name__ == "__main__":
