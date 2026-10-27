@@ -351,6 +351,22 @@ class ThermalChartTests(unittest.TestCase):
         self.panel.refresh()
         self.assertTrue(self.panel.training_settings_button.isHidden())
 
+    def test_unavailable_training_hides_settings_and_uses_neutral_empty_message(self):
+        self.session.view = "PINN"
+        self.session.pinn = None
+        self.panel.set_training_available(False)
+        self.panel._refresh()
+        self.assertTrue(self.panel.training_settings_button.isHidden())
+        self.assertFalse(self.panel.training_settings_button.isEnabled())
+        self.assertEqual(self.panel.cards[0].ax.texts[0].get_text(),
+                         "No PINN available for this saved scenario")
+        self.panel.set_training_available(True)
+        self.panel._refresh()
+        self.assertFalse(self.panel.training_settings_button.isHidden())
+        self.assertTrue(self.panel.training_settings_button.isEnabled())
+        self.assertEqual(self.panel.cards[0].ax.texts[0].get_text(),
+                         "Train a PINN for the active saved scenario")
+
 
 if __name__ == "__main__":
     unittest.main()

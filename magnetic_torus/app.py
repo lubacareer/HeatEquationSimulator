@@ -403,16 +403,16 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.editor.run_button.setEnabled(not busy and valid_draft)
         has_result = self.session.active is not None
         training_reason = self._pinn_training_unavailable_reason()
+        # Unsupported training modes are not presented as available actions.
+        # Keep the separate start_job guard for non-UI callers.
+        self.editor.train_button.setVisible(not has_result or training_reason is None)
         self.editor.train_button.setEnabled(
             has_result and not busy and training_reason is None
         )
         self.editor.train_button.setToolTip(
             training_reason or "Train a PINN for the accepted simulation."
         )
-        self.editor.training_unavailable_label.setText(training_reason or "")
-        self.editor.training_unavailable_label.setVisible(
-            has_result and training_reason is not None
-        )
+        self.chart_panel.set_training_available(training_reason is None)
         for control in (
             self.editor.trace_button,
             self.editor.dose_button,

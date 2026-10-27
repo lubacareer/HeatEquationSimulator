@@ -84,7 +84,7 @@ Imposed, induced, and mutual magnetic stored-energy contributions and integrated
 
 ### PINNs
 
-The desktop enables training for single-phase native thermal sources and stationary coupled sources. Phase-changing thermal and time-varying coupled MHD training are disabled, with an explanation beside **Train PINN**, because those modes remain unqualified. This does not disable their numerical simulations, plots, or radiation analysis using accepted numerical fields. Existing PINNs remain inspectable; only passed, source-matched models can provide radiation fields. The research backend and full diagnostic cases remain available for investigation and still enforce their original gates.
+The desktop enables training for single-phase native thermal sources and stationary coupled sources. The **Train PINN** action is removed for phase-changing thermal and time-varying coupled MHD sources because those modes remain unqualified. This does not disable their numerical simulations, plots, or radiation analysis using accepted numerical fields. Existing PINNs remain inspectable; only passed, source-matched models can provide radiation fields. The research backend and full diagnostic cases remain available for investigation and still enforce their original gates.
 
 Per-scenario PyTorch models use nondimensional variables and sparse numerical samples. Full coupled models enforce the same exported differentiable FE weak operator, including closure, conductor/exterior interfaces, gauges, and boundary conditions. Native models enforce the corresponding discrete conservative enthalpy balance and supply only the thermal fields they train. Batches are bounded; checkpoints, cancellation, held-out field errors, conservation defects, and histories are recorded.
 

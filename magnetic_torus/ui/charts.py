@@ -189,6 +189,7 @@ class ChartPanel(QtWidgets.QWidget):
             lambda: self.training_settings_requested.emit()
         )
         self.training_settings_button.hide()
+        self.training_available = True
         self.cards[0].add_header_control(self.training_settings_button)
         self.energy_mode = QtWidgets.QComboBox()
         self.energy_mode.addItems(["Change (ΔE)", "Stored total"])
@@ -277,9 +278,15 @@ class ChartPanel(QtWidgets.QWidget):
         ):
             card.empty(title, message)
 
+    def set_training_available(self, available: bool) -> None:
+        """Show training controls only when the accepted source supports them."""
+        self.training_available = bool(available)
+        self.training_settings_button.setEnabled(self.training_available)
+        self.training_settings_button.setVisible(self.session.view == "PINN" and self.training_available)
+
     def _refresh(self):
         self.energy_mode.setVisible(self.session.view == "Thermal")
-        self.training_settings_button.setVisible(self.session.view == "PINN")
+        self.training_settings_button.setVisible(self.session.view == "PINN" and self.training_available)
         self.energy_mode.setEnabled(self.session.active is not None)
         if self.session.active is None:
             self.empty()
@@ -788,11 +795,13 @@ class ChartPanel(QtWidgets.QWidget):
         if self.session.active is None:
             return
         if self.session.pinn is None:
+            empty_message = ("Train a PINN for the active saved scenario" if self.training_available
+                             else "No PINN available for this saved scenario")
             for card, title in zip(
                 self.cards,
                 ("Training convergence", "Held-out validation", "Numerical / PINN"),
             ):
-                card.empty(title, "Train a PINN for the active saved scenario")
+                card.empty(title, empty_message)
             return
         epochs = training_epochs(self.session.pinn)
         ax = self.cards[0].reset(
