@@ -470,6 +470,46 @@ class InvocationBudgetTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(record["metrics"]["tests_executed"], 1)
 
+    def test_worker_records_linux_symlink_limitation_on_windows(self):
+        import test_setup_geant4
+
+        path = Path(__file__).parent / "simulation_suite" / "unittest_worker.py"
+        spec = importlib.util.spec_from_file_location("linux_errno_unittest_worker", path)
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        request, output = self.root / "linux-request.json", self.root / "linux-result.json"
+        request.write_text(json.dumps({"parameters": {"pattern": "fixture.py"}, "profile": "full"}), encoding="utf-8")
+        symlink_id = "test_setup_geant4.Geant4InstallerTests.test_cached_archive_symlink_is_rejected"
+        probe = subprocess.CompletedProcess(
+            [], 1, json.dumps({"errno": 95, "name": "EOPNOTSUPP", "message": "not supported"}), ""
+        )
+
+        class SymlinkProbe(unittest.TestCase):
+            def id(self):
+                return symlink_id
+
+            def runTest(self):
+                with patch.object(test_setup_geant4.subprocess, "run", return_value=probe):
+                    test_setup_geant4.create_linux_symlink(["wsl", "--"], "/source", "/destination")
+
+        class ApplicableTest(unittest.TestCase):
+            def runTest(self):
+                pass
+
+        with (patch.object(sys, "argv", ["worker", "--request", str(request), "--result", str(output)]),
+              patch.object(sys, "path", list(sys.path)),
+              patch.object(unittest.defaultTestLoader, "discover",
+                           return_value=unittest.TestSuite([ApplicableTest(), SymlinkProbe()])),
+              patch.object(worker, "os", SimpleNamespace(name="nt")),
+              patch.object(sys, "stderr", io.StringIO())):
+            self.assertEqual(worker.main(), 0)
+        record = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "PASS")
+        self.assertEqual(record["metrics"]["tests_executed"], 1)
+        self.assertEqual(record["skipped"][0]["test"], symlink_id)
+        self.assertEqual(record["skipped"][0]["classification"], "NOT_APPLICABLE")
+        self.assertIn(":95:none:linux:EOPNOTSUPP]", record["skipped"][0]["reason"])
+
     def test_host_skip_rules_and_html_keep_reasons_visible(self):
         windows_id = "test_torus_publication.JobPublicationTests.test_transport_request_paths_survive_publication"
         self.assertTrue(host_skips.is_host_inapplicable(windows_id, "Windows/WSL path representation", os_name="posix"))
