@@ -354,18 +354,38 @@ class ThermalChartTests(unittest.TestCase):
     def test_unavailable_training_hides_settings_and_uses_neutral_empty_message(self):
         self.session.view = "PINN"
         self.session.pinn = None
-        self.panel.set_training_available(False)
+        reason = "Phase-changing thermal PINN training is not qualified. Numerical results remain available."
+        self.panel.set_training_unavailable_reason(reason)
         self.panel._refresh()
         self.assertTrue(self.panel.training_settings_button.isHidden())
         self.assertFalse(self.panel.training_settings_button.isEnabled())
+        self.assertTrue(self.panel.training_unavailable_note.isVisible())
+        self.assertTrue(self.panel.training_unavailable_note.wordWrap())
+        self.assertEqual(self.panel.training_unavailable_note.text(), reason)
         self.assertEqual(self.panel.cards[0].ax.texts[0].get_text(),
                          "No PINN available for this saved scenario")
-        self.panel.set_training_available(True)
+        self.session.pinn = PINNResult("saved", self.result.run_id, self.result.config.config_hash,
+                                       self.result.fields, {}, {}, {"validation_status": "failed"})
         self.panel._refresh()
+        self.assertTrue(self.panel.training_unavailable_note.isVisible())
+        self.assertEqual(self.panel.training_unavailable_note.text(), reason)
+        self.session.view = "Thermal"
+        self.panel._refresh()
+        self.assertTrue(self.panel.training_unavailable_note.isHidden())
+        self.session.view = "PINN"
+        self.panel.set_training_unavailable_reason(None)
+        self.session.pinn = None
+        self.panel._refresh()
+        self.assertTrue(self.panel.training_unavailable_note.isHidden())
+        self.assertEqual(self.panel.training_unavailable_note.text(), "")
         self.assertFalse(self.panel.training_settings_button.isHidden())
         self.assertTrue(self.panel.training_settings_button.isEnabled())
         self.assertEqual(self.panel.cards[0].ax.texts[0].get_text(),
                          "Train a PINN for the active saved scenario")
+        self.session.active = None
+        self.panel.set_training_unavailable_reason(reason)
+        self.panel._refresh()
+        self.assertTrue(self.panel.training_unavailable_note.isHidden())
 
 
 if __name__ == "__main__":

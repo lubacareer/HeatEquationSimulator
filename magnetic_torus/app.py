@@ -412,7 +412,7 @@ class TorusWindow(QtWidgets.QMainWindow):
         self.editor.train_button.setToolTip(
             training_reason or "Train a PINN for the accepted simulation."
         )
-        self.chart_panel.set_training_available(training_reason is None)
+        self.chart_panel.set_training_unavailable_reason(training_reason)
         for control in (
             self.editor.trace_button,
             self.editor.dose_button,
