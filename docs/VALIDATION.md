@@ -297,6 +297,27 @@ unsuccessful PINNs, water precision, and complete profiles remain open.
 
 ## Pressure and CUDA follow-up (2026-10-27)
 
+### Liquid Dynamo targeted rerun
+
+The later user-run full-profile selection passed the Liquid Dynamo case and
+its FE prerequisite. The PINN completed 3,050 steps in 640.703 s on CUDA with
+seed 42 and the unchanged qualification gates: held-out MSE 0.00304978,
+maximum field normalized RMSE 0.097568 (pressure), maximum independently checked
+residual RMS 0.035691 (magnetic consistency), physics loss 0.00021645, and
+boundary loss 5.30e-37. This is a pass for that source, not qualification of
+all evolving dynamos. The earlier OOM remains unexplained; telemetry did not
+record one during this rerun. Original case evidence remains under
+`.cache/test-suite/20261026T133138.135583Z/cases/pinn.fe.liquid.dynamo.vms/attempt-0003/`.
+The later review fixes can invalidate this attempt's fingerprint on resume;
+they do not change the historical result. The enlarged water case is separate.
+
+The research-workflow review fixes were verified with eight focused suite cases
+(94 tests), including real desktop, publication, temporal checkpoint, and
+supervisor coverage. This targeted selection does not qualify a complete profile.
+After the reporting compatibility adjustment, the 31 publication and supervisor
+tests passed again. Evidence: `.cache/review-fixes-20261027/report.json` and
+`.cache/review-fixes-final-20261027/report.json`.
+
 ### Timestep, operator, Huber and memory investigation
 
 A new 12-nominal-step source passed the existing FE source checks. On the
@@ -363,8 +384,8 @@ Remove-Item Env:MAGNETIC_TORUS_PINN_MEMORY_LOG
 ```
 
 The log is opt-in, append-only and PID-tagged. The runner reuses prerequisites
-only when their fingerprints and artifacts remain valid. The complete Liquid
-qualification and enlarged water calculation remain pending.
+only when their fingerprints and artifacts remain valid. The Liquid rerun above
+has since passed; the enlarged water calculation remains separate.
 
 Exploratory signed and absolute pressure maps, per-snapshot statistics, radial
 sample counts, and the accepted-field Lorentz-force reconstruction are saved in
