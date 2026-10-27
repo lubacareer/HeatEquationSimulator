@@ -65,6 +65,7 @@ def child(args: argparse.Namespace) -> int:
     from magnetic_torus.store import RunStore
 
     result = {"strategy": args.child, "status": "ERROR", "repetitions": []}
+    run = None
     try:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for this profiler.")
@@ -81,6 +82,9 @@ def child(args: argparse.Namespace) -> int:
         data = training._prepare_data(source, threading.Event())
         run = training._prepare_training(data, lambda *_: None, threading.Event(), None)
         run.field.model = restore_model_from_checkpoint(payload, source, "cuda")
+        if run.telemetry is not None:
+            run.telemetry.stage, run.telemetry.epoch = "L-BFGS probe", int(payload["epoch"])
+            run.telemetry.emit("checkpoint_loaded", probe=True)
         parameters = tuple(p for p in run.field.model.parameters() if p.requires_grad)
         indices = np.unique(np.linspace(1, data.snapshot_count - 1,
                                        min(4, data.snapshot_count - 1), dtype=np.int64))
@@ -114,6 +118,8 @@ def child(args: argparse.Namespace) -> int:
             free, total = torch.cuda.mem_get_info()
             recorded = {}
             def closure():
+                if run.telemetry is not None:
+                    run.telemetry.closures += 1
                 optimizer.zero_grad(set_to_none=True)
                 terms = training._deterministic_objective(
                     run, indices, centers, backward=True,
@@ -127,13 +133,18 @@ def child(args: argparse.Namespace) -> int:
                 return terms["loss"]
             start = time.perf_counter()
             evaluations, limited, outcomes = 0, 0, {}
-            for _ in range(args.steps_per_repetition):
-                step = training._recovering_lbfgs_step(optimizer, parameters, closure, threading.Event())
+            for step_index in range(args.steps_per_repetition):
+                if run.telemetry is not None:
+                    run.telemetry.epoch = int(payload["epoch"]) + step_index + 1
+                step = training._recovering_lbfgs_step(optimizer, parameters, closure, threading.Event(),
+                                                       telemetry=run.telemetry)
                 evaluations += step.evaluations
                 limited += int(step.limited)
                 outcomes[step.outcome] = outcomes.get(step.outcome, 0) + 1
                 # Production refinement also audits the objective after every step.
                 training._deterministic_objective(run, indices, centers, backward=False)
+                if run.telemetry is not None:
+                    run.telemetry.emit("probe_step", repetition=iteration + 1, outcome=step.outcome)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
             if iteration == 0:
@@ -151,6 +162,8 @@ def child(args: argparse.Namespace) -> int:
                               "seconds": elapsed, "steps": args.steps_per_repetition}), flush=True)
         result.update(status="PASS", median_seconds=statistics.median(item["seconds"] for item in result["repetitions"]))
     except BaseException as error:
+        if run is not None and run.telemetry is not None:
+            run.telemetry.emit("probe_error", error_type=type(error).__name__, error=str(error))
         result.update(status="ERROR", error=f"{type(error).__name__}: {error}")
     target = args.output / (args.child + "-result.json")
     temporary = target.with_suffix(".partial")

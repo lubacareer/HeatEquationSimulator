@@ -523,6 +523,7 @@ class TrainingRun:
     checkpoint_path: Path | None
     metadata: dict[str, Any]
     history: dict[str, list[float]]
+    telemetry: Any = None
 
 
 def _optimizer_steps(epochs: int) -> tuple[int, int]:
@@ -708,8 +709,14 @@ def _prepare_training(data: TrainingData, progress: Progress, cancel: threading.
     history: dict[str, list[float]] = {key: [] for key in (
         "epoch", "loss", "data_loss", "physics_loss", "boundary_loss", "validation_loss")}
     progress(0.0, f"Preparing {'thermal' if thermal else 'coupled weak-form'} PINN on {device}")
+    from .memory_telemetry import optional_memory_telemetry
+    telemetry = optional_memory_telemetry(torch, device)
+    if telemetry is not None:
+        metadata["memory_telemetry"] = {"enabled": True, "interval_steps": 50,
+                                        "peak_scope": "process allocator cumulative"}
+        telemetry.emit("prepared", run_id=run_id, source_run_id=data.result.run_id)
     return TrainingRun(field, losses, optimizer,
-                       scheduler, run_id, checkpoint_path, metadata, history)
+                       scheduler, run_id, checkpoint_path, metadata, history, telemetry)
 
 
 def _training_metadata(data: TrainingData, field: NeuralField, checkpoint_path: Path | None) -> dict[str, Any]:
@@ -828,7 +835,8 @@ class _RefinementEvaluationBudget(RuntimeError):
 
 
 def _bounded_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Callable[[], Any],
-                       cancel: threading.Event, limit: int = 8) -> tuple[int, bool]:
+                       cancel: threading.Event, limit: int = 8,
+                       telemetry: Any = None) -> tuple[int, bool]:
     """Bound actual closure calls and roll back a discarded line-search trial."""
     torch = _torch()
     weights = [parameter.detach().clone() for parameter in parameters]
@@ -846,11 +854,15 @@ def _bounded_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Ca
         return closure()
 
     def restore():
+        if telemetry is not None:
+            telemetry.emit("rollback_start", step_closures=evaluations)
         with torch.no_grad():
             for parameter, weight, gradient in zip(parameters, weights, gradients):
                 parameter.copy_(weight)
                 parameter.grad = gradient
         optimizer.load_state_dict(state)
+        if telemetry is not None:
+            telemetry.emit("rollback_complete", step_closures=evaluations)
 
     try:
         optimizer.step(counted_closure)
@@ -858,10 +870,16 @@ def _bounded_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Ca
         restore()
         return evaluations, True
     except BaseException as error:
+        if telemetry is not None:
+            telemetry.emit("optimizer_error", error_type=type(error).__name__,
+                           error=str(error), step_closures=evaluations)
         # PyTorch may still have trial weights installed when a closure fails.
         try:
             restore()
         except BaseException as rollback_error:
+            if telemetry is not None:
+                telemetry.emit("rollback_error", error_type=type(rollback_error).__name__,
+                               error=str(rollback_error), step_closures=evaluations)
             # Retain the original failure when CUDA is too exhausted to restore.
             # The caller must discard this optimizer/model and may not publish it.
             if hasattr(error, "add_note"):
@@ -881,7 +899,7 @@ class _RefinementStep:
 
 
 def _recovering_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure: Callable[[], Any],
-                          cancel: threading.Event) -> _RefinementStep:
+                          cancel: threading.Event, telemetry: Any = None) -> _RefinementStep:
     """Recover useful training descent without spending another closure call."""
     torch = _torch()
     base = tuple(parameter.detach().clone() for parameter in parameters)
@@ -909,7 +927,8 @@ def _recovering_lbfgs_step(optimizer: Any, parameters: tuple[Any, ...], closure:
                 best = (value, tuple(parameter.detach().clone() for parameter in parameters), gradients)
         return loss
 
-    evaluations, limited = _bounded_lbfgs_step(optimizer, parameters, observed_closure, cancel)
+    evaluations, limited = _bounded_lbfgs_step(optimizer, parameters, observed_closure, cancel,
+                                               telemetry=telemetry)
     if initial_loss is None or initial_gradients is None:
         raise RuntimeError("Refinement did not evaluate its training objective.")
     gradient_max = max(float(gradient.abs().max()) for gradient in initial_gradients)
@@ -944,6 +963,8 @@ def _refinement_iteration(run: TrainingRun, indices: np.ndarray, centers: np.nda
     torch = run.field.torch
     def closure():
         _cancelled(run.losses.cancel)
+        if run.telemetry is not None:
+            run.telemetry.closures += 1
         run.optimizer.zero_grad(set_to_none=True)
         terms = _deterministic_objective(run, indices, centers, backward=True)
         if any(parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())
@@ -951,7 +972,8 @@ def _refinement_iteration(run: TrainingRun, indices: np.ndarray, centers: np.nda
             raise FloatingPointError("PINN refinement gradient became non-finite.")
         run.metadata["function_evaluations"]["lbfgs_closures"] += 1
         return terms["loss"]
-    step = _recovering_lbfgs_step(run.optimizer, parameters, closure, run.losses.cancel)
+    step = _recovering_lbfgs_step(run.optimizer, parameters, closure, run.losses.cancel,
+                                  telemetry=run.telemetry)
     run.metadata["refinement_budget_limited_steps"] += int(step.limited)
     run.metadata["refinement_step_outcomes"][step.outcome] += 1
     run.metadata["refinement_accepted_updates"] += int(step.delta_inf > 0.)
@@ -996,6 +1018,8 @@ def _train_corrections(run: TrainingRun, audit_indices: np.ndarray, centers: np.
         run.metadata["conditioning_adam_objective"] = "original full sampled training labels plus raw physics and boundary losses, each with coefficient one"
         for index in range(additional_adam):
             _cancelled(cancel)
+            if run.telemetry is not None:
+                run.telemetry.stage, run.telemetry.epoch = "Correction Adam", len(run.history["epoch"]) + 1
             field.model.train()
             run.optimizer.zero_grad(set_to_none=True)
             data_loss = run.losses.sampled_training_loss()
@@ -1019,6 +1043,8 @@ def _train_corrections(run: TrainingRun, audit_indices: np.ndarray, centers: np.
             history_size=20, line_search_fn="strong_wolfe")
         for index in range(additional_lbfgs):
             _cancelled(cancel)
+            if run.telemetry is not None:
+                run.telemetry.stage, run.telemetry.epoch = "Correction L-BFGS", len(run.history["epoch"]) + 1
             objective, step = _refinement_iteration(run, audit_indices, centers, parameters)
             run.metadata["additional_optimizer_steps_completed"]["lbfgs"] += 1
             record(objective, "Correction L-BFGS", stage_end=index + 1 == additional_lbfgs,
@@ -1072,12 +1098,22 @@ def _train_model(run: TrainingRun, progress: Progress, cancel: threading.Event) 
         display = "Adam" if stage.startswith("Adam") else stage
         progress(.9 * epoch / maximum_steps,
             f"Epoch {epoch} (budget ≤{maximum_steps}) · {display} · {label} {values['loss']:.6g} · held-out {current_validation:.6g}@{heldout_epoch}{detail}")
+        if run.telemetry is not None and (epoch == 1 or epoch % 50 == 0 or stage_end):
+            run.telemetry.stage, run.telemetry.epoch = stage, epoch
+            run.telemetry.emit("step", stage_end=stage_end)
         if run.checkpoint_path is not None and (epoch % 50 == 0 or stage_end):
+            if run.telemetry is not None:
+                run.telemetry.emit("checkpoint_start")
             _checkpoint(run.checkpoint_path, field.model, run.optimizer, epoch,
                         data.result, data.scaling, run.history, run.metadata)
+            if run.telemetry is not None:
+                run.telemetry.emit("checkpoint_complete")
 
     for epoch in range(config.pinn_epochs):
         _cancelled(cancel)
+        if run.telemetry is not None:
+            run.telemetry.stage = "Adam" if epoch < adam_steps else "L-BFGS"
+            run.telemetry.epoch = epoch + 1
         field.model.train()
         if epoch < adam_steps:
             run.optimizer.zero_grad(set_to_none=True)
@@ -1178,7 +1214,11 @@ def _assemble_result(run: TrainingRun, predicted: dict[str, np.ndarray], metrics
     config = data.config
     result = data.result
     if run.checkpoint_path is not None:
+        if run.telemetry is not None:
+            run.telemetry.emit("checkpoint_start", final=True)
         _checkpoint(run.checkpoint_path, field.model, run.optimizer, int(run.history["epoch"][-1]), result, data.scaling, run.history, run.metadata)
+        if run.telemetry is not None:
+            run.telemetry.emit("checkpoint_complete", final=True)
         (run.checkpoint_path.parent / "metadata.json").write_text(json.dumps(run.metadata, indent=2), encoding="utf-8")
     _cancelled(cancel)
     output = PINNResult(run_id=run.run_id, source_run_id=result.run_id, config_hash=config.config_hash,
@@ -1198,7 +1238,15 @@ def train_pinn(result: RunResult, progress: Progress, cancel: threading.Event,
     """
     data = _prepare_data(result, cancel)
     run = _prepare_training(data, progress, cancel, output_dir)
-    initial_validation = _train_model(run, progress, cancel)
-    predicted = _predict_fields(run, progress, cancel)
-    metrics = validate_prediction(run, predicted, initial_validation, progress, cancel)
-    return _assemble_result(run, predicted, metrics, progress, cancel)
+    try:
+        initial_validation = _train_model(run, progress, cancel)
+        predicted = _predict_fields(run, progress, cancel)
+        metrics = validate_prediction(run, predicted, initial_validation, progress, cancel)
+        result = _assemble_result(run, predicted, metrics, progress, cancel)
+        if run.telemetry is not None:
+            run.telemetry.emit("complete", validation_status=result.metadata.get("validation_status"))
+        return result
+    except BaseException as error:
+        if run.telemetry is not None:
+            run.telemetry.emit("training_error", error_type=type(error).__name__, error=str(error))
+        raise
