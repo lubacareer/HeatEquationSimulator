@@ -92,6 +92,12 @@ The experiment supports:
   source-bound core or correction checkpoint. It preserves every output at
   creation; subsequent training still uses the joint data, physics, and
   boundary losses.
+- **Pressure Huber:** `--pressure-huber` with uniform `method5` changes only
+  the research training loss for pressure, using a 0.003 Pa transition scaled
+  by training-only labels. Its quadratic region matches MSE. Both optimizer
+  stages use this loss; training selection and held-out qualification return
+  to the original unweighted MSE and physical oracle. The matched pilot was
+  not selected; see [VALIDATION.md](VALIDATION.md#pressure-and-cuda-follow-up-2026-10-27).
 
 The `method5` and `pressure-fourier` research architectures require an explicit
 checkpoint bound to the selected source. They run in an owned child with a hard

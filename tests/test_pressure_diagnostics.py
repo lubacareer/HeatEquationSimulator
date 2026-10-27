@@ -2,14 +2,24 @@
 from io import BytesIO
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from scripts.pinn_pressure_diagnostics import (check_pressure_anchors, coordinate_mapping,
-                                               exact_time, heldout_mask, lorentz_statistics)
+from scripts.pinn_pressure_diagnostics import (check_pressure_anchors, compare_sources, coordinate_mapping,
+                                               error_statistics, exact_time, heldout_mask, lorentz_statistics)
 
 
 class PressureDiagnosticsTests(unittest.TestCase):
+    def test_pressure_error_statistics_distinguish_node_and_volume_weights(self):
+        stats = error_statistics(np.array([1., 3.]), np.array([3., 1.]))
+        self.assertAlmostEqual(stats["node_rms_pa"], np.sqrt(5.))
+        self.assertAlmostEqual(stats["volume_weighted_rms_pa"], np.sqrt(3.))
+        self.assertEqual(stats["absolute_quantiles_pa"]["0.5"], 2.)
+        self.assertIsNone(error_statistics(np.array([]), np.array([]))["node_rms_pa"])
+        with self.assertRaises(ValueError):
+            error_statistics(np.array([1.]), np.array([-1.]))
+
     def test_seeded_holdout_matches_recorded_split(self):
         mask = heldout_mask(7, 1961, 42)
         self.assertEqual(mask.shape, (7, 1961))
@@ -37,6 +47,29 @@ class PressureDiagnosticsTests(unittest.TestCase):
         check_pressure_anchors(original, same, np.array([2, 0, 1]))
         with self.assertRaisesRegex(ValueError, "anchor differs"):
             check_pressure_anchors(original, changed, np.array([2, 0, 1]))
+
+    def test_source_comparison_uses_only_common_accepted_times(self):
+        stream = BytesIO()
+        np.savez_compressed(stream, node_volumes=np.array([1., 3.]))
+        config = SimpleNamespace(seed=42, mode="driven", seed_field=0., major_radius=1.,
+                                 to_dict=lambda: {"time_steps": 2, "seed": 42})
+        def source(times, pressures, name):
+            n = len(times)
+            return SimpleNamespace(config=config, points=np.array([[0., 0., 0.], [1., 0., 0.]]),
+                                   times=np.array(times), run_id=name,
+                                   metadata={"conductor_mask": [True, True],
+                                             "pinn_physics": {"bc_nodes": {"1": [0]}}},
+                                   fields={"pressure": np.array(pressures), "velocity": np.zeros((n, 2, 3)),
+                                           "liquid_fraction": np.zeros((n, 2))},
+                                   artifact_bytes=lambda _: stream.getvalue())
+        config.config_hash = "hash"
+        first = source([0., .5, 1.], [[0., 0.], [0., 1.], [0., 1.]], "first")
+        second = source([0., .25, 1.], [[0., 0.], [0., 2.], [0., 3.]], "second")
+        with patch("scripts.pinn_pressure_diagnostics.accepted_residuals", return_value={}):
+            comparison = compare_sources(first, second)
+        self.assertEqual([row["time_s"] for row in comparison["common_accepted_times"]], [0., 1.])
+        self.assertTrue(all(not row["interpolated"] for row in comparison["common_accepted_times"]))
+        self.assertAlmostEqual(comparison["common_accepted_times"][-1]["pressure_difference"]["volume_weighted_rms_pa"], np.sqrt(3.))
 
     def test_lorentz_reconstruction_on_uniform_analytic_field(self):
         points = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])

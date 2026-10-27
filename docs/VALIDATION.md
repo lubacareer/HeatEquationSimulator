@@ -297,6 +297,75 @@ unsuccessful PINNs, water precision, and complete profiles remain open.
 
 ## Pressure and CUDA follow-up (2026-10-27)
 
+### Timestep, operator, Huber and memory investigation
+
+A new 12-nominal-step source passed the existing FE source checks. On the
+matched conductor mesh at accepted t=0.020 s, node-weighted pressure RMS
+differences were 0.0047032 Pa (original versus six steps), 0.0073358 Pa
+(original versus 12), and 0.0026523 Pa (six versus 12). The last comparison
+has velocity RMS difference 2.5696e-9 m/s and maximum liquid-fraction
+difference 3.6123e-9. These are differences among three discrete calculations,
+not a convergence proof or a direct comparison to the all-time PINN gate.
+The new report records each common accepted time, source-specific normalized
+residuals, nodal/volume-weighted errors and quantiles without interpolation.
+At 0.020 s, held-out pressure absolute error had median 0.0024242 Pa, 90th
+percentile 0.0073822 Pa, and maximum 0.0182440 Pa. Volume-weighted held-out
+statistics describe only sampled nodes and are not a whole-volume estimate.
+Evidence: `.cache/pinn-pressure-followup/diagnostics-refined12-isolated/`.
+
+The independent worker/PyTorch comparison at 0.01667–0.020 s used matching
+fields, mesh, masks and gauge. The five analytic directional Jacobian actions
+and four raw momentum, continuity, induction and charge residuals matched the
+declared comparison tolerances. Raw enthalpy residuals differed by up to
+3.5654e-4 (worker maximum 2.0260e-4), so the strict raw comparison **failed**;
+the discrepancy after the existing qualification normalization was 1.9028e-12,
+well below the 0.1 residual limit. A counterfactual with equal current and
+previous temperature reduced the raw difference to 7.39e-12, consistent with
+transient enthalpy cancellation but not proof of its cause. This counterfactual
+is not an accepted solve. No qualification gate was changed. Evidence:
+`.cache/pinn-pressure-followup/operator-probe-final/report.json` and
+`.cache/pinn-pressure-followup/operator-probe-v14-counterfactual/report.json`.
+On the distinct accepted 0–0.01667 s interval, the same four residual and five
+Jacobian comparisons matched; raw heat again failed (maximum difference
+1.1214e-4, normalized maximum 4.49e-13). Evidence:
+`.cache/pinn-pressure-followup/operator-probe-second-interval/report.json`.
+
+The source-bound Huber pilot used 0.003 Pa and the training-only pressure scale;
+its quadratic region matches MSE. Against a matched control, training pressure
+normalized RMSE was 0.0857890 versus 0.0850952, so Huber was not selected for
+a refined-source screen. After that selection was frozen, held-out pressure
+errors were 0.1174506 versus 0.1158900; both fail the unchanged 0.1 gate. Both
+completed 200 Adam and 10 L-BFGS steps, with unchanged input and implementation
+hashes. Evidence: `.cache/pinn-pressure-followup/huber-selection-20261027.json`
+and the `huber-control-20261027` / `huber-candidate-20261027` reports.
+
+Opt-in telemetry records CUDA allocation, reservation, process peaks, device
+free memory, stage/closure counts, checkpoints, rollback and errors. A saved
+Liquid epoch-850 checkpoint completed 13 L-BFGS steps and 26 closures in 16.36 s
+without OOM. Allocated memory after each step was 21,912,064 bytes and peak
+allocation was 203,548,672 bytes. This does not identify the earlier intermittent
+failure or prove a full run will pass. Telemetry begins after model preparation,
+so preparation failures are not logged. It does not empty the CUDA cache.
+Evidence: `.cache/pinn-memory-liquid-probe-20261027/report.json` and its JSONL log.
+
+Five focused cases passed through the suite runner (44 individual tests),
+covering operator comparisons, catalog, CPU/CUDA telemetry, pressure pilots,
+and pressure diagnostics. This partial selection does not qualify either
+complete profile. Evidence:
+`.cache/pinn-pressure-followup/investigation-suite-20261027/report.json`.
+
+Enable telemetry for the targeted Liquid rerun in PowerShell:
+
+```powershell
+$env:MAGNETIC_TORUS_PINN_MEMORY_LOG = (Join-Path (Get-Location) '.cache\pinn-memory-liquid.jsonl')
+conda run --no-capture-output -n torch-gpu python -B scripts/run_all_tests.py --profile full --resume ".cache/test-suite/20261026T133138.135583Z" --case "pinn.fe.liquid.dynamo.vms"
+Remove-Item Env:MAGNETIC_TORUS_PINN_MEMORY_LOG
+```
+
+The log is opt-in, append-only and PID-tagged. The runner reuses prerequisites
+only when their fingerprints and artifacts remain valid. The complete Liquid
+qualification and enlarged water calculation remain pending.
+
 Exploratory signed and absolute pressure maps, per-snapshot statistics, radial
 sample counts, and the accepted-field Lorentz-force reconstruction are saved in
 `.cache/pinn-pressure-followup/diagnostics-v5/`. At the original accepted

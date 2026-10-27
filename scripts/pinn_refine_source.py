@@ -1,4 +1,4 @@
-"""Create and independently check a six-step FE source for PINN research.
+"""Create and independently check a finer-step FE source for PINN research.
 
 The input HDF5 is copied before loading because RunStore extracts embedded
 artifacts beside a loaded file. No application history is used or modified.
@@ -79,6 +79,7 @@ def main() -> int:
     run.add_argument("--source", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--timeout", type=float, default=300.)
+    run.add_argument("--steps", type=int, default=6)
     check = sub.add_parser("verify")
     check.add_argument("--source", type=Path, required=True)
     check.add_argument("--output", type=Path, required=True)
@@ -93,6 +94,8 @@ def main() -> int:
 
     if not 1 <= args.timeout <= 3600:
         parser.error("The refinement timeout must be between 1 and 3600 seconds.")
+    if not 1 <= args.steps <= 1000:
+        parser.error("Nominal steps must be between 1 and 1000.")
     source_path = args.source.resolve(strict=True)
     directory = args.output.resolve()
     if directory.exists() and any(directory.iterdir()):
@@ -107,14 +110,16 @@ def main() -> int:
         parser.error("This follow-up requires the accepted driven FE source.")
     # The driven worker sets the seed-field multiplier to zero; seed 123 gives
     # the later PINN a new deterministic split without changing the driven field.
-    config = replace(source.config, time_steps=6, seed=123).validate()
+    if args.steps <= source.config.time_steps:
+        parser.error("The refinement must use more nominal steps than its input.")
+    config = replace(source.config, time_steps=args.steps, seed=123).validate()
     stop = threading.Event()
     deadline = time.monotonic() + args.timeout
     timer = threading.Timer(args.timeout, stop.set)
     timer.daemon = True
     timer.start()
     summary = {"status": "ERROR", "original_source": str(source_path), "original_sha256": original_hash,
-               "nominal_steps": 6, "split_seed": 123, "timeout_s": args.timeout}
+               "nominal_steps": args.steps, "split_seed": 123, "timeout_s": args.timeout}
     try:
         result = run_simulation(config, lambda f, m: print(f"{f:.2f} {m}", flush=True), stop)
         saved = RunStore(directory / "store").save_run(result)
