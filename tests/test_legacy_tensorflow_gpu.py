@@ -2,6 +2,7 @@
 import os
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 
 @unittest.skipUnless(os.environ.get("RUN_LEGACY_TF_GPU_TEST") == "1", "Requires TensorFlow and an NVIDIA GPU")
@@ -25,12 +26,32 @@ class LegacyTensorFlowGpuTests(unittest.TestCase):
             pcm=SimpleNamespace(rho=1., c=1.), x_input=x,
             bound_mask_array=masks, temp_mask_array=masks, y_T=y_t, y_B=y_b,
         )
-        with tf.device("/GPU:0"):
-            result = dl.train_PINN(
+        initial_weights = []
+
+        class SnapshotLogger(dl.PINNConsoleLogger):
+            def on_train_begin(self, logs=None):
+                initial_weights.extend(v.numpy().copy() for v in self.model.trainable_variables)
+                super().on_train_begin(logs)
+
+        with patch.object(dl, "PINNConsoleLogger", SnapshotLogger), tf.device("/GPU:0"):
+            loss, metrics, temperature, boundary = dl.train_PINN(
                 model, x, x, y_t, y_b, epochs=1,
                 mask_T=masks, mask_B=masks, batch_size=4,
             )
-        self.assertTrue(result)
+        self.assertTrue(initial_weights, "Training began without trainable weights")
+        final_weights = [v.numpy() for v in model.trainable_variables]
+        self.assertEqual(len(initial_weights), len(final_weights))
+        self.assertTrue(any(not np.array_equal(before, after)
+                            for before, after in zip(initial_weights, final_weights)),
+                        "One epoch did not update any trainable weights")
+        self.assertGreater(int(model.optimizer.iterations.numpy()), 0)
+        for values in (loss, metrics["raw_loss"], metrics["scaled_accuracy_T"],
+                       metrics["scaled_accuracy_B"], metrics["physics_loss"]):
+            self.assertEqual(len(values), 1)
+            self.assertTrue(np.isfinite(values).all())
+        for prediction in (temperature, boundary):
+            self.assertEqual(prediction.shape, (len(x), 1))
+            self.assertTrue(np.isfinite(prediction).all())
 
 
 if __name__ == "__main__":

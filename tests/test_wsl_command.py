@@ -1,13 +1,43 @@
 """WSL launches must pass arguments literally rather than evaluate a shell."""
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from magnetic_torus.backend_environment import wsl_command, wsl_distribution, wsl_path
+
+
+class WSLDistributionSelectionTests(unittest.TestCase):
+    def test_diagnostics_and_installer_use_shared_distribution_precedence(self):
+        from magnetic_torus import diagnostics
+        from test_setup_geant4 import Geant4InstallerTests
+
+        variants = [
+            ({"MAGNETIC_TORUS_WSL_DISTRO": "Selected Ubuntu", "TORUS_WSL_DISTRO": "Old Ubuntu"}, "Selected Ubuntu"),
+            ({"TORUS_WSL_DISTRO": "Old Ubuntu"}, "Old Ubuntu"),
+            ({}, "Ubuntu"),
+        ]
+        for variables, expected in variants:
+            with self.subTest(variables=variables), patch.dict(os.environ, variables, clear=True):
+                completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+                with (patch.object(diagnostics.os, "name", "nt"),
+                      patch.object(diagnostics.importlib.metadata, "version", return_value="test"),
+                      patch.object(diagnostics.subprocess, "run", return_value=completed) as run):
+                    diagnostics.inspect_environment()
+                self.assertEqual([call.args[0][2] for call in run.call_args_list[1:]],
+                                 [expected, expected])
+                with (patch.object(sys, "platform", "win32"),
+                      patch("test_setup_geant4.shutil.which", return_value="wsl"),
+                      patch("test_setup_geant4.subprocess.run", return_value=completed),
+                      patch.object(Geant4InstallerTests, "runner", create=True)):
+                    Geant4InstallerTests.setUpClass()
+                    self.assertEqual(Geant4InstallerTests.runner[2], expected)
 
 
 @unittest.skipUnless(sys.platform == "win32" and shutil.which("wsl"), "Requires Windows WSL")

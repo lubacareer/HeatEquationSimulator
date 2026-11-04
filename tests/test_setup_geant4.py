@@ -72,7 +72,7 @@ class Geant4InstallerTests(unittest.TestCase):
         if sys.platform == "win32":
             if not shutil.which("wsl"):
                 raise unittest.SkipTest("Installer tests need Bash in Linux/WSL.")
-            cls.runner = wsl_command(distribution=os.environ.get("TORUS_WSL_DISTRO", "Ubuntu"))
+            cls.runner = wsl_command()
         elif shutil.which("bash"):
             cls.runner = []
         else:
