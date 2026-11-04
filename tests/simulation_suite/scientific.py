@@ -261,12 +261,12 @@ def _references(request, checks, progress, cancel):
 
 
 def _fe_references(request, checks, progress, cancel):
-    from magnetic_torus.backend_environment import wsl_path, wsl_distribution
+    from magnetic_torus.backend_environment import wsl_command, wsl_path
     path = Path(request["case_dir"]) / "fe-references.json"
     worker = ROOT / "magnetic_torus" / "workers" / "fenics_worker.py"
     interpreter = os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3")
     if sys.platform == "win32":
-        command = ["wsl", "-d", wsl_distribution(), "--", interpreter, wsl_path(worker), "--benchmarks", wsl_path(path)]
+        command = wsl_command(interpreter, wsl_path(worker), "--benchmarks", wsl_path(path))
     else:
         command = [interpreter, str(worker), "--benchmarks", str(path)]
     completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)

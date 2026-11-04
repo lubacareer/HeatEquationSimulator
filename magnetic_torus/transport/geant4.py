@@ -13,7 +13,7 @@ from typing import Any, Mapping
 import uuid
 import numpy as np
 from ..models import DoseResult, Progress, RunResult
-from ..backend_environment import wsl_distribution, wsl_path
+from ..backend_environment import wsl_command, wsl_path
 from .common import _check
 from .fields import frozen_field
 from .sampling import sample_source
@@ -23,7 +23,7 @@ def _geant4_command(request_path: Path) -> list[str]:
     binary = os.environ.get("TORUS_GEANT4_WORKER", "")
     if os.name == "nt":
         executable = binary or "/opt/magnetic-torus/bin/torus-dose-run"
-        return ["wsl", "-d", wsl_distribution(), "--", executable, wsl_path(request_path)]
+        return wsl_command(executable, wsl_path(request_path))
     executable = binary or shutil.which("torus-dose-run") or "/opt/magnetic-torus/bin/torus-dose-run"
     if not Path(executable).is_file():
         raise RuntimeError("Geant4 dose worker is not installed. Run bash scripts/setup_geant4.sh in Ubuntu/WSL, then restart the app.")
@@ -36,7 +36,7 @@ def _stop_worker(process: subprocess.Popen, pid_path: Path, *, via_wsl: bool) ->
         try:
             worker_pid = pid_path.read_text(encoding="ascii").strip()
             if worker_pid.isdigit():
-                subprocess.run(["wsl", "-d", wsl_distribution(), "--", "kill", "-TERM", worker_pid],
+                subprocess.run(wsl_command("/usr/bin/kill", "-TERM", worker_pid),
                                capture_output=True, timeout=15,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, UnicodeError, subprocess.SubprocessError):

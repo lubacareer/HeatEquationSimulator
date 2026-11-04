@@ -197,7 +197,7 @@ class RadiationTests(unittest.TestCase):
                     with self.assertRaises(SimulationCancelled) as raised:
                         calculate_dose(result, 0, lambda *_: None, None, Path(directory))
                 self.assertIs(raised.exception, original)
-                self.assertEqual(kill.call_args.args[0][-3:], ["kill", "-TERM", "12345"])
+                self.assertEqual(kill.call_args.args[0][-3:], ["/usr/bin/kill", "-TERM", "12345"])
                 process.terminate.assert_called_once_with()
                 process.wait.assert_called_once_with(timeout=10)
 

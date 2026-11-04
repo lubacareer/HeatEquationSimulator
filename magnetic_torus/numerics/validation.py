@@ -9,7 +9,7 @@ import sys
 from typing import Any
 import numpy as np
 from ..models import Progress, ScenarioConfig
-from ..backend_environment import wsl_distribution, wsl_path
+from ..backend_environment import wsl_command, wsl_path
 from .thermal import stefan_front_benchmark
 from .weak_residual import evaluate_weak_residual_torch
 
@@ -82,7 +82,7 @@ def write_validation_report(destination: str | Path, include_fenics: bool = Fals
         case_file = destination.with_name(destination.stem + "_fenics.json")
         interpreter = os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3")
         if sys.platform == "win32":
-            command = ["wsl", "-d", wsl_distribution(), "--", interpreter, wsl_path(worker), "--benchmarks", wsl_path(case_file)]
+            command = wsl_command(interpreter, wsl_path(worker), "--benchmarks", wsl_path(case_file))
         else:
             command = [interpreter, str(worker), "--benchmarks", str(case_file)]
         try:

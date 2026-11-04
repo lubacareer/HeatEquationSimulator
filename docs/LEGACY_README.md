@@ -28,64 +28,36 @@ The application simulates the latent heat thermal energy storage in lunar regoli
 
 ### How to Run the Program
 
-1. **Ensure Prerequisites Are Met:**
-   - **Docker Desktop**: Make sure Docker Desktop is installed and running on your system.
-   - **Xming (Windows users)**: Install and run Xming to display GUI applications. Configure it to allow external connections.
-   - **X Server for Linux/macOS**: Ensure X11 (Linux) or XQuartz (macOS) is installed and running for GUI display.
+Use the local setup below. The older Dockerfile and published image are not currently validated for this version of the legacy application.
 
-2. **Pull the Docker image from Google Cloud Container Registry:**
+## Local setup and NVIDIA GPU on WSL2
 
-    ```commandline
-   docker pull gcr.io/sonic-cumulus-357519/scientific-project
-    ```
-3. **Run the Docker container:**
+The legacy application uses Python 3.12 and TensorFlow 2.21. On Windows, native
+TensorFlow runs on the CPU. For NVIDIA GPU acceleration, run the legacy GUI in
+Ubuntu on WSL2 with a current NVIDIA Windows driver and WSLg. Install Conda in
+Ubuntu, then from the repository root inside Ubuntu run:
 
-    ```commandline
-   docker run -it --rm -e DISPLAY=host.docker.internal:0.0 gcr.io/sonic-cumulus-357519/scientific-project
-    ```
+```bash
+conda create -n legacy-tf python=3.12 tk -y
+conda activate legacy-tf
+python -m pip install --upgrade pip
+python -m pip install -r requirements-gpu.txt
+# Add the CUDA libraries installed in this environment to the loader path.
+export LD_LIBRARY_PATH="$(python -c 'import glob, site; print(":".join(p for s in site.getsitepackages() for p in glob.glob(s + "/nvidia/*/lib")))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+python interface3.py --legacy
+```
 
-4. **Display Configuration:**
-   - Ensure the DISPLAY environment variable is correctly set for your operating system to connect to the X server (e.g., DISPLAY=host.docker.internal:0.0 for Windows users).
+Confirm that the device list contains a GPU before starting training. The GPU
+requirements use TensorFlow's Linux CUDA dependencies; a Windows DirectML
+plugin is not required. WSLg supplies the display for the Tkinter window. To
+repeat the GPU training smoke test from the repository root, run:
 
-## Troubleshooting: NumPy DLL load failed
+```bash
+RUN_LEGACY_TF_GPU_TEST=1 python -m unittest discover -s tests -p test_legacy_tensorflow_gpu.py
+```
 
-If you see an error similar to the following when launching the app or importing matplotlib/NumPy:
-
-- ImportError: DLL load failed while importing _multiarray_umath: The specified module could not be found.
-- ImportError: numpy._core.multiarray failed to import
-
-This is an environment issue: your Python environment has an incompatible or broken NumPy build (often caused by mixing conda and pip, or installing wheels that do not match your Python version/ABI).
-
-The application now detects this early and shows a friendly message before heavy imports. To fix your environment, choose ONE of the options below and run the commands in a clean environment.
-
-Option A — Conda (recommended if you created a conda env):
-
-    # Create or repair environment (example name: tf_env)
-    conda create -n tf_env python==3.10 -y
-    conda activate tf_env
-    # Install compatible scientific stack from conda-forge
-    conda install -c conda-forge "numpy==1.23.5" "scipy==1.10.*" "matplotlib" "scikit-learn>=1.5,<2" -y
-    # Optional: TensorFlow CPU and DirectML plugin on Windows
-    pip install --upgrade pip
-    pip install --extra-index-url https://pkgs.dev.azure.com/azure-public/vside/_packaging/tensorflow-directml/pypi/simple/ \
-        "tensorflow-cpu==2.10.0" "tensorflow-directml-plugin==0.4.0.dev230202"
-
-Option B — Pure pip (no conda), in a clean venv:
-
-    py -3.10 -m venv .venv
-    .venv\Scripts\activate
-    python -m pip install --upgrade pip
-    pip uninstall -y numpy scipy
-    pip install --only-binary=:all: "numpy==1.23.5" "scipy==1.11.4" matplotlib "scikit-learn>=1.5,<2"
-
-Notes:
-- Do NOT mix conda and pip for NumPy/SciPy in the same environment.
-- Ensure your Python version matches the pinned versions in requirements.txt.
-- On Python 3.12+, NumPy 2.x will be installed and our code handles NumPy 2 changes.
-
-Local run (without Docker):
-
-    python -m pip install -r requirements.txt
-    python interface3.py --legacy
-
-If the GUI exits early with a "NumPy import error" dialog, follow the steps above to repair your environment.
+For CPU use on Windows or another supported platform, create a clean Python
+3.12 environment, install `requirements.txt`, and run `python interface3.py
+--legacy`. If NumPy fails to import, recreate the environment rather than
+mixing incompatible Conda and pip packages.

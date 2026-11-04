@@ -140,12 +140,10 @@ for sig in (signal.SIGTERM, signal.SIGKILL):
     if targets: time.sleep(.1)
 print('Owned WSL processes terminated:', len(targets))
 """
-    distro = os.environ.get(
-        "MAGNETIC_TORUS_WSL_DISTRO", os.environ.get("TORUS_WSL_DISTRO", "Ubuntu")
-    )
+    from magnetic_torus.backend_environment import wsl_command
     try:
         result = subprocess.run(
-            ["wsl", "-d", distro, "--", "/usr/bin/python3", "-", root],
+            wsl_command("/usr/bin/python3", "-", root),
             input=code,
             capture_output=True,
             text=True,

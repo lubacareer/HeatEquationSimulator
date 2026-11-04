@@ -151,7 +151,7 @@ class CapabilityProbeTests(unittest.TestCase):
                         budget = SimpleNamespace(preflight_token=Path("owner") if owned else None,
                                                  register_preflight=lambda: None, poll=lambda: None)
                         with (patch.object(capabilities.sys, "platform", platform),
-                              patch.object(capabilities, "wsl_distribution", return_value="test-wsl"),
+                              patch("magnetic_torus.backend_environment.wsl_distribution", return_value="test-wsl"),
                               patch.object(capabilities, "wsl_path", return_value="/owned/probe"),
                               patch.object(capabilities, "_run_json", side_effect=responses) as probes,
                               patch.object(capabilities.importlib.metadata, "version", return_value="test-version"),
@@ -164,7 +164,7 @@ class CapabilityProbeTests(unittest.TestCase):
                             command = probes.call_args_list[3].args[0]
                         self.assertNotIn("", command)
                         self.assertEqual(command[:5] if platform == "win32" else command[:2],
-                                         ["wsl", "-d", "test-wsl", "--", "/usr/bin/python3"]
+                                         ["wsl", "-d", "test-wsl", "--exec", "/usr/bin/python3"]
                                          if platform == "win32" else ["/usr/bin/python3", "-"])
                         self.assertEqual([value for value in command if value.startswith("--worker=")],
                                          [f"--worker={override}"] if override else [])

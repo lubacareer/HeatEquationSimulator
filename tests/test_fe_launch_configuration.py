@@ -39,7 +39,7 @@ class FELaunchConfigurationTests(unittest.TestCase):
     def assert_interpreter(self, command, platform, configured):
         expected = configured or "/usr/bin/python3"
         if platform == "win32":
-            self.assertEqual(command[:5], ["wsl", "-d", "Test Ubuntu", "--", expected])
+            self.assertEqual(command[:5], ["wsl", "-d", "Test Ubuntu", "--exec", expected])
             worker_index = 5
         else:
             self.assertEqual(command[0], expected)
@@ -76,7 +76,7 @@ class FELaunchConfigurationTests(unittest.TestCase):
                     self.assertEqual(len(fe_calls), 1)
                     selected = interpreter or "/usr/bin/python3"
                     expected = (
-                        ["wsl", "-d", "Test Ubuntu", "--", selected, "-"]
+                        ["wsl", "-d", "Test Ubuntu", "--exec", selected, "-"]
                         if platform == "win32"
                         else [selected, "-"]
                     )

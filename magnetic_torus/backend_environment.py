@@ -14,3 +14,12 @@ def wsl_path(path: Path) -> str:
 
 def wsl_distribution() -> str:
     return os.environ.get("MAGNETIC_TORUS_WSL_DISTRO", os.environ.get("TORUS_WSL_DISTRO", "Ubuntu"))
+
+
+def wsl_command(*arguments: str, distribution: str | None = None) -> list[str]:
+    """Pass arguments directly to the WSL executable without a shell.
+
+    WSL's ``--`` form builds a shell command and can expand substitutions
+    inside paths, even when Python receives a list.
+    """
+    return ["wsl", "-d", distribution if distribution is not None else wsl_distribution(), "--exec", *arguments]
