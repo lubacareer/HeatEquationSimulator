@@ -115,11 +115,23 @@ that omit their input contents. Run the generator with Python and pip present
 installing another package. An operator-supplied inventory is evidence, not a
 cryptographic attestation of the selected image.
 
-The original `source_image`/`inventory_sha256` fields retain the pin-selection
-origin. The `validation_source_image`/`validation_inventory_sha256` fields and
-`requirements_validation` record the extended dependency/marker validation.
-They may identify a later runtime-equivalent verified image without changing
-the already proven lock bodies or package versions.
+The two confined requirement files are captured once as immutable bytes. The
+validator parses that snapshot, including its local include, and provenance
+digests use the same bytes after metadata retrieval. If the checkout changes
+during generation, the resulting old-snapshot record cannot pass the Docker
+check against the changed files. Malformed inventory shapes fail with fixed,
+sanitized CLI diagnostics before network requests or lock publication.
+
+In the checked-in record, `source_image`/`inventory_sha256` identify the original
+pin-selection evidence. The `validation_source_image`/`validation_inventory_sha256`
+fields and `requirements_validation` record a later validation of the same lock
+bodies and package versions. A validation-only record update must first prove
+that exact lock/version equivalence and retain the original pin-selection fields.
+The CLI below performs full regeneration: its supplied image and inventory
+become the new pin-selection and validation pair, and its generation timestamp
+changes. It does not reproduce this historical validation-only record update;
+preserving an old origin while deliberately selecting new pins would misstate
+their provenance.
 
 To regenerate after deliberately verifying another compatible image, capture
 its distribution/dependency metadata, marker environment and target tags, then run the generator from this

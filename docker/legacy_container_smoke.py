@@ -9,6 +9,20 @@ from pathlib import Path
 import tempfile
 
 
+def exercise_event_loop(application) -> None:
+    """Require the scheduled close callback to finish during App.run()."""
+    callback_completed = False
+
+    def close_from_event_loop():
+        nonlocal callback_completed
+        application.on_closing()
+        callback_completed = True
+
+    application.root.after(200, close_from_event_loop)
+    application.run()
+    assert callback_completed, "Scheduled Tk close callback did not complete during App.run()"
+
+
 def main() -> None:
     assert os.getuid() == os.geteuid() == 10001, "Container must run as its non-root user"
     assert os.getgid() == os.getegid() == 10001, "Container must use its unprivileged group"
@@ -42,15 +56,15 @@ def main() -> None:
         assert application.root.winfo_viewable(), "Legacy Tk window did not render"
         title = application.root.title()
         assert title == "Heat Conduction Dashboard"
-        application.root.after(200, application.on_closing)
-        application.run()
+        exercise_event_loop(application)
     finally:
         try:
             application.root.destroy()
         except tk.TclError:
             pass
     print(json.dumps({"passed": True, "uid": os.geteuid(), "gid": os.getegid(),
-                      "gui": title, "writable_data": True, "protected_source": True}))
+                      "gui": title, "event_loop_callback": True,
+                      "writable_data": True, "protected_source": True}))
 
 
 if __name__ == "__main__":

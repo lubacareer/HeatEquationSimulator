@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
@@ -18,17 +19,68 @@ from pathlib import Path
 import re
 import stat
 from tempfile import TemporaryDirectory
+from types import MappingProxyType
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 
 from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
 from pip._vendor.packaging.version import InvalidVersion, Version
 
-from check_container_lock import LOCK_FILES, normalized_digest, normalized_text_digest
+from check_container_lock import INPUTS, LOCK_FILES, normalized_text_digest
 
 
 def canonical(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def validate_inventory_shape(inventory: object) -> None:
+    """Reject malformed input with fixed diagnostics before indexing records."""
+    if not isinstance(inventory, dict):
+        raise ValueError("Inventory must be a JSON object")
+    if not isinstance(inventory.get("python"), str) or not inventory["python"].strip():
+        raise ValueError("Inventory needs a Python identity string")
+    tags = inventory.get("tags")
+    if not isinstance(tags, list) or not tags or not all(
+            isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9_.]+-[A-Za-z0-9_.]+-[A-Za-z0-9_.]+", tag)
+            for tag in tags):
+        raise ValueError("Inventory needs a list of target wheel tag strings")
+    if not isinstance(inventory.get("environment"), dict):
+        raise ValueError("Inventory needs the captured target marker environment")
+    packages = inventory.get("distributions")
+    if not isinstance(packages, list) or not packages:
+        raise ValueError("Inventory needs a nonempty distribution list")
+    for package in packages:
+        if not isinstance(package, dict):
+            raise ValueError("Inventory distribution records must be objects")
+        name, version = package.get("name"), package.get("version")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", canonical(name)):
+            raise ValueError("Inventory distribution identity is invalid")
+        if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]*", version):
+            raise ValueError("Inventory distribution version is invalid")
+        try:
+            Version(version)
+        except InvalidVersion:
+            raise ValueError("Inventory distribution version is invalid") from None
+        if not all(isinstance(package.get(field), list) and all(isinstance(item, str) for item in package[field])
+                   for field in ("requires_dist", "provides_extra")):
+            raise ValueError("Inventory needs captured Requires-Dist and Provides-Extra metadata")
+
+
+def capture_requirement_inputs(root: Path) -> Mapping[str, bytes]:
+    """Read each confined ordinary input once and retain immutable byte values."""
+    root = root.resolve()
+    paths = [root / name for name in INPUTS]
+    try:
+        for path in paths:
+            info = path.lstat()
+            reparse = getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if not stat.S_ISREG(info.st_mode) or path.is_symlink() or reparse or path.resolve() != path:
+                raise ValueError("Requirement inputs must be ordinary files at the two canonical root names")
+        if paths[0].samefile(paths[1]):
+            raise ValueError("The two requirement inputs must not alias the same file")
+        return MappingProxyType({path.name: path.read_bytes() for path in paths})
+    except OSError:
+        raise ValueError("The two supported requirement inputs must be readable ordinary files") from None
 
 
 def parse_requirement(text: str) -> Requirement:
@@ -41,13 +93,15 @@ def parse_requirement(text: str) -> Requirement:
     return requirement
 
 
-def validate_inventory(root: Path, inventory: dict) -> dict:
+def validate_inventory(root: Path, inventory: dict,
+                       requirement_inputs: Mapping[str, bytes] | None = None) -> dict:
     """Check declared inputs and their active dependency/extra closure offline.
 
     The inventory is operator-supplied evidence from a verified image, not a
     cryptographic attestation. Markers use its captured target, never this host.
     Only the two confined input files and ordinary PEP 508 entries are supported.
     """
+    validate_inventory_shape(inventory)
     environment = inventory.get("environment")
     expected_target = {"implementation_name": "cpython", "os_name": "posix",
                        "platform_machine": "x86_64", "platform_python_implementation": "CPython",
@@ -84,17 +138,12 @@ def validate_inventory(root: Path, inventory: dict) -> dict:
         packages[name] = package
 
     root = root.resolve()
-    allowed = {root / name for name in ("requirements.txt", "requirements-gpu.txt")}
-    try:
-        for path in allowed:
-            info = path.lstat()
-            reparse = getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-            if not stat.S_ISREG(info.st_mode) or path.is_symlink() or reparse or path.resolve() != path:
-                raise ValueError("Requirement inputs must be ordinary files at the two canonical root names")
-        if (root / "requirements.txt").samefile(root / "requirements-gpu.txt"):
-            raise ValueError("The two requirement inputs must not alias the same file")
-    except OSError:
-        raise ValueError("The two supported requirement inputs must be readable ordinary files") from None
+    allowed = {root / name for name in INPUTS}
+    if requirement_inputs is None:
+        requirement_inputs = capture_requirement_inputs(root)
+    if (not isinstance(requirement_inputs, Mapping) or set(requirement_inputs) != set(INPUTS)
+            or not all(isinstance(value, bytes) for value in requirement_inputs.values())):
+        raise ValueError("Requirement snapshot must contain the two canonical byte inputs")
     visited, pending = set(), deque()
 
     def active(requirement: Requirement, extra: str = "") -> bool:
@@ -112,9 +161,9 @@ def validate_inventory(root: Path, inventory: dict) -> dict:
             return
         visited.add(path)
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            raise ValueError("The two supported requirement inputs must be readable") from None
+            lines = requirement_inputs[path.name].decode("utf-8").splitlines()
+        except UnicodeError:
+            raise ValueError("Requirement inputs must contain valid UTF-8 text") from None
         for raw in lines:
             line = re.sub(r"\s+#.*$", "", raw).strip()
             if not line or line.startswith("#"):
@@ -244,8 +293,15 @@ def main() -> None:
     args = parser.parse_args()
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.source_image):
         parser.error("Use the inspected image's exact sha256 ID")
-    raw_inventory = args.inventory.read_bytes()
-    inventory = json.loads(raw_inventory.decode("utf-8-sig"))
+    try:
+        raw_inventory = args.inventory.read_bytes()
+        inventory = json.loads(raw_inventory.decode("utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        parser.error("Inventory must be a readable UTF-8 JSON document")
+    try:
+        validate_inventory_shape(inventory)
+    except ValueError as error:
+        parser.error(str(error))
     tags = set(inventory["tags"])
     packages = inventory["distributions"]
     if not inventory["python"].startswith("3.12.") or "cp312-cp312-linux_x86_64" not in tags:
@@ -255,7 +311,8 @@ def main() -> None:
         parser.error("Inventory must contain unique distributions and exactly one pip")
     root = Path(__file__).resolve().parents[1]
     try:
-        validation = validate_inventory(root, inventory)
+        requirement_inputs = capture_requirement_inputs(root)
+        validation = validate_inventory(root, inventory, requirement_inputs)
     except (ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
     # No network or output publication occurs until the declared inputs and
@@ -268,10 +325,10 @@ def main() -> None:
     provenance = {"source_image": args.source_image, "python": inventory["python"],
                   "inventory_sha256": hashlib.sha256(raw_inventory).hexdigest(),
                   "fetched_at": datetime.now(timezone.utc).isoformat(),
-                  "source_requirements_sha256": {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-                                                 for name in ("requirements.txt", "requirements-gpu.txt")},
-                  "source_requirements_normalized_sha256": {name: normalized_digest(root / name)
-                                                            for name in ("requirements.txt", "requirements-gpu.txt")},
+                  "source_requirements_sha256": {name: hashlib.sha256(requirement_inputs[name]).hexdigest()
+                                                 for name in INPUTS},
+                  "source_requirements_normalized_sha256": {
+                      name: normalized_text_digest(requirement_inputs[name].decode("utf-8")) for name in INPUTS},
                   "requirements_validation": validation,
                   "validation_inventory_sha256": hashlib.sha256(raw_inventory).hexdigest(),
                   "validation_source_image": args.source_image,

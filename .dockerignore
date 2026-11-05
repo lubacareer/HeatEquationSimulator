@@ -23,3 +23,4 @@ tests/*
 !tests/test_enthalpy_temperature_curve.py
 !tests/test_legacy_png_exports.py
 !tests/test_container_lock.py
+!tests/test_container_gui_smoke.py

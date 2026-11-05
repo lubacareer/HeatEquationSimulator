@@ -1,7 +1,10 @@
 """Verify portable input identity and fail-closed container lock maintenance."""
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from contextlib import redirect_stdout
+import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -213,15 +216,129 @@ class ContainerLockTests(unittest.TestCase):
                             os.link(root / "requirements.txt", root / "requirements-gpu.txt")
                 except OSError:
                     self.skipTest("This host does not permit the synthetic link fixture")
-                read_text = Path.read_text
+                read_bytes = Path.read_bytes
 
-                def guarded_read(path, *args, **kwargs):
+                def guarded_read(path):
                     if path.resolve() == target.resolve():
                         raise AssertionError("External synthetic contents were read")
-                    return read_text(path, *args, **kwargs)
+                    return read_bytes(path)
 
-                with patch.object(Path, "read_text", guarded_read), self.assertRaises(ValueError):
+                with patch.object(Path, "read_bytes", guarded_read), self.assertRaises(ValueError):
                     generator.validate_inventory(root, inventory)
+
+    def test_requirement_edit_during_release_fetch_cannot_gain_a_valid_new_digest(self):
+        """Keep validation and provenance tied to the same single-read bytes."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = self.inventory_fixture(root)
+            expected = {name: (root / name).read_bytes() for name in checker.INPUTS}
+            docker = root / "docker"
+            docker.mkdir()
+            inventory_path = root / "inventory.json"
+            inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+            reads = {name: 0 for name in checker.INPUTS}
+            read_bytes = Path.read_bytes
+
+            def count_input_reads(path):
+                if path.parent == root and path.name in reads:
+                    reads[path.name] += 1
+                return read_bytes(path)
+
+            def release_with_concurrent_edit(package, _tags, _metadata):
+                if package["name"] == "pip":
+                    (root / "requirements-gpu.txt").write_text("tensorflow==2.22.0\n", encoding="utf-8")
+                return {"name": package["name"], "version": package["version"],
+                        "wheels": [{"sha256": "a" * 64}]}
+
+            arguments = [str(docker / "generate_container_lock.py"), "--inventory", str(inventory_path),
+                         "--source-image", "sha256:" + "a" * 64, "--metadata-dir", str(root / "metadata")]
+            with patch.object(generator, "__file__", str(docker / "generate_container_lock.py")), \
+                    patch.object(sys, "argv", arguments), patch.object(generator, "release", release_with_concurrent_edit), \
+                    patch.object(Path, "read_bytes", count_input_reads), redirect_stdout(io.StringIO()):
+                generator.main()
+            self.assertEqual(reads, {name: 1 for name in checker.INPUTS})
+            provenance = docker / "requirements-lock-provenance.json"
+            record = json.loads(provenance.read_text(encoding="utf-8"))
+            self.assertEqual(record["source_requirements_sha256"],
+                             {name: hashlib.sha256(raw).hexdigest() for name, raw in expected.items()})
+            self.assertEqual(record["source_requirements_normalized_sha256"],
+                             {name: checker.normalized_text_digest(raw.decode("utf-8")) for name, raw in expected.items()})
+            with self.assertRaisesRegex(ValueError, "stale for requirements-gpu.txt"):
+                checker.check(root, provenance)
+
+    def test_captured_requirement_bytes_are_immutable_and_used_for_validation(self):
+        """A later checkout edit cannot alter the snapshot being validated."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = self.inventory_fixture(root)
+            captured = generator.capture_requirement_inputs(root)
+            with self.assertRaises(TypeError):
+                captured["requirements.txt"] = b"tensorflow==2.22.0\n"
+            (root / "requirements.txt").write_text("tensorflow==2.22.0\n", encoding="utf-8")
+            self.assertIn("tensorflow", generator.validate_inventory(root, inventory, captured)["required_distributions"])
+            with self.assertRaisesRegex(ValueError, "version constraint"):
+                generator.validate_inventory(root, inventory)
+
+    def test_malformed_inventory_shapes_fail_with_sanitized_cli_errors(self):
+        """Reject wrong JSON shapes before network, outputs, or input-value traces."""
+        marker = "DO_NOT_PRINT_INVENTORY_MARKER"
+        cases = ("root-list", "root-null", "missing-tags", "tags-string", "tag-object", "python-list",
+                 "distributions-object", "record-list", "missing-name", "name-object", "credential-name",
+                 "version-object", "invalid-version", "dependency-object")
+        for kind in cases:
+            with self.subTest(kind=kind), TemporaryDirectory() as directory:
+                root = Path(directory)
+                inventory = self.inventory_fixture(root)
+                if kind == "root-list":
+                    inventory = [marker]
+                elif kind == "root-null":
+                    inventory = None
+                elif kind == "missing-tags":
+                    inventory.pop("tags")
+                elif kind == "tags-string":
+                    inventory["tags"] = marker
+                elif kind == "tag-object":
+                    inventory["tags"] = [{marker: True}]
+                elif kind == "python-list":
+                    inventory["python"] = [marker]
+                elif kind == "distributions-object":
+                    inventory["distributions"] = {marker: True}
+                elif kind == "record-list":
+                    inventory["distributions"][0] = [marker]
+                elif kind == "missing-name":
+                    inventory["distributions"][0].pop("name")
+                elif kind == "name-object":
+                    inventory["distributions"][0]["name"] = {marker: True}
+                elif kind == "credential-name":
+                    inventory["distributions"][0]["name"] = f"https://fixture:{marker}@example.invalid"
+                elif kind == "version-object":
+                    inventory["distributions"][0]["version"] = {marker: True}
+                elif kind == "invalid-version":
+                    inventory["distributions"][0]["version"] = marker
+                else:
+                    inventory["distributions"][0]["requires_dist"] = [{marker: True}]
+                docker = root / "docker"
+                docker.mkdir()
+                for source in (CHECKER, CHECKER.with_name("generate_container_lock.py")):
+                    (docker / source.name).write_bytes(source.read_bytes())
+                outputs = {name: b"previous owned publication" for name in (*checker.LOCK_FILES, "requirements-lock-provenance.json")}
+                for name, content in outputs.items():
+                    (docker / name).write_bytes(content)
+                inventory_file = root / "inventory.json"
+                inventory_file.write_text(json.dumps(inventory), encoding="utf-8")
+                launcher = ("import runpy,sys,urllib.request; sys.path.insert(0,sys.argv[1]); "
+                            "urllib.request.urlopen=lambda *a,**k: (_ for _ in ()).throw(AssertionError('network forbidden')); "
+                            "script=sys.argv[2]; sys.argv=sys.argv[2:]; runpy.run_path(script,run_name='__main__')")
+                result = subprocess.run([sys.executable, "-I", "-c", launcher, str(docker),
+                                         str(docker / "generate_container_lock.py"), "--inventory", str(inventory_file),
+                                         "--source-image", "sha256:" + "a" * 64, "--metadata-dir", str(root / "metadata")],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2)
+                self.assertNotIn("Traceback", result.stderr + result.stdout)
+                self.assertNotIn(marker, result.stderr + result.stdout)
+                self.assertIn("Inventory", result.stderr)
+                self.assertFalse((root / "metadata").exists())
+                self.assertEqual({name: (docker / name).read_bytes() for name in outputs}, outputs)
 
     def test_invalid_inputs_and_inventory_fail_before_network_or_publication(self):
         marker = "DO_NOT_PRINT_FIXTURE_MARKER"
