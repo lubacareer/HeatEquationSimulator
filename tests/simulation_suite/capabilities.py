@@ -16,7 +16,7 @@ import sys
 import time
 from typing import Any
 
-from magnetic_torus.backend_environment import wsl_distribution, wsl_path
+from magnetic_torus.backend_environment import wsl_command, wsl_path
 from .budget import InvocationInterrupted
 
 
@@ -395,7 +395,7 @@ print(json.dumps(out))
 
 def _backend_command(*, interpreter: str = "/usr/bin/python3") -> list[str]:
     if sys.platform == "win32":
-        return ["wsl", "-d", wsl_distribution(), "--", interpreter, "-"]
+        return wsl_command(interpreter, "-")
     return [interpreter, "-"]
 
 

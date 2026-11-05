@@ -489,7 +489,7 @@ class InvocationBudgetTests(unittest.TestCase):
                 return symlink_id
 
             def runTest(self):
-                test_setup_geant4.create_linux_symlink(["wsl", "--"], "/source", "/destination")
+                test_setup_geant4.create_linux_symlink(["wsl", "--exec"], "/source", "/destination")
 
         class ApplicableTest(unittest.TestCase):
             def runTest(self):

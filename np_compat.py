@@ -62,25 +62,27 @@ def check_numpy_health() -> tuple[bool, str]:
 
 def friendly_numpy_error(ex_msg: str) -> str:
     """
-    Produce a concise, actionable message for DLL load failures on Windows.
+    Produce a concise, actionable message for NumPy binary import failures.
     """
     lines = [
-        "NumPy failed to import its core C-extensions (DLL load failure).",
+        "NumPy failed to import its core C-extensions.",
         "This is an environment issue (often due to mixing conda and pip,",
         "or installing a NumPy build incompatible with your Python).",
         "",
-        "How to fix (choose ONE toolchain):",
-        "- Conda (recommended if you created a conda env):",
-        "    conda install -n tf_env -c conda-forge \"python==3.10\" \"numpy==1.23.5\" \"scipy==1.10.*\"",
+        "Recreate a clean Python 3.12 environment for the application you use:",
+        "- Magnetic Torus desktop: follow README.md and install",
+        "    requirements-desktop.txt plus the appropriate PyTorch build.",
         "",
-        "- Pure pip (in a clean venv):",
-        "    pip uninstall -y numpy scipy",
-        "    python -m pip install --upgrade pip",
-        "    pip install --only-binary=:all: \"numpy==1.26.4\" \"scipy==1.11.4\"",
+        "- Legacy TensorFlow CPU: in the clean environment, run",
+        "    python -m pip install -r requirements.txt",
+        "",
+        "- Legacy TensorFlow NVIDIA GPU: use Ubuntu on WSL2 and install",
+        "    requirements-gpu.txt as described in docs/LEGACY_README.md.",
         "",
         "Notes:",
-        "- Do NOT mix conda and pip for NumPy/Scipy in the same environment.",
-        "- Ensure your Python version matches the pinned versions in requirements.txt.",
+        "- Keep the desktop and legacy TensorFlow environments separate.",
+        "- Do not repair the environment by downgrading NumPy independently",
+        "  of the selected application's dependency requirements.",
         "",
         f"Original import error: {ex_msg}",
     ]

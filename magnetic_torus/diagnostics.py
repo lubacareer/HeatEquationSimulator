@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 
+from .backend_environment import wsl_command
+
 
 def inspect_environment() -> dict:
     packages = {}
@@ -18,13 +20,15 @@ def inspect_environment() -> dict:
     result = {"python": sys.executable, "python_version": sys.version, "packages": packages}
     commands = {"torch": [sys.executable, "-B", "-c", "import torch,json; print(json.dumps({'cuda_available':torch.cuda.is_available(),'cuda':torch.version.cuda,'device':torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}))"]}
     if os.name == "nt":
-        commands["fenics"] = ["wsl", "-d", os.environ.get("TORUS_WSL_DISTRO", "Ubuntu"), "--", "/usr/bin/python3", "-c",
-                               "import dolfinx,gmsh,petsc4py,json; print(json.dumps({'dolfinx':dolfinx.__version__,'gmsh':gmsh.__version__,'petsc4py':petsc4py.__version__}))"]
-        commands["geant4"] = ["wsl", "-d", os.environ.get("TORUS_WSL_DISTRO", "Ubuntu"), "--", "test", "-x",
-                               os.environ.get("TORUS_GEANT4_WORKER", "/opt/magnetic-torus/bin/torus-dose-run")]
+        commands["fenics"] = wsl_command("/usr/bin/python3", "-c",
+                               "import dolfinx,gmsh,petsc4py,json; print(json.dumps({'dolfinx':dolfinx.__version__,'gmsh':gmsh.__version__,'petsc4py':petsc4py.__version__}))")
+        commands["geant4"] = wsl_command("/usr/bin/test", "-x",
+                               os.environ.get("TORUS_GEANT4_WORKER", "/opt/magnetic-torus/bin/torus-dose-run"))
     for name, command in commands.items():
         try:
-            process = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            # Audited internal programs/literal argv; WSL uses --exec, and the
+            # configured worker path is only a test -x operand. Re-audit new commands.
+            process = subprocess.run(command, capture_output=True, text=True, timeout=30)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
             result[name] = {"available": process.returncode == 0, "output": process.stdout.strip(), "error": process.stderr.strip()}
         except (OSError, subprocess.TimeoutExpired) as error:
             result[name] = {"available": False, "error": str(error)}

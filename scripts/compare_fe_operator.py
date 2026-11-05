@@ -83,7 +83,7 @@ def main() -> int:
         parser.error("Choose a new output directory and a positive timeout.")
     import torch
     import numpy as np
-    from magnetic_torus.backend_environment import wsl_distribution, wsl_path
+    from magnetic_torus.backend_environment import wsl_command, wsl_path
     from magnetic_torus.numerics.weak_residual import _load_weak_artifact, evaluate_weak_residual_torch
     from magnetic_torus.store import RunStore
 
@@ -137,8 +137,8 @@ def main() -> int:
     worker = ROOT / "magnetic_torus" / "workers" / "fenics_worker.py"
     interpreter = os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3")
     if os.name == "nt":
-        command = ["wsl", "-d", wsl_distribution(), "--", interpreter, wsl_path(worker),
-                   wsl_path(request), wsl_path(output), "--operator-probe", wsl_path(probe)]
+        command = wsl_command(interpreter, wsl_path(worker), wsl_path(request), wsl_path(output),
+                              "--operator-probe", wsl_path(probe))
     else:
         command = [interpreter, str(worker), str(request), str(output), "--operator-probe", str(probe)]
     if args.reuse_worker:

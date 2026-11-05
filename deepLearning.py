@@ -1155,7 +1155,7 @@ def train_PINN(model, x, x_boundary, y_T, y_B, epochs, mask_T, mask_B, batch_siz
     }
 
     # Compile the model with a custom training loop (train_step); no Keras loss/metrics needed here
-    model.compile(optimizer=model.optimizer, run_eagerly=debug_logging or PINN_FORCE_EAGER)
+    model.compile(optimizer=model.optimizer, run_eagerly=debug_logging or PINN_FORCE_EAGER, jit_compile=False)
 
     # Explicitly build the model before training
     model.build(input_shape={'temperature_input': x.shape, 'boundary_input': x_boundary.shape})

@@ -197,7 +197,7 @@ class RadiationTests(unittest.TestCase):
                     with self.assertRaises(SimulationCancelled) as raised:
                         calculate_dose(result, 0, lambda *_: None, None, Path(directory))
                 self.assertIs(raised.exception, original)
-                self.assertEqual(kill.call_args.args[0][-3:], ["kill", "-TERM", "12345"])
+                self.assertEqual(kill.call_args.args[0][-3:], ["/usr/bin/kill", "-TERM", "12345"])
                 process.terminate.assert_called_once_with()
                 process.wait.assert_called_once_with(timeout=10)
 
@@ -211,6 +211,37 @@ class RadiationTests(unittest.TestCase):
                 with patch("magnetic_torus.transport.geant4.subprocess.run") as kill:
                     _stop_worker(process, pid_path, via_wsl=True)
                 kill.assert_not_called()
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once_with(timeout=10)
+
+    def test_worker_cleanup_rejects_non_worker_pids(self):
+        from magnetic_torus.transport.geant4 import _stop_worker
+        invalid_pids = ("0", "000", "1", "0001", "-1", "", "12 34", "123\n456",
+                        "2147483648", "9999999999", "9" * 5000, "\u0661\u0662\u0663")
+        for index, worker_pid in enumerate(invalid_pids):
+            with self.subTest(case=index):
+                process = Mock()
+                pid_path = Mock(spec=Path)
+                pid_path.read_text.return_value = worker_pid
+                with patch("magnetic_torus.transport.geant4.subprocess.run") as kill:
+                    _stop_worker(process, pid_path, via_wsl=True)
+                self.assertFalse(kill.called, "invalid worker PID must not reach kill")
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once_with(timeout=10)
+
+    def test_worker_cleanup_signals_only_a_canonical_positive_pid(self):
+        from magnetic_torus.transport.geant4 import _stop_worker
+        for worker_pid, expected in (("2", "2"), ("0012345\n", "12345"),
+                                     ("2147483647", "2147483647")):
+            with self.subTest(pid=expected):
+                process = Mock()
+                pid_path = Mock(spec=Path)
+                pid_path.read_text.return_value = worker_pid
+                with patch.dict(os.environ, {"MAGNETIC_TORUS_WSL_DISTRO": "test-wsl"}), \
+                     patch("magnetic_torus.transport.geant4.subprocess.run") as kill:
+                    _stop_worker(process, pid_path, via_wsl=True)
+                self.assertEqual(kill.call_args.args[0],
+                                 ["wsl", "-d", "test-wsl", "--exec", "/usr/bin/kill", "-TERM", expected])
                 process.terminate.assert_called_once_with()
                 process.wait.assert_called_once_with(timeout=10)
 

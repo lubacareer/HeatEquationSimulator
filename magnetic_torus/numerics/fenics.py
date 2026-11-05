@@ -12,7 +12,7 @@ import uuid
 import numpy as np
 from ..models import Progress, RunResult, ScenarioConfig, SimulationCancelled
 from ..artifacts import FieldArtifact
-from ..backend_environment import wsl_distribution, wsl_path
+from ..backend_environment import wsl_command, wsl_path
 
 
 class PhysicsBackendUnavailable(RuntimeError):
@@ -28,7 +28,7 @@ def _run_fenics(config: ScenarioConfig, progress: Progress, cancel: threading.Ev
     worker = Path(__file__).resolve().parent.parent / "workers" / "fenics_worker.py"
     interpreter = os.environ.get("MAGNETIC_TORUS_FE_PYTHON", "/usr/bin/python3")
     if sys.platform == "win32":
-        command = ["wsl", "-d", wsl_distribution(), "--", interpreter, wsl_path(worker), wsl_path(request), wsl_path(directory)]
+        command = wsl_command(interpreter, wsl_path(worker), wsl_path(request), wsl_path(directory))
     else:
         command = [interpreter, str(worker), str(request), str(directory)]
     try:
