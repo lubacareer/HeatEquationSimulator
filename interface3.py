@@ -16,7 +16,7 @@ if __name__ == "__main__" and "--legacy" not in sys.argv:
 
 import math
 import os
-import tempfile
+import uuid
 from contextlib import suppress
 
 # NumPy compatibility shims (e.g., np.bool8 on NumPy 2)
@@ -1896,18 +1896,37 @@ class App:
         return enthalpy_curve * PLOT_ENTHALPY_SCALE, temperature_curve
 
     def _export_png(self, write_png, stem: str, **options) -> str:
-        """Atomically refresh a bounded snapshot in this App's private session."""
+        """Atomically refresh a bounded snapshot in this App's own session."""
         directory = getattr(self, "_png_export_directory", None)
         if directory is None:
-            directory = tempfile.mkdtemp(prefix="heat-equation-session-", dir=os.getcwd())
+            for _ in range(10):
+                candidate = os.path.join(os.getcwd(), f"heat-equation-session-{uuid.uuid4().hex}")
+                try:
+                    # Normal directory permissions honor the operator's umask.
+                    os.mkdir(candidate, 0o777)
+                except FileExistsError:
+                    continue
+                directory = candidate
+                break
+            else:
+                raise FileExistsError("Could not allocate a unique export session directory")
             self._png_export_directory = directory
         target = os.path.join(directory, f"{stem}.png")
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w+b", prefix=f".{stem}-", suffix=".tmp", dir=directory, delete=False
-            ) as output:
-                temporary = output.name
+            for _ in range(10):
+                candidate = os.path.join(directory, f".{stem}-{uuid.uuid4().hex}.tmp")
+                try:
+                    # Exclusive binary creation uses 0666 filtered by umask,
+                    # matching ordinary exports without changing process policy.
+                    output = open(candidate, "x+b")
+                except FileExistsError:
+                    continue
+                temporary = candidate
+                break
+            else:
+                raise FileExistsError("Could not allocate an exclusive export file")
+            with output:
                 write_png(output, format="png", **options)
             # The files share a directory/filesystem; readers see a complete
             # snapshot, and a failed render keeps the previous successful image.

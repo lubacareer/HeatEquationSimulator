@@ -28,6 +28,12 @@ replace those two files atomically. A failed render preserves the previous
 successful snapshot. Concurrent App/container instances use separate directories.
 Session directories remain after the application closes as persistent reference
 images, so retaining a session does not save an image for every UI frame.
+Exports use normal creation permissions filtered by the process umask: on Linux,
+umask `022` gives directories `0755` and PNGs `0644`, allowing a host reader with
+different UID/GID to access them when the mounted parent permits traversal. A
+restrictive umask such as `077` intentionally retains owner-only access. Configure
+the mount's ownership, traversal permissions and ACLs for the intended consumers;
+the exporter does not override that access policy.
 
 Closing the dashboard also closes its own embedded pyplot figure so that its
 separate Tk manager cannot keep the container alive. Other callers' figures stay
