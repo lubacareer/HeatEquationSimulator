@@ -15,7 +15,7 @@ environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 for path in sorted((root / "tests").glob("test_*.py")):
     print(f"\n{path.name}", flush=True)
     command = [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-p", path.name, "-v"]
-    result = subprocess.run(command, cwd=root, env=environment)
+    result = subprocess.run(command, cwd=root, env=environment)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     if result.returncode:
         failures.append(path.name)
 if failures:

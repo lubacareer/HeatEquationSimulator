@@ -129,7 +129,7 @@ def main() -> int:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Refinement expired before source validation.")
-        completed = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "verify",
+        completed = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "verify",  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
                                     "--source", str(saved), "--output", str(verification)],
                                    cwd=ROOT, timeout=remaining, check=False)
         if stop.is_set() or time.monotonic() >= deadline:

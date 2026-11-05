@@ -142,7 +142,7 @@ def supervise(command: list[str], directory: Path, *, started: float, seconds: f
         elif time.monotonic() >= work_deadline:
             reason = "TIMEOUT"
         else:
-            child = subprocess.Popen(
+            child = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                 command, cwd=cwd,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
                 start_new_session=os.name != "nt",

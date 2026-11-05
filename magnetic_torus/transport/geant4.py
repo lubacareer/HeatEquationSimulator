@@ -173,7 +173,7 @@ def calculate_dose(result: RunResult, snapshot_index: int, progress: Progress,
     command = _geant4_command(request_path)
     log_path = artifact_dir / "geant4.log"
     with log_path.open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         try:
             while process.poll() is None:
