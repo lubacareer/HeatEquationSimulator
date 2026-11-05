@@ -14,6 +14,7 @@ from magnetic_torus.backend_environment import wsl_command, wsl_distribution, ws
 
 
 def _wsl_distribution_names(output, *, utf8=False):
+    """Decode WSL's requested output encoding and normalize distribution names."""
     encoding = "utf-8-sig" if utf8 else "utf-16"
     # Some WSL versions emit UTF-16LE without a BOM.
     if not utf8 and not output.startswith((b"\xff\xfe", b"\xfe\xff")):
