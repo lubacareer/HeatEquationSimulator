@@ -13,19 +13,21 @@ def main() -> None:
     assert os.getuid() == os.geteuid() == 10001, "Container must run as its non-root user"
     assert os.getgid() == os.getegid() == 10001, "Container must use its unprivileged group"
     assert Path.cwd() == Path("/data"), "Application outputs must start in /data"
-    source = Path("/opt/heat-equation/interface3.py")
-    assert source.stat().st_uid == 0, "Application source must remain root-owned"
-    for directory in source.parents:
-        assert directory.stat().st_uid == 0, f"Source directory must remain root-owned: {directory}"
-        assert not os.access(directory, os.W_OK), f"Source directory is writable: {directory}"
-    try:
-        with source.open("r+"):
-            pass
-    except OSError as error:
-        if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
-            raise
-    else:
-        raise AssertionError("The runtime user can modify application source")
+    # Keep this list aligned with the application modules copied by Dockerfile.
+    for module in ("interface3.py", "backend.py", "deepLearning.py", "np_compat.py"):
+        source = Path("/opt/heat-equation") / module
+        assert source.stat().st_uid == 0, f"Application source must remain root-owned: {source}"
+        for directory in source.parents:
+            assert directory.stat().st_uid == 0, f"Source directory must remain root-owned: {directory}"
+            assert not os.access(directory, os.W_OK), f"Source directory is writable: {directory}"
+        try:
+            with source.open("r+"):
+                pass
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+                raise
+        else:
+            raise AssertionError(f"The runtime user can modify application source: {source}")
     with tempfile.TemporaryDirectory(prefix="container-smoke-", dir="/data") as directory:
         output = Path(directory) / "result.txt"
         output.write_text("writable data", encoding="utf-8")

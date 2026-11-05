@@ -71,6 +71,32 @@ Run this from the repository root on a Linux x86-64 Docker host:
 docker build --progress=plain -t heat-equation-legacy-gpu .
 ```
 
+The image uses its own Linux x86-64 / CPython 3.12 locks in `docker/`, including
+the pip bootstrap. All 61 distributions retain the versions from the verified
+GPU image; the shared application requirements are unchanged. Every permitted
+wheel hash was taken from that version's official PyPI release JSON. Docker
+uses only wheels and `--require-hashes` for both installation steps, so the cold
+install verifies downloaded bytes rather than trusting version pins alone.
+`docker/requirements-lock-provenance.json` records the inspected image ID,
+inventory digest, original requirement-file byte digests, release-metadata
+digests and permitted wheel filenames/URLs/hashes. Source-file line endings
+affect those raw byte digests. Separate normalized UTF-8/LF input digests are
+checked before pip runs, so CRLF and LF checkouts both work. A later change to
+either shared requirement file fails the build with an instruction to regenerate
+and verify the lock; a security update cannot silently leave the image lock stale.
+
+To regenerate after deliberately verifying another compatible image, capture
+its distribution inventory and target tags, then run the generator from this
+repository. Review every version/hash change and repeat the cold image, GUI and
+GPU checks. This pins Python wheels; apt repositories and the resulting image
+bytes are not claimed to be reproducible from a historical OS-package snapshot.
+
+```sh
+docker run --rm --network none heat-equation-legacy-gpu python -I -c 'import importlib.metadata,json,sys; from pip._vendor.packaging.tags import sys_tags; print(json.dumps({"python":sys.version,"distributions":[{"name":d.metadata["Name"],"version":d.version} for d in importlib.metadata.distributions()],"tags":[str(t) for t in sys_tags()]}))' > proven-inventory.json
+docker image inspect heat-equation-legacy-gpu --format '{{.Id}}'
+python docker/generate_container_lock.py --inventory proven-inventory.json --source-image sha256:REPLACE_WITH_INSPECTED_IMAGE_ID --metadata-dir .cache/pypi-lock-metadata
+```
+
 On Windows, NVIDIA passthrough requires Docker Desktop's WSL2 backend and a
 compatible NVIDIA Windows driver. See [Docker's GPU prerequisites](https://docs.docker.com/desktop/features/gpu/).
 The image's entrypoint exposes the CUDA libraries installed inside its own
