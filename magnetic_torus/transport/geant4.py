@@ -35,10 +35,13 @@ def _stop_worker(process: subprocess.Popen, pid_path: Path, *, via_wsl: bool) ->
     if via_wsl:
         try:
             worker_pid = pid_path.read_text(encoding="ascii").strip()
-            if worker_pid.isdigit():
-                subprocess.run(wsl_command("/usr/bin/kill", "-TERM", worker_pid),
-                               capture_output=True, timeout=15,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if len(worker_pid) <= 10 and worker_pid.isascii() and worker_pid.isdigit():
+                numeric_pid = int(worker_pid)
+                # Zero signals a process group; init (PID 1) cannot be our worker.
+                if 1 < numeric_pid <= 2_147_483_647:
+                    subprocess.run(wsl_command("/usr/bin/kill", "-TERM", str(numeric_pid)),
+                                   capture_output=True, timeout=15,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, UnicodeError, subprocess.SubprocessError):
             pass
     try:
