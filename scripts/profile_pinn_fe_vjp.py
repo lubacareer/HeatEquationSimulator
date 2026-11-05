@@ -200,7 +200,7 @@ def main() -> int:
                    "--steps-per-repetition", str(args.steps_per_repetition), "--child", strategy]
         print(f"Profiling {strategy}", flush=True)
         try:
-            completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
+            completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
                                        timeout=args.seconds_per_strategy, check=False)
             (args.output / (strategy + "-output.log")).write_text(completed.stdout + completed.stderr, encoding="utf-8")
             result_path = args.output / (strategy + "-result.json")

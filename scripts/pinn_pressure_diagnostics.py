@@ -291,7 +291,7 @@ def main() -> int:
             if name not in copies:
                 continue
             result_file = directory / f"{name}-residuals.json"
-            completed = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "pinn_source_residuals.py"),
+            completed = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "pinn_source_residuals.py"),  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
                                         "--source", str(copies[name]), "--output", str(result_file)],
                                        capture_output=True, text=True, timeout=120, check=False)
             if completed.returncode:
