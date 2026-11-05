@@ -962,5 +962,9 @@
         }
       ]
     }
-  ]
+  ],
+  "lock_files_normalized_sha256": {
+    "requirements-bootstrap.lock": "c4cbeafef374b04ee3a249cdd4c0f561558424d43f808a1d3afa499077aa9316",
+    "requirements-linux-cp312.lock": "dfc37d2bb5dc3ad234427be04b4114e844823ac6d249c9bb5a048910bb3d1560"
+  }
 }

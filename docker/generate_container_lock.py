@@ -12,12 +12,14 @@ from datetime import datetime, timezone
 import hashlib
 import itertools
 import json
+import os
 from pathlib import Path
 import re
+from tempfile import TemporaryDirectory
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 
-from check_container_lock import normalized_digest
+from check_container_lock import LOCK_FILES, normalized_digest, normalized_text_digest
 
 
 def canonical(name: str) -> str:
@@ -78,6 +80,31 @@ def lock_text(packages: list[dict], image: str) -> str:
     return "\n".join(lines)
 
 
+def publish_lock_set(output: Path, bootstrap: str, application: str, provenance: dict) -> None:
+    """Stage the set and publish its digest-bearing commit record last.
+
+    Three replacements are not a filesystem-wide transaction. An interrupted
+    or competing publication may leave a mixed set, which the build checker
+    must reject before pip rather than treating it as verified provenance.
+    """
+    output = output.resolve()
+    bodies = dict(zip(LOCK_FILES, (bootstrap, application)))
+    record = {**provenance, "lock_files_normalized_sha256": {
+        name: normalized_text_digest(text) for name, text in bodies.items()}}
+    with TemporaryDirectory(prefix=".requirements-staging-", dir=output) as directory:
+        staged = Path(directory)
+        if staged.resolve().parent != output:
+            raise ValueError("Lock staging directory escaped its intended output directory")
+        for name, text in bodies.items():
+            (staged / name).write_text(text, encoding="utf-8", newline="\n")
+        record_name = "requirements-lock-provenance.json"
+        (staged / record_name).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8", newline="\n")
+        # Only fully staged files are exposed; the provenance is the commit
+        # record. Docker copies these files into an immutable build snapshot.
+        for name in (*LOCK_FILES, record_name):
+            os.replace(staged / name, output / name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", required=True, type=Path)
@@ -109,13 +136,11 @@ def main() -> None:
                   "source_requirements_normalized_sha256": {name: normalized_digest(root / name)
                                                             for name in ("requirements.txt", "requirements-gpu.txt")},
                   "packages": releases}
-    # Write outputs only after every official release has been validated.
-    (output / "requirements-bootstrap.lock").write_text(
-        lock_text([item for item in releases if item["name"] == "pip"], args.source_image), encoding="utf-8")
-    (output / "requirements-linux-cp312.lock").write_text(
-        lock_text([item for item in releases if item["name"] != "pip"], args.source_image), encoding="utf-8")
-    (output / "requirements-lock-provenance.json").write_text(
-        json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    # Every official release is validated before staging and publication.
+    publish_lock_set(output,
+                     lock_text([item for item in releases if item["name"] == "pip"], args.source_image),
+                     lock_text([item for item in releases if item["name"] != "pip"], args.source_image),
+                     provenance)
     print(f"Pinned {len(releases)} proven distributions; wheel hashes will be verified during cold install.")
 
 

@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 WORKDIR /opt/heat-equation
 COPY requirements.txt requirements-gpu.txt ./
 COPY docker/requirements-bootstrap.lock docker/requirements-linux-cp312.lock docker/requirements-lock-provenance.json /opt/locks/
-COPY docker/check_container_lock.py ./docker/check_container_lock.py
+COPY docker/check_container_lock.py docker/generate_container_lock.py ./docker/
 RUN python3 -I /opt/heat-equation/docker/check_container_lock.py --requirements-root /opt/heat-equation --provenance /opt/locks/requirements-lock-provenance.json \
     && python3 -m venv /opt/venv \
     && /opt/venv/bin/python -m pip --isolated install --index-url https://pypi.org/simple --disable-pip-version-check --no-cache-dir --only-binary=:all: --require-hashes --no-deps -r /opt/locks/requirements-bootstrap.lock \

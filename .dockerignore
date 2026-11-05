@@ -15,6 +15,7 @@ docker/*
 !docker/requirements-linux-cp312.lock
 !docker/requirements-lock-provenance.json
 !docker/check_container_lock.py
+!docker/generate_container_lock.py
 !tests/
 tests/*
 !tests/test_legacy_tensorflow_gpu.py

@@ -22,7 +22,7 @@ docker run --rm --init --network none --cpus 1 --memory 128m --pids-limit 32 -v 
 ```
 
 The first PNG export creates a unique `heat-equation-session-*` directory under
-the output directory. Each App/session retains only the latest
+the output directory. Each App/session retains the latest two completed
 `PINN_temperature_surface.png` and `Tx.png` snapshots there; repeated UI renders
 replace those two files atomically. A failed render preserves the previous
 successful snapshot. Concurrent App/container instances use separate directories.
@@ -39,6 +39,14 @@ These reference images are intentionally retained across launches. The operator
 chooses volume quotas and manual retention for the research outputs; the
 application does not automatically delete prior sessions. An export I/O failure,
 including exhausted storage, produces a warning while plot drawing continues.
+
+Abrupt termination, such as a forced process kill or power loss during a write,
+can leave an incomplete `.Tx-*.tmp` or `.PINN_temperature_surface-*.tmp` file.
+Those temporary files are separate from the two completed snapshots. A new App
+creates its own default session directory rather than resuming the interrupted
+one. Include orphaned temporary files in the operator's quota/manual cleanup
+policy, and remove them only after confirming that the session/writer is inactive.
+The application does not scan or delete other sessions' files or active writers.
 
 For a legacy single-writer consumer that needs stable filenames in a specific
 directory, set the local operator option `HEAT_PNG_OUTPUT_DIR`. For example,
@@ -84,6 +92,16 @@ affect those raw byte digests. Separate normalized UTF-8/LF input digests are
 checked before pip runs, so CRLF and LF checkouts both work. A later change to
 either shared requirement file fails the build with an instruction to regenerate
 and verify the lock; a security update cannot silently leave the image lock stale.
+The checker also verifies normalized digests of both copied lock files against
+the recorded provenance before pip runs. A manual lock edit, missing lock, or
+mixed generation therefore fails closed.
+
+Generation stages all three files before replacing the two locks and then the
+provenance commit record. This is not an atomic transaction across three files:
+an interrupted or competing publication can leave a mixed set. Docker copies
+the files into an immutable build snapshot, where the digest check rejects such
+a set before installation; it never claims that mismatched files describe the
+proven environment. Regenerate and verify a complete set after an interruption.
 
 To regenerate after deliberately verifying another compatible image, capture
 its distribution inventory and target tags, then run the generator from this
