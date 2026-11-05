@@ -1899,17 +1899,24 @@ class App:
         """Atomically refresh a bounded snapshot in this App's own session."""
         directory = getattr(self, "_png_export_directory", None)
         if directory is None:
-            for _ in range(10):
-                candidate = os.path.join(os.getcwd(), f"heat-equation-session-{uuid.uuid4().hex}")
-                try:
-                    # Normal directory permissions honor the operator's umask.
-                    os.mkdir(candidate, 0o777)
-                except FileExistsError:
-                    continue
-                directory = candidate
-                break
+            configured = os.environ.get("HEAT_PNG_OUTPUT_DIR")
+            if configured:
+                # This is an explicit local-operator option for single-writer
+                # legacy consumers, not a path supplied by external requests.
+                directory = os.path.abspath(os.path.expanduser(configured))
+                os.makedirs(directory, mode=0o777, exist_ok=True)
             else:
-                raise FileExistsError("Could not allocate a unique export session directory")
+                for _ in range(10):
+                    candidate = os.path.join(os.getcwd(), f"heat-equation-session-{uuid.uuid4().hex}")
+                    try:
+                        # Normal permissions honor the operator's umask.
+                        os.mkdir(candidate, 0o777)
+                    except FileExistsError:
+                        continue
+                    directory = candidate
+                    break
+                else:
+                    raise FileExistsError("Could not allocate a unique export session directory")
             self._png_export_directory = directory
         target = os.path.join(directory, f"{stem}.png")
         temporary = None
@@ -2187,7 +2194,10 @@ class App:
         self.line3.set_data(x, y)
         self.ax3.relim()
         self.ax3.autoscale_view()
-        self._export_png(self.canvas3.print_figure, "Tx")
+        try:
+            self._export_png(self.canvas3.print_figure, "Tx")
+        except OSError as error:
+            print(f"Warning: Failed to save Tx figure ({error})")
         self.canvas3.draw()
 
     def update_time(self, event) -> None:

@@ -35,6 +35,30 @@ restrictive umask such as `077` intentionally retains owner-only access. Configu
 the mount's ownership, traversal permissions and ACLs for the intended consumers;
 the exporter does not override that access policy.
 
+These reference images are intentionally retained across launches. The operator
+chooses volume quotas and manual retention for the research outputs; the
+application does not automatically delete prior sessions. An export I/O failure,
+including exhausted storage, produces a warning while plot drawing continues.
+
+For a legacy single-writer consumer that needs stable filenames in a specific
+directory, set the local operator option `HEAT_PNG_OUTPUT_DIR`. For example,
+`HEAT_PNG_OUTPUT_DIR=.` writes `PINN_temperature_surface.png` and `Tx.png` in the
+working directory. Relative paths resolve when the App first exports; the
+selected directory is then retained for that App. In PowerShell:
+
+```powershell
+$env:HEAT_PNG_OUTPUT_DIR = "."
+python interface3.py --legacy
+```
+
+For the container, pass `-e HEAT_PNG_OUTPUT_DIR=/data/legacy` to use that explicit
+directory on the mounted output volume. Atomic replacement and failed-write
+preservation still apply. Give each concurrent writer its own explicit directory;
+sharing an override intentionally selects the legacy single-writer contract.
+Leaving the option unset uses isolated session directories. No repository
+production reader of the old working-directory PNGs was identified; this option
+is a compatibility contract for external consumers.
+
 Closing the dashboard also closes its own embedded pyplot figure so that its
 separate Tk manager cannot keep the container alive. Other callers' figures stay
 open.

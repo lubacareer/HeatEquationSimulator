@@ -1,6 +1,8 @@
 """Exercise bounded per-App snapshots with real PNG writers and concurrency."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import chdir
+from contextlib import chdir, redirect_stdout
+import errno
+import io
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,13 @@ from interface3 import App
 
 
 class LegacyPngExportTests(unittest.TestCase):
+    def setUp(self):
+        # Never let a host operator's override redirect test files outside their
+        # owned TemporaryDirectory fixtures.
+        environment = patch.dict(os.environ, {"HEAT_PNG_OUTPUT_DIR": ""})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_repeated_real_exports_are_bounded_and_images_decode(self):
         with TemporaryDirectory() as directory, chdir(directory):
             previous = Path("PINN_temperature_surface.png")
@@ -92,6 +101,53 @@ class LegacyPngExportTests(unittest.TestCase):
                     app._export_png(good, "PINN_temperature_surface")
             self.assertEqual(previous.read_bytes(), b"successful snapshot")
             self.assertEqual(list(previous.parent.iterdir()), [previous])
+
+    def test_explicit_operator_directory_restores_legacy_filenames(self):
+        for configured in (".", "legacy exports"):
+            with self.subTest(directory=configured), TemporaryDirectory() as directory, chdir(directory):
+                with patch.dict(os.environ, {"HEAT_PNG_OUTPUT_DIR": configured}):
+                    app = App.__new__(App)
+                    destination = (Path.cwd() / configured).resolve()
+
+                    def write(output, *, format):
+                        output.write(b"latest snapshot")
+
+                    for stem in ("PINN_temperature_surface", "Tx"):
+                        target = Path(app._export_png(write, stem))
+                        self.assertEqual(target, destination / f"{stem}.png")
+                        self.assertEqual(app._export_png(write, stem), str(target))
+                    self.assertEqual({path.name for path in destination.iterdir()},
+                                     {"PINN_temperature_surface.png", "Tx.png"})
+
+                    def fail(output, *, format):
+                        output.write(b"partial")
+                        raise OSError(errno.ENOSPC, "fixture storage full")
+
+                    with self.assertRaises(OSError):
+                        app._export_png(fail, "Tx")
+                    self.assertEqual((destination / "Tx.png").read_bytes(), b"latest snapshot")
+                    self.assertEqual({path.name for path in destination.iterdir()},
+                                     {"PINN_temperature_surface.png", "Tx.png"})
+
+    def test_export_io_failure_still_draws_without_masking_programming_errors(self):
+        figure, axes = plt.subplots()
+        try:
+            line, = axes.plot([], [])
+            app = App.__new__(App)
+            app.line3, app.ax3, app.canvas3 = line, axes, figure.canvas
+            warning = io.StringIO()
+            with patch.object(app, "_export_png", side_effect=OSError(errno.ENOSPC, "fixture storage full")), patch.object(
+                app.canvas3, "draw", wraps=app.canvas3.draw
+            ) as draw, redirect_stdout(warning):
+                app.update_line_plot3([0, 1], [2, 3])
+                draw.assert_called_once_with()
+            self.assertEqual(list(line.get_ydata()), [2, 3])
+            self.assertIn("Failed to save Tx figure", warning.getvalue())
+            with patch.object(app, "_export_png", side_effect=ValueError("fixture programming error")):
+                with self.assertRaisesRegex(ValueError, "fixture programming error"):
+                    app.update_line_plot3([0, 1], [4, 5])
+        finally:
+            plt.close(figure)
 
     def test_creation_collisions_preserve_preexisting_directories_and_files(self):
         with TemporaryDirectory() as directory, chdir(directory):
