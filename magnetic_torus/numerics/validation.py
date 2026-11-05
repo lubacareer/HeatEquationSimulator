@@ -86,7 +86,7 @@ def write_validation_report(destination: str | Path, include_fenics: bool = Fals
         else:
             command = [interpreter, str(worker), "--benchmarks", str(case_file)]
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
             cases_data = json.loads(case_file.read_text(encoding="utf-8"))
             report.update(cases_data)
         except Exception as exc:

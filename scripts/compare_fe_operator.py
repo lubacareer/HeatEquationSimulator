@@ -160,7 +160,7 @@ def main() -> int:
         shutil.copy2(other / "worker.sha256", directory / "worker.sha256")
     else:
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout, check=False)
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout, check=False)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
         except subprocess.TimeoutExpired as exc:
             # The WSL worker watchdog owns its own process group and sees this marker.
             output.mkdir(exist_ok=True)

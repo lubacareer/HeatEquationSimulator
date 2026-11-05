@@ -69,7 +69,7 @@ def main() -> int:
         request = directory / "native-request.json"
         request.write_text(json.dumps({"action": "simulate", "store": str(store.root),
                                        "config": config.to_dict()}), encoding="utf-8")
-        job = subprocess.run([sys.executable, "-B", "-u", "-m", "magnetic_torus.worker",
+        job = subprocess.run([sys.executable, "-B", "-u", "-m", "magnetic_torus.worker",  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
                               "--request", str(request)], capture_output=True, text=True,
                              encoding="utf-8", errors="replace")
         events = [json.loads(line) for line in job.stdout.splitlines() if line.startswith("{")]

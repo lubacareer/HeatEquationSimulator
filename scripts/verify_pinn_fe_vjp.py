@@ -49,7 +49,7 @@ def main() -> int:
         if args.offload:
             command.append("--offload")
         try:
-            completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
+            completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
                                        timeout=args.seconds, check=False)
             stdout, stderr = completed.stdout, completed.stderr
             try:

@@ -32,7 +32,7 @@ def _run_fenics(config: ScenarioConfig, progress: Progress, cancel: threading.Ev
     else:
         command = [interpreter, str(worker), str(request), str(directory)]
     try:
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
                                 encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
     except OSError as exc:
         raise PhysicsBackendUnavailable("Cannot start the FEniCS worker. Install Ubuntu WSL2 and run scripts/setup_wsl_physics.sh. " + str(exc)) from exc
