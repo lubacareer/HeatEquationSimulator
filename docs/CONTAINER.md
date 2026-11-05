@@ -103,14 +103,32 @@ the files into an immutable build snapshot, where the digest check rejects such
 a set before installation; it never claims that mismatched files describe the
 proven environment. Regenerate and verify a complete set after an interruption.
 
+Before querying PyPI or publishing any output, the generator validates that the
+captured inventory satisfies the two shared requirement files, their confined
+local include, active PEP 508 markers/version constraints and requested extras
+with their dependency closure. Markers use the captured Linux/x86-64/CPython 3.12
+environment, including package `Requires-Dist` and `Provides-Extra` metadata;
+the host's Windows/Python environment does not choose the dependencies. Unknown
+pip options, other includes and direct/remote URLs are rejected with diagnostics
+that omit their input contents. Run the generator with Python and pip present
+(as in the verified image); it uses pip's vendored packaging parser without
+installing another package. An operator-supplied inventory is evidence, not a
+cryptographic attestation of the selected image.
+
+The original `source_image`/`inventory_sha256` fields retain the pin-selection
+origin. The `validation_source_image`/`validation_inventory_sha256` fields and
+`requirements_validation` record the extended dependency/marker validation.
+They may identify a later runtime-equivalent verified image without changing
+the already proven lock bodies or package versions.
+
 To regenerate after deliberately verifying another compatible image, capture
-its distribution inventory and target tags, then run the generator from this
+its distribution/dependency metadata, marker environment and target tags, then run the generator from this
 repository. Review every version/hash change and repeat the cold image, GUI and
 GPU checks. This pins Python wheels; apt repositories and the resulting image
 bytes are not claimed to be reproducible from a historical OS-package snapshot.
 
 ```sh
-docker run --rm --network none heat-equation-legacy-gpu python -I -c 'import importlib.metadata,json,sys; from pip._vendor.packaging.tags import sys_tags; print(json.dumps({"python":sys.version,"distributions":[{"name":d.metadata["Name"],"version":d.version} for d in importlib.metadata.distributions()],"tags":[str(t) for t in sys_tags()]}))' > proven-inventory.json
+docker run --rm --read-only --network none heat-equation-legacy-gpu python -I -c 'import importlib.metadata,json,sys; from pip._vendor.packaging.tags import sys_tags; from pip._vendor.packaging.markers import default_environment; print(json.dumps({"python":sys.version,"environment":default_environment(),"distributions":[{"name":d.metadata["Name"],"version":d.version,"requires_dist":d.metadata.get_all("Requires-Dist",[]),"provides_extra":d.metadata.get_all("Provides-Extra",[])} for d in importlib.metadata.distributions()],"tags":[str(t) for t in sys_tags()]}))' > proven-inventory.json
 docker image inspect heat-equation-legacy-gpu --format '{{.Id}}'
 python docker/generate_container_lock.py --inventory proven-inventory.json --source-image sha256:REPLACE_WITH_INSPECTED_IMAGE_ID --metadata-dir .cache/pypi-lock-metadata
 ```

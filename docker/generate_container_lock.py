@@ -7,6 +7,7 @@ CUDA wheels. The subsequent Docker install must verify the actual wheel bytes.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
@@ -15,15 +16,145 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from tempfile import TemporaryDirectory
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
+
+from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+from pip._vendor.packaging.version import InvalidVersion, Version
 
 from check_container_lock import LOCK_FILES, normalized_digest, normalized_text_digest
 
 
 def canonical(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def parse_requirement(text: str) -> Requirement:
+    try:
+        requirement = Requirement(text)
+    except InvalidRequirement:
+        raise ValueError("Requirement syntax is unsupported; no input contents are included in diagnostics") from None
+    if requirement.url is not None:
+        raise ValueError("Direct or remote requirement URLs are unsupported")
+    return requirement
+
+
+def validate_inventory(root: Path, inventory: dict) -> dict:
+    """Check declared inputs and their active dependency/extra closure offline.
+
+    The inventory is operator-supplied evidence from a verified image, not a
+    cryptographic attestation. Markers use its captured target, never this host.
+    Only the two confined input files and ordinary PEP 508 entries are supported.
+    """
+    environment = inventory.get("environment")
+    expected_target = {"implementation_name": "cpython", "os_name": "posix",
+                       "platform_machine": "x86_64", "platform_python_implementation": "CPython",
+                       "platform_system": "Linux", "python_version": "3.12", "sys_platform": "linux"}
+    environment_names = {"implementation_name", "implementation_version", "os_name", "platform_machine",
+                         "platform_python_implementation", "platform_release", "platform_system",
+                         "platform_version", "python_full_version", "python_version", "sys_platform"}
+    if not isinstance(environment, dict) or set(environment) != environment_names or not all(
+            isinstance(value, str) for value in environment.values()):
+        raise ValueError("Inventory needs the captured target marker environment")
+    if any(environment.get(name) != value for name, value in expected_target.items()):
+        raise ValueError("Inventory target must be Linux x86-64 CPython 3.12")
+    try:
+        full_version = Version(environment["python_full_version"])
+        if full_version.release[:2] != (3, 12) or Version(environment["implementation_version"]) != full_version:
+            raise ValueError("Inventory target Python versions are inconsistent")
+        if full_version != Version(inventory["python"].split()[0]):
+            raise ValueError("Inventory Python identity does not match the target environment")
+    except (InvalidVersion, KeyError, IndexError, TypeError):
+        raise ValueError("Inventory Python identity is invalid") from None
+
+    packages = {}
+    for package in inventory["distributions"]:
+        name = canonical(package["name"])
+        if name in packages:
+            raise ValueError("Inventory contains duplicate distribution identities")
+        if not all(isinstance(package.get(field), list) and all(isinstance(item, str) for item in package[field])
+                   for field in ("requires_dist", "provides_extra")):
+            raise ValueError("Inventory needs captured Requires-Dist and Provides-Extra metadata")
+        try:
+            Version(package["version"])
+        except (InvalidVersion, TypeError):
+            raise ValueError("Inventory distribution version is invalid") from None
+        packages[name] = package
+
+    root = root.resolve()
+    allowed = {root / name for name in ("requirements.txt", "requirements-gpu.txt")}
+    try:
+        for path in allowed:
+            info = path.lstat()
+            reparse = getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if not stat.S_ISREG(info.st_mode) or path.is_symlink() or reparse or path.resolve() != path:
+                raise ValueError("Requirement inputs must be ordinary files at the two canonical root names")
+        if (root / "requirements.txt").samefile(root / "requirements-gpu.txt"):
+            raise ValueError("The two requirement inputs must not alias the same file")
+    except OSError:
+        raise ValueError("The two supported requirement inputs must be readable ordinary files") from None
+    visited, pending = set(), deque()
+
+    def active(requirement: Requirement, extra: str = "") -> bool:
+        try:
+            return requirement.marker is None or requirement.marker.evaluate({**environment, "extra": extra})
+        except Exception:
+            raise ValueError("Requirement marker metadata is invalid") from None
+
+    def read_inputs(path: Path, stack: set[Path]) -> None:
+        canonical_path = Path(os.path.abspath(path))
+        if canonical_path not in allowed or canonical_path != path.resolve() or canonical_path in stack:
+            raise ValueError("Requirement includes must stay within the two supported inputs without cycles")
+        path = canonical_path
+        if path in visited:
+            return
+        visited.add(path)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            raise ValueError("The two supported requirement inputs must be readable") from None
+        for raw in lines:
+            line = re.sub(r"\s+#.*$", "", raw).strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("-"):
+                parts = line.split()
+                if len(parts) != 2 or parts[0] not in ("-r", "--requirement"):
+                    raise ValueError("Unsupported pip option in requirement inputs")
+                read_inputs(path.parent / parts[1], stack | {path})
+            else:
+                requirement = parse_requirement(line)
+                if active(requirement):
+                    pending.append(requirement)
+
+    for path in sorted(allowed):
+        read_inputs(path, set())
+    contexts, checked, requested_extras = set(), set(), {}
+    while pending:
+        requirement = pending.popleft()
+        name = canonical(requirement.name)
+        package = packages.get(name)
+        if package is None:
+            raise ValueError("Inventory is missing a required distribution")
+        if not requirement.specifier.contains(package["version"], prereleases=True):
+            raise ValueError("Inventory distribution violates a required version constraint")
+        extras = {canonical(extra) for extra in requirement.extras}
+        if not extras <= {canonical(extra) for extra in package["provides_extra"]}:
+            raise ValueError("Inventory does not provide a requested extra")
+        checked.add(name)
+        requested_extras.setdefault(name, set()).update(extras)
+        for extra in ("", *sorted(extras)):
+            if (name, extra) in contexts:
+                continue
+            contexts.add((name, extra))
+            for text in package["requires_dist"]:
+                dependency = parse_requirement(text)
+                if active(dependency, extra):
+                    pending.append(dependency)
+    return {"environment": environment, "required_distributions": sorted(checked),
+            "requested_extras": {name: sorted(extras) for name, extras in sorted(requested_extras.items()) if extras}}
 
 
 def compatible(filename: str, target_tags: set[str]) -> bool:
@@ -122,11 +253,17 @@ def main() -> None:
     names = [canonical(item["name"]) for item in packages]
     if len(names) != len(set(names)) or names.count("pip") != 1:
         parser.error("Inventory must contain unique distributions and exactly one pip")
+    root = Path(__file__).resolve().parents[1]
+    try:
+        validation = validate_inventory(root, inventory)
+    except (ValueError, KeyError, TypeError) as error:
+        parser.error(str(error))
+    # No network or output publication occurs until the declared inputs and
+    # requested extras are satisfied by the captured target inventory.
     args.metadata_dir.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=4) as workers:
         releases = list(workers.map(lambda package: release(package, tags, args.metadata_dir), packages))
     releases.sort(key=lambda package: package["name"])
-    root = Path(__file__).resolve().parents[1]
     output = root / "docker"
     provenance = {"source_image": args.source_image, "python": inventory["python"],
                   "inventory_sha256": hashlib.sha256(raw_inventory).hexdigest(),
@@ -135,6 +272,9 @@ def main() -> None:
                                                  for name in ("requirements.txt", "requirements-gpu.txt")},
                   "source_requirements_normalized_sha256": {name: normalized_digest(root / name)
                                                             for name in ("requirements.txt", "requirements-gpu.txt")},
+                  "requirements_validation": validation,
+                  "validation_inventory_sha256": hashlib.sha256(raw_inventory).hexdigest(),
+                  "validation_source_image": args.source_image,
                   "packages": releases}
     # Every official release is validated before staging and publication.
     publish_lock_set(output,

@@ -1,7 +1,9 @@
 """Verify portable input identity and fail-closed container lock maintenance."""
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -21,6 +23,22 @@ with patch.dict(sys.modules, {"check_container_lock": checker}):
 
 
 class ContainerLockTests(unittest.TestCase):
+    def inventory_fixture(self, root):
+        (root / "requirements.txt").write_text("numpy>=1.26,<3\ntensorflow==2.21.0\n", encoding="utf-8")
+        (root / "requirements-gpu.txt").write_text(
+            '-r requirements.txt\ntensorflow[and-cuda]==2.21.0; platform_system == "Linux"\n', encoding="utf-8")
+        environment = {"implementation_name": "cpython", "implementation_version": "3.12.3", "os_name": "posix",
+                       "platform_machine": "x86_64", "platform_python_implementation": "CPython",
+                       "platform_release": "fixture-release", "platform_system": "Linux", "platform_version": "fixture-version",
+                       "python_full_version": "3.12.3", "python_version": "3.12", "sys_platform": "linux"}
+        packages = [{"name": name, "version": version, "requires_dist": [], "provides_extra": []}
+                    for name, version in (("pip", "26.3"), ("numpy", "2.5.4"), ("tensorflow", "2.21.0"),
+                                          ("nvidia-cuda-runtime-cu12", "12.9.79"))]
+        packages[2].update({"provides_extra": ["and-cuda"], "requires_dist": [
+            "numpy>=1.26", 'nvidia-cuda-runtime-cu12>=12.9,<13; extra == "and-cuda" and platform_system == "Linux"']})
+        return {"python": "3.12.3 (fixture)", "environment": environment, "distributions": packages,
+                "tags": ["cp312-cp312-linux_x86_64"]}
+
     def fixture(self, root):
         for name in checker.INPUTS:
             (root / name).write_bytes(b"# fixture\nnumpy==2.5.4\n")
@@ -131,6 +149,116 @@ class ContainerLockTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "stale"):
                 checker.check(root, provenance)
             self.assertFalse(list(root.glob(".requirements-staging-*")))
+
+    def test_validation_uses_recorded_linux_target_and_requested_gpu_extra(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = self.inventory_fixture(root)
+            host = {**inventory["environment"], "platform_system": "Windows", "os_name": "nt", "sys_platform": "win32",
+                    "python_version": "3.11", "python_full_version": "3.11.0"}
+            with patch("pip._vendor.packaging.markers.default_environment", return_value=host):
+                result = generator.validate_inventory(root, inventory)
+            self.assertIn("nvidia-cuda-runtime-cu12", result["required_distributions"])
+            self.assertEqual(result["requested_extras"], {"tensorflow": ["and-cuda"]})
+
+    def test_validation_rejects_missing_or_incompatible_direct_and_gpu_requirements(self):
+        for change in ("missing-direct", "incompatible-direct", "missing-gpu", "incompatible-gpu", "missing-extra"):
+            with self.subTest(change=change), TemporaryDirectory() as directory:
+                root = Path(directory)
+                inventory = deepcopy(self.inventory_fixture(root))
+                packages = inventory["distributions"]
+                if change == "missing-direct":
+                    packages[:] = [package for package in packages if package["name"] != "numpy"]
+                elif change == "incompatible-direct":
+                    packages[2]["version"] = "2.20.0"
+                elif change == "missing-gpu":
+                    packages[:] = [package for package in packages if package["name"] != "nvidia-cuda-runtime-cu12"]
+                elif change == "incompatible-gpu":
+                    packages[3]["version"] = "11.8.0"
+                else:
+                    packages[2]["provides_extra"] = []
+                with self.assertRaises(ValueError):
+                    generator.validate_inventory(root, inventory)
+
+    def test_validation_rejects_inconsistent_target_python_versions(self):
+        for change in ("wrong-full-version", "wrong-implementation-version"):
+            with self.subTest(change=change), TemporaryDirectory() as directory:
+                root = Path(directory)
+                inventory = self.inventory_fixture(root)
+                inventory["environment"]["implementation_version"] = "3.13.0"
+                if change == "wrong-full-version":
+                    inventory["python"] = "3.13.0 (fixture)"
+                    inventory["environment"]["python_full_version"] = "3.13.0"
+                with self.assertRaisesRegex(ValueError, "inconsistent"):
+                    generator.validate_inventory(root, inventory)
+
+    def test_requirement_inputs_reject_external_links_and_internal_aliases(self):
+        for kind in ("external-file", "internal-file-alias", "external-directory", "hardlink-alias"):
+            with self.subTest(kind=kind), TemporaryDirectory() as directory, TemporaryDirectory() as outside:
+                root, external = Path(directory), Path(outside)
+                inventory = self.inventory_fixture(root)
+                target = external / "requirements.txt"
+                target.write_text("owned external fixture; must not be read", encoding="utf-8")
+                try:
+                    if kind == "external-directory":
+                        (root / "linked-inputs").symlink_to(external, target_is_directory=True)
+                        (root / "requirements-gpu.txt").write_text("-r linked-inputs/requirements.txt\n", encoding="utf-8")
+                    else:
+                        (root / "requirements-gpu.txt").unlink()
+                        if kind == "external-file":
+                            (root / "requirements-gpu.txt").symlink_to(target)
+                        elif kind == "internal-file-alias":
+                            (root / "requirements-gpu.txt").symlink_to(root / "requirements.txt")
+                        else:
+                            os.link(root / "requirements.txt", root / "requirements-gpu.txt")
+                except OSError:
+                    self.skipTest("This host does not permit the synthetic link fixture")
+                read_text = Path.read_text
+
+                def guarded_read(path, *args, **kwargs):
+                    if path.resolve() == target.resolve():
+                        raise AssertionError("External synthetic contents were read")
+                    return read_text(path, *args, **kwargs)
+
+                with patch.object(Path, "read_text", guarded_read), self.assertRaises(ValueError):
+                    generator.validate_inventory(root, inventory)
+
+    def test_invalid_inputs_and_inventory_fail_before_network_or_publication(self):
+        marker = "DO_NOT_PRINT_FIXTURE_MARKER"
+        cases = (("direct-url", f"tensorflow @ https://fixture:{marker}@example.invalid/package.whl"),
+                 ("unknown-option", f"--index-url https://fixture:{marker}@example.invalid/simple"),
+                 ("remote-include", f"-r https://example.invalid/{marker}"),
+                 ("incompatible-inventory", None))
+        for kind, line in cases:
+            with self.subTest(kind=kind), TemporaryDirectory() as directory:
+                root = Path(directory)
+                inventory = self.inventory_fixture(root)
+                if line is not None:
+                    (root / "requirements-gpu.txt").write_text(line + "\n", encoding="utf-8")
+                else:
+                    inventory["distributions"][2]["version"] = "2.20.0"
+                docker = root / "docker"
+                docker.mkdir()
+                for source in (CHECKER, CHECKER.with_name("generate_container_lock.py")):
+                    (docker / source.name).write_bytes(source.read_bytes())
+                outputs = {name: b"previous owned publication" for name in (*checker.LOCK_FILES, "requirements-lock-provenance.json")}
+                for name, content in outputs.items():
+                    (docker / name).write_bytes(content)
+                inventory_file = root / "inventory.json"
+                inventory_file.write_text(json.dumps(inventory), encoding="utf-8")
+                # Any attempted network request fails the control before it can
+                # leave the process, even when this unit test runs on a host.
+                launcher = ("import runpy,sys,urllib.request; sys.path.insert(0,sys.argv[1]); "
+                            "urllib.request.urlopen=lambda *a,**k: (_ for _ in ()).throw(AssertionError('network forbidden')); "
+                            "script=sys.argv[2]; sys.argv=sys.argv[2:]; runpy.run_path(script,run_name='__main__')")
+                result = subprocess.run([sys.executable, "-I", "-c", launcher, str(docker),
+                                         str(docker / "generate_container_lock.py"), "--inventory", str(inventory_file),
+                                         "--source-image", "sha256:" + "a" * 64, "--metadata-dir", str(root / "metadata")],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2)
+                self.assertNotIn(marker, result.stderr + result.stdout)
+                self.assertFalse((root / "metadata").exists())
+                self.assertEqual({name: (docker / name).read_bytes() for name in outputs}, outputs)
 
 
 if __name__ == "__main__":
