@@ -57,23 +57,6 @@ BOUNDARY_HEAD_VIOLATION_THRESHOLD = 0.05
 PLOT_ENTHALPY_SCALE = 1e-3  # Convert specific enthalpy from J/kg to kJ/kg for T(E).
 
 
-def _save_png_export(write_png, stem: str, **options) -> str:
-    """Give each export an exclusively created file in the output directory."""
-    filename = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w+b", prefix=f"{stem}-", suffix=".png", dir=os.getcwd(), delete=False
-        ) as output:
-            filename = output.name
-            write_png(output, format="png", **options)
-        return filename
-    except BaseException:
-        if filename is not None:
-            with suppress(FileNotFoundError):
-                os.unlink(filename)
-        raise
-
-
 THEME = {
     "bg": "#f3f6fa",
     "surface": "#ffffff",
@@ -413,6 +396,7 @@ class App:
         self.terrain_profile_values: Optional[np.ndarray] = None
         self.terrain_surface_values: Optional[np.ndarray] = None
         self.last_commands = ""
+        self._png_export_directory: Optional[str] = None
 
         self.build_dashboard()
 
@@ -1911,6 +1895,30 @@ class App:
         )
         return enthalpy_curve * PLOT_ENTHALPY_SCALE, temperature_curve
 
+    def _export_png(self, write_png, stem: str, **options) -> str:
+        """Atomically refresh a bounded snapshot in this App's private session."""
+        directory = getattr(self, "_png_export_directory", None)
+        if directory is None:
+            directory = tempfile.mkdtemp(prefix="heat-equation-session-", dir=os.getcwd())
+            self._png_export_directory = directory
+        target = os.path.join(directory, f"{stem}.png")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w+b", prefix=f".{stem}-", suffix=".tmp", dir=directory, delete=False
+            ) as output:
+                temporary = output.name
+                write_png(output, format="png", **options)
+            # The files share a directory/filesystem; readers see a complete
+            # snapshot, and a failed render keeps the previous successful image.
+            os.replace(temporary, target)
+            return target
+        except BaseException:
+            if temporary is not None:
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary)
+            raise
+
     def show_PINN_plots(self, show_gold_standard=True, custom_cmap="coolwarm"):
         self.render_pinn_results(show_gold_standard, custom_cmap)
 
@@ -2107,7 +2115,7 @@ class App:
 
         # Save the composite PINN figure for reference
         try:
-            _save_png_export(self.fig_PINN.savefig, "PINN_temperature_surface", dpi=300)
+            self._export_png(self.fig_PINN.savefig, "PINN_temperature_surface", dpi=300)
         except Exception as e:
             print(f"Warning: Failed to save PINN figure ({e})")
 
@@ -2160,7 +2168,7 @@ class App:
         self.line3.set_data(x, y)
         self.ax3.relim()
         self.ax3.autoscale_view()
-        _save_png_export(self.canvas3.print_figure, "Tx")
+        self._export_png(self.canvas3.print_figure, "Tx")
         self.canvas3.draw()
 
     def update_time(self, event) -> None:

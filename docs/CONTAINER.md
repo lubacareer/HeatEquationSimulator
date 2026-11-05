@@ -21,9 +21,13 @@ an existing volume with the same non-root user before opening the GUI:
 docker run --rm --init --network none --cpus 1 --memory 128m --pids-limit 32 -v heat-equation-results:/data heat-equation-legacy-gpu python -c "import tempfile; probe = tempfile.TemporaryFile(dir='/data'); probe.write(b'write-check'); probe.close(); print('Output volume is writable')"
 ```
 
-PNG exports use exclusively created `PINN_temperature_surface-*.png` and
-`Tx-*.png` filenames in the output directory. Repeated renders and concurrent
-containers sharing a writable volume retain their separate artifacts.
+The first PNG export creates a unique `heat-equation-session-*` directory under
+the output directory. Each App/session retains only the latest
+`PINN_temperature_surface.png` and `Tx.png` snapshots there; repeated UI renders
+replace those two files atomically. A failed render preserves the previous
+successful snapshot. Concurrent App/container instances use separate directories.
+Session directories remain after the application closes as persistent reference
+images, so retaining a session does not save an image for every UI frame.
 
 Closing the dashboard also closes its own embedded pyplot figure so that its
 separate Tk manager cannot keep the container alive. Other callers' figures stay
