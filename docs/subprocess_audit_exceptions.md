@@ -54,12 +54,24 @@ These assumptions do not make a compromised environment or untrusted caller safe
 | `scripts/verify_pinn_fe_vjp.py` | `sys.executable` relaunches the fixed current script with parsed paths, numeric settings and device. | Local CLI inputs and executable/script are trusted; device is a parsed choice. |
 | `scripts/run_checks.py` | `sys.executable` runs fixed unittest discovery for each local `test_*.py` name. | The local test tree, Python environment and checkout are trusted. |
 
-The audit finding at `scripts/research_supervisor.py` remains active. Its
-`supervise` function accepts an arbitrary command list, so suppressing the call
-could hide a future untrusted caller. Its current production caller
-`pinn_research.py` constructs `sys.executable`, its own fixed script and locally
-parsed arguments, but the supervisor itself is not safe to expose to an
-untrusted caller.
+The existing `scripts/research_supervisor.py:145–149` occurrence has a bounded
+exception for the current caller: Sourcery group `153068015`, issue `157360426` only.
+The sole application caller found, `pinn_research.py`, constructs the running
+`sys.executable`, `-B`, its own resolved script, locally parsed operator arguments,
+resolved source/output/checkpoint paths and a fixed worker flag, with the checkout
+root as `cwd`. No caller supplying a command from a remote request or configuration
+was identified. This assessment depends on the trusted local operator, interpreter,
+environment and checkout; it is not a rule-wide or future-caller exemption.
+
+The generic `supervise` utility still accepts arbitrary commands and working
+directories and is not a security boundary for untrusted callers. Its source
+remains without a blanket suppression. As explained in Python's
+[subprocess security considerations](https://docs.python.org/3/library/subprocess.html#security-considerations),
+Windows `.bat` and `.cmd` files can receive implicit shell interpretation even with `shell=False`; the observed
+caller selects the running Python interpreter, but the generic utility permits
+other commands. Re-audit this exception if a new caller supplies commands or
+`cwd` from a network request, untrusted configuration or another lower-trust
+source, or if the executable/environment assumptions change.
 
 Re-audit the affected site if a new caller supplies commands, executable selection
 or argument construction changes, a launch gains shell interpretation, or any
