@@ -1,5 +1,7 @@
 """Opt-in smoke test for the legacy TensorFlow GPU training path."""
 import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -10,6 +12,7 @@ class LegacyTensorFlowGpuTests(unittest.TestCase):
     def test_one_training_epoch_on_gpu(self):
         import numpy as np
         import tensorflow as tf
+        from tensorflow.tsl.profiler.protobuf import xplane_pb2
         import deepLearning as dl
 
         self.assertTrue(tf.config.list_physical_devices("GPU"), "TensorFlow did not detect a GPU")
@@ -33,11 +36,37 @@ class LegacyTensorFlowGpuTests(unittest.TestCase):
                 initial_weights.extend(v.numpy().copy() for v in self.model.trainable_variables)
                 super().on_train_begin(logs)
 
-        with patch.object(dl, "PINNConsoleLogger", SnapshotLogger), tf.device("/GPU:0"):
-            loss, metrics, temperature, boundary = dl.train_PINN(
-                model, x, x, y_t, y_b, epochs=1,
-                mask_T=masks, mask_B=masks, batch_size=4,
-            )
+        with tempfile.TemporaryDirectory(prefix="pinn-gpu-profile-") as trace_directory:
+            # Capture only training: the standalone GPU operation above cannot
+            # satisfy these assertions if fit silently falls back to the CPU.
+            tf.profiler.experimental.start(trace_directory)
+            try:
+                with patch.object(dl, "PINNConsoleLogger", SnapshotLogger), tf.device("/GPU:0"):
+                    loss, metrics, temperature, boundary = dl.train_PINN(
+                        model, x, x, y_t, y_b, epochs=1,
+                        mask_T=masks, mask_B=masks, batch_size=4,
+                    )
+            finally:
+                tf.profiler.experimental.stop()
+            gpu_operations = set()
+            traces = list(Path(trace_directory).rglob("*.xplane.pb"))
+            self.assertTrue(traces, "TensorFlow did not produce a training device trace")
+            for trace_path in traces:
+                trace = xplane_pb2.XSpace.FromString(trace_path.read_bytes())
+                for plane in trace.planes:
+                    if not plane.name.startswith("/device:GPU:"):
+                        continue
+                    for line in plane.lines:
+                        for event in line.events:
+                            for stat in event.stats:
+                                if plane.stat_metadata[stat.metadata_id].name == "tf_op":
+                                    operation = (plane.stat_metadata[stat.ref_value].name
+                                                 if stat.WhichOneof("value") == "ref_value"
+                                                 else stat.str_value)
+                                    gpu_operations.add(operation)
+            self.assertTrue(any("MatMul" in operation and "gradient_tape" in operation
+                                for operation in gpu_operations),
+                            "No PINN backpropagation matrix multiplication executed on the GPU")
         self.assertTrue(initial_weights, "Training began without trainable weights")
         final_weights = [v.numpy() for v in model.trainable_variables]
         self.assertEqual(len(initial_weights), len(final_weights))
