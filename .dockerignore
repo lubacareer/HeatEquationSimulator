@@ -1,7 +1,18 @@
+# Send only the legacy application's source and its container checks.
 *
-!dist/interface3.exe
+!Dockerfile
+!requirements.txt
+!requirements-gpu.txt
 !interface3.py
 !deepLearning.py
 !backend.py
-!requirements.txt
-!README.md
+!np_compat.py
+!docker/
+docker/*
+!docker/legacy-entrypoint.sh
+!docker/legacy_container_smoke.py
+!tests/
+tests/*
+!tests/test_legacy_tensorflow_gpu.py
+!tests/test_legacy_window_close.py
+!tests/test_enthalpy_temperature_curve.py

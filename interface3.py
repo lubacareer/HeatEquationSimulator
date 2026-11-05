@@ -2438,6 +2438,8 @@ class App:
 
     def on_closing(self):
         # print("Main window is closing")
+        # The embedded pyplot figure also owns a Tk manager window.
+        plt.close(self.fig1)
         self.root.destroy()
 
 

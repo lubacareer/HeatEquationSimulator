@@ -28,7 +28,8 @@ The application simulates the latent heat thermal energy storage in lunar regoli
 
 ### How to Run the Program
 
-Use the local setup below. The older Dockerfile and published image are not currently validated for this version of the legacy application.
+Use the local setup below, or build the source-based [legacy NVIDIA GPU container](CONTAINER.md).
+The previously published image is not used by that build.
 
 ## Local setup and NVIDIA GPU on WSL2
 

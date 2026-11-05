@@ -47,6 +47,8 @@ python interface3.py --legacy
 
 The tested Windows Python 3.12 package versions are recorded in [requirements-desktop.lock.txt](requirements-desktop.lock.txt), including the CUDA 12.8 PyTorch build. This is a reference package snapshot; [requirements-desktop.txt](requirements-desktop.txt) installs the desktop stack while leaving your PyTorch build under your control. Legacy dependencies and instructions are retained in [docs/LEGACY_README.md](docs/LEGACY_README.md).
 
+The original TensorFlow/Tkinter GUI also has a source-based [NVIDIA GPU container](docs/CONTAINER.md), with a non-root runtime and separate GUI/GPU verification commands.
+
 ## Explore, animate, compare
 
 - Rotate/zoom the PyVista scene or choose a camera preset. Toggle cutaway, phase contour, velocity arrows, integrated flow tracers, magnetic field lines, and a movable cross-section. Hide **Plots** for a larger scene. Opacity and visual detail do not alter the computed solution.
