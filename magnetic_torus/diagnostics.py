@@ -26,7 +26,9 @@ def inspect_environment() -> dict:
                                os.environ.get("TORUS_GEANT4_WORKER", "/opt/magnetic-torus/bin/torus-dose-run"))
     for name, command in commands.items():
         try:
-            process = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            # Audited internal programs/literal argv; WSL uses --exec, and the
+            # configured worker path is only a test -x operand. Re-audit new commands.
+            process = subprocess.run(command, capture_output=True, text=True, timeout=30)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
             result[name] = {"available": process.returncode == 0, "output": process.stdout.strip(), "error": process.stderr.strip()}
         except (OSError, subprocess.TimeoutExpired) as error:
             result[name] = {"available": False, "error": str(error)}
