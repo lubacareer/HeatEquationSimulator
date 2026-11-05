@@ -22,7 +22,7 @@ COPY --chmod=0644 interface3.py backend.py deepLearning.py np_compat.py ./
 COPY --chmod=0755 docker/legacy-entrypoint.sh /usr/local/bin/legacy-entrypoint
 COPY --chmod=0644 docker/legacy_container_smoke.py ./docker/legacy_container_smoke.py
 COPY --chmod=0644 tests/test_legacy_tensorflow_gpu.py ./tests/test_legacy_tensorflow_gpu.py
-COPY --chmod=0644 tests/test_legacy_window_close.py tests/test_enthalpy_temperature_curve.py ./tests/
+COPY --chmod=0644 tests/test_legacy_window_close.py tests/test_enthalpy_temperature_curve.py tests/test_legacy_png_exports.py ./tests/
 # COPY's file mode can also reach newly created destination directories.
 # Keep these root-owned helper directories traversable by the runtime user.
 RUN chmod 0755 /opt/heat-equation/docker /opt/heat-equation/tests

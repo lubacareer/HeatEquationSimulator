@@ -11,6 +11,20 @@ root-owned, while `/data` and the user's home are writable. Mount a named volume
 at `/data` to retain exported plots between runs. The build context contains only
 the required legacy sources and verification helpers.
 
+An empty named volume is initialized with the image's UID/GID 10001 ownership.
+Pre-existing volumes and bind mounts retain their existing permissions and must
+grant UID/GID 10001 write access before starting the application. Use a dedicated
+writable volume or provision the desired ownership in your storage setup. Check
+an existing volume with the same non-root user before opening the GUI:
+
+```sh
+docker run --rm --init --network none --cpus 1 --memory 128m --pids-limit 32 -v heat-equation-results:/data heat-equation-legacy-gpu python -c "import tempfile; probe = tempfile.TemporaryFile(dir='/data'); probe.write(b'write-check'); probe.close(); print('Output volume is writable')"
+```
+
+PNG exports use exclusively created `PINN_temperature_surface-*.png` and
+`Tx-*.png` filenames in the output directory. Repeated renders and concurrent
+containers sharing a writable volume retain their separate artifacts.
+
 Closing the dashboard also closes its own embedded pyplot figure so that its
 separate Tk manager cannot keep the container alive. Other callers' figures stay
 open.

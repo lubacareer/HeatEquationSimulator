@@ -16,3 +16,4 @@ tests/*
 !tests/test_legacy_tensorflow_gpu.py
 !tests/test_legacy_window_close.py
 !tests/test_enthalpy_temperature_curve.py
+!tests/test_legacy_png_exports.py

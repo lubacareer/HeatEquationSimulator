@@ -16,6 +16,8 @@ if __name__ == "__main__" and "--legacy" not in sys.argv:
 
 import math
 import os
+import tempfile
+from contextlib import suppress
 
 # NumPy compatibility shims (e.g., np.bool8 on NumPy 2)
 import np_compat  # noqa: F401
@@ -53,6 +55,24 @@ PINN_TARGET_BATCHES_PER_EPOCH = 32
 PINN_MAX_TRAIN_SAMPLES = 20000
 BOUNDARY_HEAD_VIOLATION_THRESHOLD = 0.05
 PLOT_ENTHALPY_SCALE = 1e-3  # Convert specific enthalpy from J/kg to kJ/kg for T(E).
+
+
+def _save_png_export(write_png, stem: str, **options) -> str:
+    """Give each export an exclusively created file in the output directory."""
+    filename = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b", prefix=f"{stem}-", suffix=".png", dir=os.getcwd(), delete=False
+        ) as output:
+            filename = output.name
+            write_png(output, format="png", **options)
+        return filename
+    except BaseException:
+        if filename is not None:
+            with suppress(FileNotFoundError):
+                os.unlink(filename)
+        raise
+
 
 THEME = {
     "bg": "#f3f6fa",
@@ -2087,7 +2107,7 @@ class App:
 
         # Save the composite PINN figure for reference
         try:
-            self.fig_PINN.savefig("PINN_temperature_surface.png", dpi=300)
+            _save_png_export(self.fig_PINN.savefig, "PINN_temperature_surface", dpi=300)
         except Exception as e:
             print(f"Warning: Failed to save PINN figure ({e})")
 
@@ -2140,7 +2160,7 @@ class App:
         self.line3.set_data(x, y)
         self.ax3.relim()
         self.ax3.autoscale_view()
-        self.canvas3.print_figure("Tx.png")
+        _save_png_export(self.canvas3.print_figure, "Tx")
         self.canvas3.draw()
 
     def update_time(self, event) -> None:

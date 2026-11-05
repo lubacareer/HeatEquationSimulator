@@ -15,6 +15,9 @@ def main() -> None:
     assert Path.cwd() == Path("/data"), "Application outputs must start in /data"
     source = Path("/opt/heat-equation/interface3.py")
     assert source.stat().st_uid == 0, "Application source must remain root-owned"
+    for directory in source.parents:
+        assert directory.stat().st_uid == 0, f"Source directory must remain root-owned: {directory}"
+        assert not os.access(directory, os.W_OK), f"Source directory is writable: {directory}"
     try:
         with source.open("r+"):
             pass
