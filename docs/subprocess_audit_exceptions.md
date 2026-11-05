@@ -53,7 +53,13 @@ These assumptions do not make a compromised environment or untrusted caller safe
 | `scripts/profile_pinn_fe_vjp.py` | `sys.executable` relaunches the fixed current script with parsed paths, counts and a strategy. | Local CLI inputs and executable/script are trusted; strategies are parsed choices. |
 | `scripts/verify_pinn_fe_vjp.py` | `sys.executable` relaunches the fixed current script with parsed paths, numeric settings and device. | Local CLI inputs and executable/script are trusted; device is a parsed choice. |
 | `scripts/run_checks.py` | `sys.executable` runs fixed unittest discovery for each local `test_*.py` name. | The local test tree, Python environment and checkout are trusted. |
-| `scripts/research_supervisor.py` | Runs its caller's command list under a deadline. | This function accepts arbitrary commands; the current production caller `pinn_research.py` builds `sys.executable`, its own fixed script and locally parsed arguments. It is not safe to expose to an untrusted caller. |
+
+The audit finding at `scripts/research_supervisor.py` remains active. Its
+`supervise` function accepts an arbitrary command list, so suppressing the call
+could hide a future untrusted caller. Its current production caller
+`pinn_research.py` constructs `sys.executable`, its own fixed script and locally
+parsed arguments, but the supervisor itself is not safe to expose to an
+untrusted caller.
 
 Re-audit the affected site if a new caller supplies commands, executable selection
 or argument construction changes, a launch gains shell interpretation, or any
